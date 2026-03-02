@@ -942,7 +942,7 @@ export default function JobMetrics({ job }: JobMetricsProps) {
                 {stats.highNoiseLoss > stats.lowNoiseLoss * 1.1 ? (
                   <span className="ml-2 text-green-400">✓ High noise learning harder timesteps (expected)</span>
                 ) : (
-                  <span className="ml-2 text-amber-400">⚠ Ratio may be unusual (expect high > low)</span>
+                  <span className="ml-2 text-amber-400">⚠ Ratio may be unusual (expect high {'>'} low)</span>
                 )}
               </p>
             </div>
