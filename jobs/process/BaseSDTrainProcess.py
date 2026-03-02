@@ -1811,6 +1811,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     config['default_lr'] = self.train_config.lr
                 if 'learning_rate' in sig.parameters:
                     config['learning_rate'] = self.train_config.lr
+                if 'optimizer_params' in sig.parameters:
+                    config['optimizer_params'] = self.train_config.optimizer_params
                 params_net = self.network.prepare_optimizer_params(
                     **config
                 )
@@ -2224,7 +2226,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # if optimizer has get_lrs method, then use it
                     learning_rate = 0.0
                     if hasattr(optimizer, 'get_avg_learning_rate'):
-                        learning_rate = optimizer.get_avg_learning_rate()
+                        # Check if this is MoE with multiple param groups
+                        if hasattr(optimizer, 'get_learning_rates') and len(optimizer.param_groups) > 1:
+                            # Show per-expert LRs for MoE
+                            group_lrs = optimizer.get_learning_rates()
+                            learning_rate = None  # Will use group_lrs instead
+                        else:
+                            learning_rate = optimizer.get_avg_learning_rate()
                     elif hasattr(optimizer, 'get_learning_rates'):
                         learning_rate = optimizer.get_learning_rates()[0]
                     elif self.train_config.optimizer.lower().startswith('dadaptation') or \
@@ -2236,7 +2244,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     else:
                         learning_rate = optimizer.param_groups[0]['lr']
 
-                    prog_bar_string = f"lr: {learning_rate:.1e}"
+                    # Format LR string (per-expert for MoE, single value otherwise)
+                    if hasattr(optimizer, 'get_avg_learning_rate') and learning_rate is None:
+                        # MoE: show each expert's LR
+                        lr_strings = []
+                        for i, lr in enumerate(group_lrs):
+                            lr_val = lr.item() if hasattr(lr, 'item') else lr
+                            lr_strings.append(f"lr{i}: {lr_val:.1e}")
+                        prog_bar_string = " ".join(lr_strings)
+                    else:
+                        prog_bar_string = f"lr: {learning_rate:.1e}"
                     for key, value in loss_dict.items():
                         prog_bar_string += f" {key}: {value:.3e}"
 
