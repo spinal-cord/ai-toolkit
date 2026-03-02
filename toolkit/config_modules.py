@@ -209,7 +209,13 @@ class NetworkConfig:
         
         # Use the old lokr format
         self.old_lokr_format = kwargs.get('old_lokr_format', False)
-        
+
+        # Alpha scheduling config
+        self.alpha_schedule = kwargs.get('alpha_schedule', None)
+        if self.alpha_schedule:
+            print(f"[DEBUG NetworkConfig] alpha_schedule found in kwargs: {self.alpha_schedule}")
+            print(f"[DEBUG NetworkConfig] alpha_schedule enabled: {self.alpha_schedule.get('enabled')}")
+
         # for multi stage models
         self.split_multistage_loras = kwargs.get('split_multistage_loras', True)
         
