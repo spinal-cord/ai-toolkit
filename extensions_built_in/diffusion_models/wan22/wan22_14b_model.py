@@ -392,6 +392,7 @@ def load_transformer_from_safetensors(safetensors_path: str, config: Dict,
     
     # Move to device and dtype
     model = model.to(dtype=dtype)
+    print("Moved model with dtype == ",dtype)
     if device != torch.device('cpu'):
         model = model.to(device)
     
@@ -416,7 +417,7 @@ class Wan2214bModel(Wan21):
         super().__init__(
             device=device,
             model_config=model_config,
-            dtype=dtype,
+            dtype=torch.float8_e4m3fn,
             custom_pipeline=custom_pipeline,
             noise_scheduler=noise_scheduler,
             **kwargs,
