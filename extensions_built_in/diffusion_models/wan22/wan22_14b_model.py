@@ -630,6 +630,8 @@ class Wan2214bModel(Wan21):
         dtype = self.torch_dtype
         device = self.device_torch
         
+        model_dtype = dtype
+        
         self.print_and_status_update("Searching for safetensors files in repo")
         
         safetensor_files = {}
@@ -647,7 +649,7 @@ class Wan2214bModel(Wan21):
                 f"Found files: {list(safetensor_files.keys())}"
             )
         else:
-            # dtype = torch.float8_e4m3fn
+            model_dtype = torch.float8_e4m3fn
             pass
         
         if 'low' not in safetensor_files:
@@ -656,7 +658,7 @@ class Wan2214bModel(Wan21):
                 f"Found files: {list(safetensor_files.keys())}"
             )
         else:
-            # dtype = torch.float8_e4m3fn
+            model_dtype = torch.float8_e4m3fn
             pass
         
         self.print_and_status_update(f"Found HIGH noise model: {safetensor_files['high']}")
@@ -684,7 +686,7 @@ class Wan2214bModel(Wan21):
         self.print_and_status_update("Loading HIGH noise transformer")
         
         transformer_1 = load_transformer_from_safetensors(
-            high_path, config, dtype, device, is_high_noise=True
+            high_path, config, model_dtype, device, is_high_noise=True
         )
         
         if self.model_config.low_vram:
@@ -693,7 +695,7 @@ class Wan2214bModel(Wan21):
             flush()
         
         # Skip quantization if dtype is already float8 (pre-quantized model)
-        is_already_quantized = dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        is_already_quantized = model_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     
         if self.model_config.quantize and not is_already_quantized and self.model_config.accuracy_recovery_adapter is None:
             self.print_and_status_update("Quantizing HIGH noise Transformer")
@@ -710,7 +712,7 @@ class Wan2214bModel(Wan21):
             low_path = safetensor_files['low']
         
         transformer_2 = load_transformer_from_safetensors(
-            low_path, config, dtype, device, is_high_noise=False
+            low_path, config, model_dtype, device, is_high_noise=False
         )
         
         if self.model_config.low_vram:
