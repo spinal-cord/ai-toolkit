@@ -103,7 +103,7 @@ class FP8PatchEmbed(torch.nn.Module):
         # New code:
         
 		if x.dtype == torch.float8_e4m3fn and FP8_OPS_AVAILABLE:
-			x = fp8_im2col(x, kernel_h=2, kernel_w=2, stride_h=2, stride_w=2)
+			x = fp8_ops.fp8_im2col(x, kernel_h=2, kernel_w=2, stride_h=2, stride_w=2)
 		else:
 			x = F.unfold(x, kernel_size=(2,2), stride=(2,2))
 		x = x.transpose(1, 2)                               # B*T, num_patches, C*4
