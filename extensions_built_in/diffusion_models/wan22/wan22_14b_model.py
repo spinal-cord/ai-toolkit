@@ -255,6 +255,34 @@ def find_safetensors_files_local(base_path: str) -> Dict[str, str]:
     return safetensor_files
 
 
+def load_config_from_safetensors(safetensors_path: str) -> Optional[Dict]:
+    """
+    Try to load config from safetensors file metadata.
+    Returns None if no config found.
+    """
+    try:
+        # Try to load metadata from safetensors file
+        from safetensors import safe_open
+        with safe_open(safetensors_path, framework="pt") as f:
+            metadata = f.metadata()
+            if metadata is not None:
+                # Check if there's config info in metadata
+                # Some safetensors files have config in metadata
+                if "config" in metadata:
+                    try:
+                        return json.loads(metadata["config"])
+                    except:
+                        pass
+                
+                # Try to infer config from common metadata fields
+                # Wan models often have model_format or architecture info
+                print(f"Safetensors metadata keys: {list(metadata.keys())}")
+    except Exception as e:
+        print(f"Could not load config from safetensors metadata: {e}")
+    
+    return None
+
+
 def download_config_for_model(repo_id: str, filename: str = "config.json", 
                                revision: str = "main", cache_dir: Optional[str] = None) -> Dict:
     """
@@ -269,13 +297,19 @@ def download_config_for_model(repo_id: str, filename: str = "config.json",
             force_download=False,
         )
         with open(config_path, 'r') as f:
-            return json.load(f)
-    except Exception:
+            config = json.load(f)
+            # Fix config: WanTransformer3DModel uses 'dim' not 'hidden_size'
+            if "hidden_size" in config and "dim" not in config:
+                config["dim"] = config.pop("hidden_size")
+            return config
+    except Exception as e:
+        print(f"Could not download config.json: {e}")
         # Return default Wan 2.2 14B config
+        # Note: WanTransformer3DModel uses 'dim' not 'hidden_size'
         return {
             "in_channels": 16,
             "out_channels": 16,
-            "hidden_size": 3072,
+            "dim": 3072,
             "num_hidden_layers": 30,
             "num_attention_heads": 24,
             "num_key_value_heads": 24,
@@ -323,6 +357,10 @@ def load_transformer_from_safetensors(safetensors_path: str, config: Dict,
     """
     Load a WanTransformer3DModel from a safetensors file and config.
     """
+    # Fix config: WanTransformer3DModel uses 'dim' not 'hidden_size'
+    if "hidden_size" in config and "dim" not in config:
+        config["dim"] = config.pop("hidden_size")
+    
     # Create model from config
     model = WanTransformer3DModel(**config)
     
@@ -612,40 +650,26 @@ class Wan2214bModel(Wan21):
         self.print_and_status_update(f"Found HIGH noise model: {safetensor_files['high']}")
         self.print_and_status_update(f"Found LOW noise model: {safetensor_files['low']}")
         
-        # Get config (try to download from repo or use default)
-        config = None
-        if is_hf_path:
-            try:
-                # Try to find config.json in the same folder as the safetensors
-                high_folder = os.path.dirname(safetensor_files['high'])
-                if high_folder:
-                    config_filename = os.path.join(high_folder, "config.json")
-                    config = download_config_for_model(transformer_path, config_filename)
-                else:
-                    # In root
-                    config = download_config_for_model(transformer_path, "config.json")
-            except Exception as e:
-                self.print_and_status_update(f"Could not download config.json, using default: {e}")
-                config = download_config_for_model(transformer_path, "config.json")
-        else:
-            # Local path - check for config.json in same folder as safetensors
-            high_path = safetensor_files['high']
-            config_path = os.path.join(os.path.dirname(high_path), "config.json")
-            
-            if os.path.exists(config_path):
-                with open(config_path, 'r') as f:
-                    config = json.load(f)
-            else:
-                # Use default config
-                config = download_config_for_model("", "config.json")
-        
-        # Download or load safetensors files
-        self.print_and_status_update("Loading HIGH noise transformer")
+        # Download safetensors files first so we can extract config from them
+        self.print_and_status_update("Downloading HIGH noise model")
         
         if is_hf_path:
             high_path = download_safetensors_file(transformer_path, safetensor_files['high'])
         else:
             high_path = safetensor_files['high']
+        
+        # Try to load config from safetensors file first
+        config = load_config_from_safetensors(high_path)
+        
+        if config is None:
+            # Try to download config.json from repo
+            self.print_and_status_update("No config in safetensors, trying to download config.json from repo")
+            config = download_config_for_model(transformer_path, "config.json")
+        
+        self.print_and_status_update(f"Using config: {config}")
+        
+        # Now load the transformers using the already downloaded high_path
+        self.print_and_status_update("Loading HIGH noise transformer")
         
         transformer_1 = load_transformer_from_safetensors(
             high_path, config, dtype, device, is_high_noise=True
