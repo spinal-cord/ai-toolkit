@@ -10,6 +10,7 @@ from toolkit.accelerator import unwrap_model
 from toolkit.basic import flush
 from toolkit.models.wan21.wan_utils import add_first_frame_conditioning
 from toolkit.prompt_utils import PromptEmbeds
+from toolkit.train_tools import get_torch_dtype
 from PIL import Image
 from diffusers import UniPCMultistepScheduler
 import torch
@@ -82,8 +83,9 @@ class DualWanTransformer3DModel(torch.nn.Module):
         super().__init__()
         self.transformer_1: WanTransformer3DModel = transformer_1
         self.transformer_2: WanTransformer3DModel = transformer_2
-        self.torch_dtype: torch.dtype = torch_dtype
-        self.device_torch: torch.device = device
+        # Convert string dtype to torch.dtype if needed
+        self.torch_dtype: torch.dtype = get_torch_dtype(torch_dtype) if torch_dtype is not None else torch_dtype
+        self.device_torch: torch.device = torch.device(device) if device is not None else device
         self.boundary_ratio: float = boundary_ratio
         self.boundary: float = self.boundary_ratio * 1000
         self.low_vram: bool = low_vram
