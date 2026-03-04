@@ -307,26 +307,29 @@ def download_config_for_model(repo_id: str, filename: str = "config.json",
         # Return default Wan 2.2 14B config
         # Note: WanTransformer3DModel uses 'dim' not 'hidden_size'
         return {
-            "in_channels": 16,
-            "out_channels": 16,
-            "dim": 3072,
-            "num_hidden_layers": 30,
-            "num_attention_heads": 24,
-            "num_key_value_heads": 24,
-            "cross_attention_dim": 4096,
-            "caption_projection_dim": 4096,
-            "max_sequence_length": 512,
-            "max_batch_size": 16,
-            "activation": "gelu-approximate",
+            "_class_name": "WanTransformer3DModel",
+            "_diffusers_version": "0.35.0.dev0",
+            "_name_or_path": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+            "added_kv_proj_dim": null,
             "attention_head_dim": 128,
-            "patch_size": [1, 2, 2],
-            "moe_intermediate_dim": 6144,
-            "num_experts": 1,
-            "expert_capacity": 1.0,
-            "use_moe": False,
-            "qk_lora": False,
-            "qk_norm": False,
-            "attention_mode": "ta_flash",
+            "cross_attn_norm": true,
+            "eps": 1e-06,
+            "ffn_dim": 13824,
+            "freq_dim": 256,
+            "image_dim": null,
+            "in_channels": 36,
+            "num_attention_heads": 40,
+            "num_layers": 40,
+            "out_channels": 16,
+            "patch_size": [
+                1,
+                2,
+                2
+            ],
+            "pos_embed_seq_len": null,
+            "qk_norm": "rms_norm_across_heads",
+            "rope_max_seq_len": 1024,
+            "text_dim": 4096
         }
 
 
