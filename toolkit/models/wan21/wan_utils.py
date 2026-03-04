@@ -98,12 +98,19 @@ def add_first_frame_conditioning(
 
 	# Choose fast FP8 path when possible
 	if FP8_OPS_AVAILABLE and dtype == torch.float8_e4m3fn:
-		latents_std = fp8_ops.scalar_rdiv_fp8(std_tensor, 1.0)
+		# Make mean & std broadcastable by expanding spatial & temporal dims
+		mean_tensor = mean_tensor.expand_as(latent_condition)
+		std_tensor  = std_tensor.expand_as(latent_condition)
+
+		latents_std = fp8_ops.scalar_rdiv_fp8(std_tensor, 1.0)   # still scalar op
+		diff        = fp8_ops.fp8_sub(latent_condition, mean_tensor)
+		latent_condition = fp8_ops.fp8_mul(diff, latents_std)
 	else:
 		latents_std = 1.0 / std_tensor
-
-	# Apply normalization
-	latent_condition = (latent_condition - mean_tensor) * latents_std
+		# Apply normalization
+		latent_condition = (latent_condition - mean_tensor) * latents_std
+    
+    
 
 	# ──────────────────────────────────────────────────────────────
 
