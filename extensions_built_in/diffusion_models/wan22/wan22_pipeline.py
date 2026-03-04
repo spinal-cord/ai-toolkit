@@ -23,23 +23,23 @@ class Wan22Pipeline(WanPipeline):
         expand_timesteps: bool = False,
         device: torch.device = torch.device("cuda"),
         aggressive_offload: bool = False,
-    ):
-	# Force VAE → bfloat16 early
-	vaeb16 = vae.to(dtype=torch.bfloat16, device=device)
+	):
+        # Force VAE → bfloat16 early
+		vaeb16 = vae.to(dtype=torch.bfloat16, device=device)
 
-	super().__init__(
-		vae=vaeb16,
-		tokenizer=tokenizer,
-		text_encoder=text_encoder,
-		transformer=transformer,
-		transformer_2=transformer_2,
-		boundary_ratio=boundary_ratio,
-		expand_timesteps=expand_timesteps,
-		scheduler=scheduler,
-	)
+		super().__init__(
+            vae=vaeb16,
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            transformer=transformer,
+            transformer_2=transformer_2,
+            boundary_ratio=boundary_ratio,
+            expand_timesteps=expand_timesteps,
+            scheduler=scheduler,
+        )
 
-	self._aggressive_offload = aggressive_offload
-	self._exec_device = device
+		self._aggressive_offload = aggressive_offload
+		self._exec_device = device
 
 	@property
 	def _execution_device(self):
