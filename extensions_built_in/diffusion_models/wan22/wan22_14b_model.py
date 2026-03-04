@@ -69,6 +69,58 @@ scheduler_configUniPC = {
     "use_karras_sigmas": False,
 }
 
+import torch
+import torch.nn.functional as F
+
+class FP8PatchEmbed(torch.nn.Module):
+	def __init__(self, original_conv: torch.nn.Conv3d):
+		super().__init__()
+		self.original = original_conv
+		self.in_channels = original_conv.in_channels
+		self.embed_dim = original_conv.out_channels
+		self.kernel_size = original_conv.kernel_size
+		self.stride = original_conv.stride
+
+	def forward(self, x):
+		# x : [B, C_in, T, H, W]
+		B, C, T, H, W = x.shape
+
+		# Unfold spatial-temporal patches → flatten to tokens
+		# Equivalent to Conv3d with kernel=(1,2,2), stride=(1,2,2) in Wan
+		x = x.permute(0, 2, 1, 3, 4)                # B T C H W
+		x = x.reshape(B * T, C, H, W)
+
+		# To depth → space-to-depth like (for 2×2 spatial patch)
+		# For kernel 2×2 spatial → rearrange to channels ×4
+		x = F.unfold(x, kernel_size=(2,2), stride=(2,2))   # B*T, C*4, num_patches_h * num_patches_w
+		x = x.transpose(1, 2)                               # B*T, num_patches, C*4
+
+		# Temporal is usually stride 1 → we keep T dimension separate or flatten later
+
+		# Now treat as sequence: reshape to [B, seq_len, C_in * patch_area]
+		num_patches = x.shape[1]
+		x = x.reshape(B, T * num_patches, -1)              # B, (T * patches), C*4
+
+		# Fake "linear" projection using FP8 matmul
+		weight = self.original.weight.view(self.embed_dim, -1).to(torch.float8_e4m3fn)
+		bias   = self.original.bias.to(torch.float8_e4m3fn) if self.original.bias is not None else None
+
+		# Use torchao or manual scaled matmul if available
+		# Option A: torchao Float8Linear style (install torchao if not present)
+		from torchao.float8 import to_float8, Float8Linear
+		# or manual
+		x_fp8 = to_float8(x, scale=torch.tensor(1.0))  # adjust scaling
+		out = torch.matmul(x_fp8, weight.t())          # FP8 matmul if GPU supports
+
+		if bias is not None:
+			out = out + bias
+
+		# Reshape back if needed to [B, embed_dim, T', H', W']
+		# (you need to know output spatial shape — usually H//2, W//2, T unchanged or T//stride_t)
+		out = out.view(B, -1, self.embed_dim).transpose(1,2)  # adapt
+
+		return out
+
 
 class DualWanTransformer3DModel(torch.nn.Module):
     def __init__(
@@ -698,6 +750,8 @@ class Wan2214bModel(Wan21):
         transformer_1 = load_transformer_from_safetensors(
             high_path, config, model_dtype, device, is_high_noise=True
         )
+        if model_dtype == torch.float8_e4m3fn:
+            transformer_1.patch_embedding = FP8PatchEmbed(transformer_1.patch_embedding)
         
         if self.model_config.low_vram:
             self.print_and_status_update("Moving HIGH noise transformer to CPU")
@@ -722,6 +776,9 @@ class Wan2214bModel(Wan21):
         transformer_2 = load_transformer_from_safetensors(
             low_path, config, model_dtype, device, is_high_noise=False
         )
+        
+        if model_dtype == torch.float8_e4m3fn:
+            transformer_2.patch_embedding = FP8PatchEmbed(transformer_2.patch_embedding)
         
         if self.model_config.low_vram:
             self.print_and_status_update("Moving LOW noise transformer to CPU")
