@@ -11,7 +11,8 @@ from toolkit.paths import COMFY_MODELS_PATH
 # Download URL for the UMT5 text encoder model
 # This is the zootkitty/wan_umt5-xxl_bf16_fixed repository's fixed bf16 version
 # https://huggingface.co/zootkitty/wan_umt5-xxl_bf16_fixed/resolve/main/nsfw_wan_umt5-xxl_bf16_fixed.safetensors?download=true
-UMT5_DOWNLOAD_URL = "https://huggingface.co/zootkitty/nsfw_wan_umt5-xxl_bf16_fixed/resolve/main/nsfw_wan_umt5-xxl_bf16_fixed.safetensors?download=true"
+# UMT5_DOWNLOAD_URL = "https://huggingface.co/zootkitty/nsfw_wan_umt5-xxl_bf16_fixed/resolve/main/nsfw_wan_umt5-xxl_bf16_fixed.safetensors?download=true"
+UMT5_DOWNLOAD_URL = "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-bf16.safetensors"
 
 
 def download_file(url: str, local_path: str, desc: str = "Downloading"):
@@ -49,8 +50,8 @@ def get_umt5_encoder(
     
     # If the file doesn't exist locally, download it from the URL
     if comfy_path is None and COMFY_MODELS_PATH is not None:
-        # Check for the first file in the list (umt5_xxl_fp16.safetensors)
-        target_filename = comfy_files[0] if comfy_files else "text_encoders/umt5_xxl_fp16.safetensors"
+        # Check for the first file in the list (umt5_xxl_bf16.safetensors)
+        target_filename = comfy_files[0] if comfy_files else "text_encoders/umt5_xxl_bf16.safetensors"
         local_file_path = os.path.join(COMFY_MODELS_PATH, target_filename)
         
         if not os.path.exists(local_file_path):
