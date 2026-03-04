@@ -135,7 +135,11 @@ class FP8PatchEmbed(torch.nn.Module):
         # Step 7: add bias (if any)
 		if bias is not None:
             # Bias is added per output feature, so we can add directly
-			out = out + bias
+			if out.dtype == torch.float8_e4m3fn and FP8_OPS_AVAILABLE:
+				bias_expanded = bias.view(1, 1, -1).expand_as(out)
+				out = fp8_ops.fp8_add(out, bias_expanded)
+			else:
+				out = out + bias
 
         # Step 8: final reshape to [B, embed_dim, T * num_patches]
         # This matches the expected input for the transformer blocks.
