@@ -620,7 +620,10 @@ class Wan2214bModel(Wan21):
         else:
             transformer_2.to(self.device_torch)
         
-        return self._create_dual_transformer(transformer_1, transformer_2)
+        # Use the actual dtype from the transformers
+        actual_dtype = transformer_1.dtype
+        
+        return self._create_dual_transformer(transformer_1, transformer_2, actual_dtype)
 
     def _load_wan_transformer_custom(self, transformer_path, subfolder=None, is_hf_path: bool = True):
         """
@@ -650,7 +653,6 @@ class Wan2214bModel(Wan21):
             )
         else:
             model_dtype = torch.float8_e4m3fn
-            pass
         
         if 'low' not in safetensor_files:
             raise ValueError(
@@ -659,7 +661,15 @@ class Wan2214bModel(Wan21):
             )
         else:
             model_dtype = torch.float8_e4m3fn
-            pass
+        
+        # Check if model is already in fp8 format
+        is_already_quantized = model_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        
+        # Update self.torch_dtype to match the actual model dtype when loading fp8 models
+        # This ensures consistency across the model class
+        if is_already_quantized:
+            self.torch_dtype = model_dtype
+            self.print_and_status_update(f"Detected fp8 model, updating torch_dtype to {model_dtype}")
         
         self.print_and_status_update(f"Found HIGH noise model: {safetensor_files['high']}")
         self.print_and_status_update(f"Found LOW noise model: {safetensor_files['low']}")
@@ -695,8 +705,6 @@ class Wan2214bModel(Wan21):
             flush()
         
         # Skip quantization if dtype is already float8 (pre-quantized model)
-        is_already_quantized = model_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-    
         if self.model_config.quantize and not is_already_quantized and self.model_config.accuracy_recovery_adapter is None:
             self.print_and_status_update("Quantizing HIGH noise Transformer")
             quantize_model(self, transformer_1)
@@ -727,19 +735,26 @@ class Wan2214bModel(Wan21):
         elif is_already_quantized and self.model_config.quantize:
             self.print_and_status_update("Skipping quantization - model is already in float8 format")
         
-        return self._create_dual_transformer(transformer_1, transformer_2)
+        # Use self.torch_dtype which has been updated to fp8 if needed
+        # This ensures consistency between self.torch_dtype and the actual model dtype
+        
+        return self._create_dual_transformer(transformer_1, transformer_2, self.torch_dtype)
 
-    def _create_dual_transformer(self, transformer_1, transformer_2):
+    def _create_dual_transformer(self, transformer_1, transformer_2, dtype=None):
         """
         Create DualWanTransformer3DModel from two transformers.
         """
         layer_offloading_transformer = self.model_config.layer_offloading and self.model_config.layer_offloading_transformer_percent > 0
         # make the combined model
+        # Use provided dtype if available, otherwise fall back to self.torch_dtype
+        # This ensures consistency when loading fp8 models directly
+        actual_dtype = dtype if dtype is not None else self.torch_dtype
+        
         self.print_and_status_update("Creating DualWanTransformer3DModel")
         transformer = DualWanTransformer3DModel(
             transformer_1=transformer_1,
             transformer_2=transformer_2,
-            torch_dtype=self.torch_dtype,
+            torch_dtype=actual_dtype,
             device=self.device_torch,
             boundary_ratio=self.boundary_ratio,
             low_vram=self.model_config.low_vram,
@@ -747,7 +762,7 @@ class Wan2214bModel(Wan21):
         
         if self.model_config.quantize and self.model_config.accuracy_recovery_adapter is not None:
             # Skip if already in fp8 format
-            is_already_quantized = self.torch_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            is_already_quantized = actual_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
             if not is_already_quantized:
                 # apply the accuracy recovery adapter to both transformers
                 self.print_and_status_update("Applying Accuracy Recovery Adapter to Transformers")
