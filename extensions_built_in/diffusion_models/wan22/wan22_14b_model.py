@@ -124,7 +124,7 @@ class FP8PatchEmbed(torch.nn.Module):
 		# or manual
 		# x_fp8 = to_float8(x, scale=torch.tensor(1.0))  # adjust scaling
 		# out = torch.matmul(x_fp8, weight.t())          # FP8 matmul if GPU supports
-		out = fp8_ops.fp8_matmul(x_fp8, weight.t())
+		out = fp8_ops.fp8_matmul(x, weight.t())
 
 		if bias is not None:
 			out = out + bias
