@@ -133,13 +133,36 @@ class FP8PatchEmbed(torch.nn.Module):
 		out = out_flat.reshape(B_T, num_patches, self.embed_dim)    # (B*T), num_patches, embed_dim
 
         # Step 7: add bias (if any)
+		# Debug flag – set to True when troubleshooting
+		DEBUG_BIAS = True
+
 		if bias is not None:
+			if DEBUG_BIAS:
+				print(f"[DEBUG] out shape: {out.shape}, dtype: {out.dtype}")
+				print(f"[DEBUG] bias shape: {bias.shape}, dtype: {bias.dtype}")
+				# Check for NaNs/Infs if tensors are float (not fp8)
+				if out.dtype.is_floating_point:
+					print(f"[DEBUG] out has nan: {torch.isnan(out).any()}, inf: {torch.isinf(out).any()}")
+				if bias.dtype.is_floating_point:
+					print(f"[DEBUG] bias has nan: {torch.isnan(bias).any()}, inf: {torch.isinf(bias).any()}")
+
             # Bias is added per output feature, so we can add directly
 			if out.dtype == torch.float8_e4m3fn and FP8_OPS_AVAILABLE:
 				bias_expanded = bias.view(1, 1, -1).expand_as(out)
+				if DEBUG_BIAS:
+					print(f"[DEBUG] bias_expanded shape: {bias_expanded.shape}, dtype: {bias_expanded.dtype}")
+                    # Check contiguity – custom kernels may require contiguous inputs
+					print(f"[DEBUG] out is contiguous: {out.is_contiguous()}")
+					print(f"[DEBUG] bias_expanded is contiguous: {bias_expanded.is_contiguous()}")
 				out = fp8_ops.fp8_add(out, bias_expanded)
 			else:
+                # For non‑fp8, use regular addition
 				out = out + bias
+
+			if DEBUG_BIAS:
+				print(f"[DEBUG] after addition – out shape: {out.shape}, dtype: {out.dtype}")
+				if out.dtype.is_floating_point:
+					print(f"[DEBUG] out has nan: {torch.isnan(out).any()}, inf: {torch.isinf(out).any()}")
 
         # Step 8: final reshape to [B, embed_dim, T * num_patches]
         # This matches the expected input for the transformer blocks.
