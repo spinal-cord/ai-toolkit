@@ -688,6 +688,9 @@ class Wan2214bModel(Wan21):
         # Skip quantization if dtype is already float8 (pre-quantized model)
         is_already_quantized = dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
         
+        print("dtype == ",dtype)
+        print("torch.float8_e4m3fn == ",torch.float8_e4m3fn)
+        
         if self.model_config.quantize and not is_already_quantized and self.model_config.accuracy_recovery_adapter is None:
             self.print_and_status_update("Quantizing HIGH noise Transformer")
             quantize_model(self, transformer_1)
