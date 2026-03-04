@@ -55,7 +55,7 @@ export default async function processQueue() {
           },
         });
         if (nextJob) {
-          console.log(`Starting job ${nextJob.id} on GPU(s) ${nextJob.gpu_ids}`);
+          // console.log(`Starting job ${nextJob.id} on GPU(s) ${nextJob.gpu_ids}`);
           await startJob(nextJob.id);
         } else {
           // no more jobs, stop the queue
