@@ -89,49 +89,57 @@ class FP8PatchEmbed(torch.nn.Module):
 		self.stride = original_conv.stride
 
 	def forward(self, x):
-		# x : [B, C_in, T, H, W]
+        # x : [B, C_in, T, H, W]
 		B, C, T, H, W = x.shape
 
-		# Unfold spatial-temporal patches → flatten to tokens
-		# Equivalent to Conv3d with kernel=(1,2,2), stride=(1,2,2) in Wan
-		x = x.permute(0, 2, 1, 3, 4)                # B T C H W
-		x = x.reshape(B * T, C, H, W)
+        # Step 1: unfold spatial patches (2x2, stride 2) over each frame
+        # Permute to [B, T, C, H, W] and merge batch & time
+		x = x.permute(0, 2, 1, 3, 4)          # B, T, C, H, W
+		x = x.reshape(B * T, C, H, W)          # (B*T), C, H, W
 
-		# To depth → space-to-depth like (for 2×2 spatial patch)
-		# For kernel 2×2 spatial → rearrange to channels ×4
-		# x = F.unfold(x, kernel_size=(2,2), stride=(2,2))   # B*T, C*4, num_patches_h * num_patches_w
-        # New code:
-        
+        # Step 2: apply unfold / im2col (spatial only)
 		if x.dtype == torch.float8_e4m3fn and FP8_OPS_AVAILABLE:
-			x = fp8_ops.fp8_im2col(x, kernel_h=2, kernel_w=2, stride_h=2, stride_w=2)
+            # custom fp8 im2col
+			x = fp8_ops.fp8_im2col(
+                x, kernel_h=2, kernel_w=2,
+                stride_h=2, stride_w=2
+            )                                   # (B*T), C*4, num_patches
 		else:
-			x = F.unfold(x, kernel_size=(2,2), stride=(2,2))
-		x = x.transpose(1, 2)                               # B*T, num_patches, C*4
+			x = F.unfold(x, kernel_size=(2,2), stride=(2,2))   # same shape
 
-		# Temporal is usually stride 1 → we keep T dimension separate or flatten later
+        # Step 3: transpose to (batch*tokens, num_patches, in_features)
+  		x = x.transpose(1, 2)                  # (B*T), num_patches, C*4
 
-		# Now treat as sequence: reshape to [B, seq_len, C_in * patch_area]
-		num_patches = x.shape[1]
-		x = x.reshape(B, T * num_patches, -1)              # B, (T * patches), C*4
+        # Step 4: flatten batch and token dimensions for 2D matmul
+		B_T, num_patches, in_features = x.shape
+		x_flat = x.reshape(-1, in_features)    # (B*T * num_patches), in_features
 
-		# Fake "linear" projection using FP8 matmul
-		weight = self.original.weight.view(self.embed_dim, -1).to(torch.float8_e4m3fn)
-		bias   = self.original.bias.to(torch.float8_e4m3fn) if self.original.bias is not None else None
+        # Step 5: get weight and bias (convert to fp8 once, cache if possible)
+        # Here we assume self.original is the original nn.Linear layer.
+        # For efficiency, you might store fp8 versions in __init__.
+		weight = self.original.weight.view(self.embed_dim, -1)
+		bias = self.original.bias
 
-		# Use torchao or manual scaled matmul if available
-		# Option A: torchao Float8Linear style (install torchao if not present)
-		# from torchao.float8 import to_float8, Float8Linear
-		# or manual
-		# x_fp8 = to_float8(x, scale=torch.tensor(1.0))  # adjust scaling
-		# out = torch.matmul(x_fp8, weight.t())          # FP8 matmul if GPU supports
-		out = fp8_ops.fp8_matmul(x, weight.t())
+		if x_flat.dtype == torch.float8_e4m3fn and FP8_OPS_AVAILABLE:
+            # Convert weight to fp8 (do this once outside the loop in real code)
+			weight_fp8 = weight.to(torch.float8_e4m3fn)
+            # Matrix multiply using custom fp8 kernel
+			out_flat = fp8_ops.fp8_matmul(x_flat, weight_fp8.t())  # (B*T*num_patches, embed_dim)
+		else:
+            # Fallback to regular matmul (will upcast if needed)
+			out_flat = torch.matmul(x_flat, weight.t())             # (B*T*num_patches, embed_dim)
 
+        # Step 6: reshape back to separate batch/time and patches
+		out = out_flat.reshape(B_T, num_patches, self.embed_dim)    # (B*T), num_patches, embed_dim
+
+        # Step 7: add bias (if any)
 		if bias is not None:
+            # Bias is added per output feature, so we can add directly
 			out = out + bias
 
-		# Reshape back if needed to [B, embed_dim, T', H', W']
-		# (you need to know output spatial shape — usually H//2, W//2, T unchanged or T//stride_t)
-		out = out.view(B, -1, self.embed_dim).transpose(1,2)  # adapt
+        # Step 8: final reshape to [B, embed_dim, T * num_patches]
+        # This matches the expected input for the transformer blocks.
+		out = out.view(B, -1, self.embed_dim).transpose(1, 2)       # B, embed_dim, T * num_patches
 
 		return out
 
