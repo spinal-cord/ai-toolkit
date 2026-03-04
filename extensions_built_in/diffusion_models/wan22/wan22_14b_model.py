@@ -108,7 +108,7 @@ class FP8PatchEmbed(torch.nn.Module):
 			x = F.unfold(x, kernel_size=(2,2), stride=(2,2))   # same shape
 
         # Step 3: transpose to (batch*tokens, num_patches, in_features)
-  		x = x.transpose(1, 2)                  # (B*T), num_patches, C*4
+		x = x.transpose(1, 2)                  # (B*T), num_patches, C*4
 
         # Step 4: flatten batch and token dimensions for 2D matmul
 		B_T, num_patches, in_features = x.shape
