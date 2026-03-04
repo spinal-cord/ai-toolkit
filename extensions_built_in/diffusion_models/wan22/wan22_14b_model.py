@@ -34,6 +34,8 @@ from .wan22_5b_model import (
 from toolkit.memory_management import MemoryManager
 from safetensors.torch import load_file, save_file
 
+import fp8_ops
+
 
 boundary_ratio_t2v = 0.875
 boundary_ratio_i2v = 0.9
@@ -92,7 +94,12 @@ class FP8PatchEmbed(torch.nn.Module):
 
 		# To depth → space-to-depth like (for 2×2 spatial patch)
 		# For kernel 2×2 spatial → rearrange to channels ×4
-		x = F.unfold(x, kernel_size=(2,2), stride=(2,2))   # B*T, C*4, num_patches_h * num_patches_w
+		# x = F.unfold(x, kernel_size=(2,2), stride=(2,2))   # B*T, C*4, num_patches_h * num_patches_w
+        # New code:
+		if x.dtype == torch.float8_e4m3fn:
+			x = fp8_im2col(x, kernel_h=2, kernel_w=2, stride_h=2, stride_w=2)
+		else:
+			x = F.unfold(x, kernel_size=(2,2), stride=(2,2))
 		x = x.transpose(1, 2)                               # B*T, num_patches, C*4
 
 		# Temporal is usually stride 1 → we keep T dimension separate or flatten later
