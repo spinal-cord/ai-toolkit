@@ -120,7 +120,7 @@ class FP8PatchEmbed(torch.nn.Module):
 
 		# Use torchao or manual scaled matmul if available
 		# Option A: torchao Float8Linear style (install torchao if not present)
-		from torchao.float8 import to_float8, Float8Linear
+		# from torchao.float8 import to_float8, Float8Linear
 		# or manual
 		# x_fp8 = to_float8(x, scale=torch.tensor(1.0))  # adjust scaling
 		# out = torch.matmul(x_fp8, weight.t())          # FP8 matmul if GPU supports
