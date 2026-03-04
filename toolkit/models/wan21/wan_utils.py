@@ -17,8 +17,7 @@ try:
 	FP8_OPS_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
 	FP8_OPS_AVAILABLE = False
-	# You can uncomment if you want visibility during development
-	# print("Warning: fp8_ops extension not found → using float32 reciprocal fallback")
+	print("fp8_ops import error!")
 
 
 def add_first_frame_conditioning(

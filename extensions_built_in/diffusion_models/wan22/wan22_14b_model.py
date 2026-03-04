@@ -34,8 +34,13 @@ from .wan22_5b_model import (
 from toolkit.memory_management import MemoryManager
 from safetensors.torch import load_file, save_file
 
-import fp8_ops
-
+# Conditional import of the custom FP8 extension
+try:
+	import fp8_ops
+	FP8_OPS_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+	FP8_OPS_AVAILABLE = False
+	print("fp8_ops import error!")
 
 boundary_ratio_t2v = 0.875
 boundary_ratio_i2v = 0.9
@@ -96,7 +101,8 @@ class FP8PatchEmbed(torch.nn.Module):
 		# For kernel 2×2 spatial → rearrange to channels ×4
 		# x = F.unfold(x, kernel_size=(2,2), stride=(2,2))   # B*T, C*4, num_patches_h * num_patches_w
         # New code:
-		if x.dtype == torch.float8_e4m3fn:
+        
+		if x.dtype == torch.float8_e4m3fn and FP8_OPS_AVAILABLE:
 			x = fp8_im2col(x, kernel_h=2, kernel_w=2, stride_h=2, stride_w=2)
 		else:
 			x = F.unfold(x, kernel_size=(2,2), stride=(2,2))
