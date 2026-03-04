@@ -647,7 +647,8 @@ class Wan2214bModel(Wan21):
                 f"Found files: {list(safetensor_files.keys())}"
             )
         else:
-            dtype = torch.float8_e4m3fn
+            # dtype = torch.float8_e4m3fn
+            pass
         
         if 'low' not in safetensor_files:
             raise ValueError(
@@ -655,7 +656,8 @@ class Wan2214bModel(Wan21):
                 f"Found files: {list(safetensor_files.keys())}"
             )
         else:
-            dtype = torch.float8_e4m3fn
+            # dtype = torch.float8_e4m3fn
+            pass
         
         self.print_and_status_update(f"Found HIGH noise model: {safetensor_files['high']}")
         self.print_and_status_update(f"Found LOW noise model: {safetensor_files['low']}")
