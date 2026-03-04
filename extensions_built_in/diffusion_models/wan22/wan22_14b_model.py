@@ -141,10 +141,10 @@ class FP8PatchEmbed(torch.nn.Module):
 				print(f"[DEBUG] out shape: {out.shape}, dtype: {out.dtype}")
 				print(f"[DEBUG] bias shape: {bias.shape}, dtype: {bias.dtype}")
 				# Check for NaNs/Infs if tensors are float (not fp8)
-				if out.dtype.is_floating_point:
-					print(f"[DEBUG] out has nan: {torch.isnan(out).any()}, inf: {torch.isinf(out).any()}")
-				if bias.dtype.is_floating_point:
-					print(f"[DEBUG] bias has nan: {torch.isnan(bias).any()}, inf: {torch.isinf(bias).any()}")
+				# if out.dtype.is_floating_point:
+				# 	print(f"[DEBUG] out has nan: {torch.isnan(out).any()}, inf: {torch.isinf(out).any()}")
+				# if bias.dtype.is_floating_point:
+				# 	print(f"[DEBUG] bias has nan: {torch.isnan(bias).any()}, inf: {torch.isinf(bias).any()}")
 
             # Bias is added per output feature, so we can add directly
 			if out.dtype == torch.float8_e4m3fn and FP8_OPS_AVAILABLE:
