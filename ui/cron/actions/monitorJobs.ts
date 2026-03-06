@@ -17,7 +17,7 @@ export default async function monitorJobs() {
   });
 
   for (const job of stoppingJobs) {
-    console.log(`Job ${job.id} (${job.name}) should be stopping, checking if process is still alive...`);
+    // console.log(`Job ${job.id} (${job.name}) should be stopping, checking if process is still alive...`);
 
     // Get training folder and check for PID file
     const trainingRoot = await getTrainingFolder();
