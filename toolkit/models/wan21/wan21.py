@@ -393,35 +393,42 @@ class Wan21(BaseModel):
     def load_model(self):
         dtype = self.torch_dtype
         model_path = self.model_config.name_or_path
-
         self.print_and_status_update("Loading Wan model")
         subfolder = 'transformer'
         transformer_path = model_path
         if os.path.exists(transformer_path):
             subfolder = None
             transformer_path = os.path.join(transformer_path, 'transformer')
-        
-        te_path = "ai-toolkit/umt5_xxl_encoder"   
-        if os.path.exists(os.path.join(model_path, 'text_encoder')):
+
+        # ====================== TEXT ENCODER PATH (choose one) ======================
+        # OPTION 1 - DeepBeepMeep/Wan2.1 native (what you asked for)
+        te_path = "DeepBeepMeep/Wan2.1/umt5-xxl"
+        tokenizer_subfolder = None
+        encoder_subfolder = None
+
+        # OPTION 2 - keep old working version (no regression)
+        # te_path = "ai-toolkit/umt5_xxl_encoder"
+        # tokenizer_subfolder = "tokenizer"
+        # encoder_subfolder = "text_encoder"
+
+        # Auto-detect local folders
+        if os.path.exists(os.path.join(model_path, 'umt5-xxl')) and te_path == "DeepBeepMeep/Wan2.1/umt5-xxl":
+            te_path = os.path.join(model_path, 'umt5-xxl')
+            print("[INFO] Using local DeepBeepMeep umt5-xxl folder")
+        elif os.path.exists(os.path.join(model_path, 'text_encoder')) and te_path == "ai-toolkit/umt5_xxl_encoder":
             te_path = model_path
-        
-        vae_path = self.model_config.extras_name_or_path
-        if os.path.exists(os.path.join(model_path, 'vae')):
-            vae_path = model_path
+            tokenizer_subfolder = "tokenizer"
+            encoder_subfolder = "text_encoder"
+            print("[INFO] Using local ai-toolkit structure")
 
-        transformer = self.load_wan_transformer(
-            transformer_path,
-            subfolder=subfolder,
-        )
-
+        transformer = self.load_wan_transformer(transformer_path, subfolder=subfolder)
         flush()
 
         self.print_and_status_update("Loading UMT5EncoderModel")
-        
         tokenizer, text_encoder = get_umt5_encoder(
             model_path=te_path,
-            tokenizer_subfolder="tokenizer",
-            encoder_subfolder="text_encoder",
+            tokenizer_subfolder=tokenizer_subfolder,
+            encoder_subfolder=encoder_subfolder,
             torch_dtype=dtype,
             comfy_files=self._comfy_te_file
         )
@@ -432,9 +439,9 @@ class Wan21(BaseModel):
         if self.model_config.quantize_te:
             self.print_and_status_update("Quantizing UMT5EncoderModel")
             quantize(text_encoder, weights=get_qtype(self.model_config.qtype))
-            freeze(text_encoder)
-            flush()
-        
+        freeze(text_encoder)
+        flush()
+
         if self.model_config.layer_offloading and self.model_config.layer_offloading_text_encoder_percent > 0:
             MemoryManager.attach(
                 text_encoder,
@@ -444,24 +451,17 @@ class Wan21(BaseModel):
 
         if self.model_config.low_vram:
             print("Moving transformer back to GPU")
-            # we can move it back to the gpu now
             transformer.to(self.device_torch)
 
         scheduler = Wan21.get_train_scheduler()
+
         self.print_and_status_update("Loading VAE")
-        # IMPORTANT: Load VAE in its native/binary dtype to avoid unwanted conversions.
-        # For WAN VAEs published in BF16, align to the training dtype (bf16) here.
-        # Using fp32 here will upcast BF16 weights and can cause soft/pixelated outputs.
         vae_dtype = self.torch_dtype
         if self._wan_vae_path is not None:
-            # load the vae from individual repo
-            vae = AutoencoderKLWan.from_pretrained(
-                self._wan_vae_path, torch_dtype=vae_dtype
-            ).to(dtype=vae_dtype)
+            vae = AutoencoderKLWan.from_pretrained(self._wan_vae_path, torch_dtype=vae_dtype).to(dtype=vae_dtype)
         else:
-            vae = AutoencoderKLWan.from_pretrained(
-                vae_path, subfolder="vae", torch_dtype=vae_dtype
-            ).to(dtype=vae_dtype)
+            vae = AutoencoderKLWan.from_pretrained(model_path, subfolder="vae", torch_dtype=vae_dtype).to(dtype=vae_dtype)
+
         flush()
 
         self.print_and_status_update("Making pipe")
@@ -476,18 +476,16 @@ class Wan21(BaseModel):
         pipe.transformer = transformer
 
         self.print_and_status_update("Preparing Model")
-
         text_encoder = pipe.text_encoder
         tokenizer = pipe.tokenizer
-
         pipe.transformer = pipe.transformer.to(self.device_torch)
-
         flush()
         text_encoder.to(self.device_torch)
         text_encoder.requires_grad_(False)
         text_encoder.eval()
         pipe.transformer = pipe.transformer.to(self.device_torch)
         flush()
+
         self.pipeline = pipe
         self.model = transformer
         self.vae = vae

@@ -3,27 +3,20 @@ import torch
 import os
 import requests
 from tqdm import tqdm
-from transformers import AutoTokenizer, UMT5EncoderModel
+from transformers import AutoTokenizer, UMT5EncoderModel, UMT5Config
+from safetensors.torch import load_file
 from toolkit.models.loaders.comfy import get_comfy_path
 from toolkit.paths import COMFY_MODELS_PATH
 
-
-# Download URL for the UMT5 text encoder model
-# This is the zootkitty/wan_umt5-xxl_bf16_fixed repository's fixed bf16 version
-# https://huggingface.co/zootkitty/wan_umt5-xxl_bf16_fixed/resolve/main/nsfw_wan_umt5-xxl_bf16_fixed.safetensors?download=true
-# UMT5_DOWNLOAD_URL = "https://huggingface.co/zootkitty/nsfw_wan_umt5-xxl_bf16_fixed/resolve/main/nsfw_wan_umt5-xxl_bf16_fixed.safetensors?download=true"
-UMT5_DOWNLOAD_URL = "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-bf16.safetensors"
-
+# Known repo & subfolder for Wan2.1 UMT5-xxl
+UMT5_REPO_ID = "DeepBeepMeep/Wan2.1"
+UMT5_SUBFOLDER = "umt5-xxl"
+UMT5_DOWNLOAD_URL = f"https://huggingface.co/{UMT5_REPO_ID}/resolve/main/{UMT5_SUBFOLDER}/models_t5_umt5-xxl-enc-bf16.safetensors"
 
 def download_file(url: str, local_path: str, desc: str = "Downloading"):
-    """
-    Download a file from a URL to a local path with a progress bar.
-    """
     response = requests.get(url, stream=True)
     response.raise_for_status()
-    
     total_size = int(response.headers.get('content-length', 0))
-    
     with open(local_path, 'wb') as f:
         with tqdm(total=total_size, unit='B', unit_scale=True, desc=desc) as pbar:
             for chunk in response.iter_content(chunk_size=8192):
@@ -31,48 +24,137 @@ def download_file(url: str, local_path: str, desc: str = "Downloading"):
                     f.write(chunk)
                     pbar.update(len(chunk))
 
+def _normalize_umt5_path(model_path: str):
+    if model_path is None or model_path == "" or model_path == UMT5_REPO_ID:
+        return UMT5_REPO_ID, UMT5_SUBFOLDER
+    if os.path.exists(model_path):
+        if os.path.exists(os.path.join(model_path, 'umt5-xxl')):
+            return os.path.join(model_path, 'umt5-xxl'), None
+        return model_path, None
+    if UMT5_SUBFOLDER in model_path or model_path.endswith("/" + UMT5_SUBFOLDER):
+        return UMT5_REPO_ID, UMT5_SUBFOLDER
+    return model_path, None
 
+# ==================== KEY REMAPPING ====================
+def remap_deepbeep_umt5_state_dict(state_dict: dict) -> dict:
+    """DeepBeepMeep native keys to standard HF UMT5EncoderModel keys"""
+    print("Original state_dict keys:")
+    for k in sorted(state_dict.keys()):
+        print(k)
+    if 'blocks.0.ffn.fc1.weight' in state_dict:
+        print(f"[DEBUG] Shape of blocks.0.ffn.fc1.weight: {state_dict['blocks.0.ffn.fc1.weight'].shape}")
+    if 'blocks.0.ffn.gate.0.weight' in state_dict:
+        print(f"[DEBUG] Shape of blocks.0.ffn.gate.0.weight: {state_dict['blocks.0.ffn.gate.0.weight'].shape}")
+    if 'blocks.0.ffn.fc2.weight' in state_dict:
+        print(f"[DEBUG] Shape of blocks.0.ffn.fc2.weight: {state_dict['blocks.0.ffn.fc2.weight'].shape}")
+    if 'blocks.0.pos_embedding.embedding.weight' in state_dict:
+        print(f"[DEBUG] Shape of blocks.0.pos_embedding.embedding.weight: {state_dict['blocks.0.pos_embedding.embedding.weight'].shape}")
+    new_sd = {}
+    for key, value in state_dict.items():
+        handled = False
+        if key == "token_embedding.weight":
+            new_sd["shared.weight"] = value
+            new_sd["encoder.embed_tokens.weight"] = value
+            handled = True
+        if key == "norm.weight" or key == "final_layer_norm.weight":
+            new_sd["encoder.final_layer_norm.weight"] = value
+            handled = True
+        if key.startswith("blocks."):
+            parts = key.split(".")
+            block_idx = parts[1]
+            rest = ".".join(parts[2:])
+            if rest.startswith("attn."):
+                attn_part = rest[5:]  # q/k/v/o .weight
+                new_key = f"encoder.block.{block_idx}.layer.0.SelfAttention.{attn_part}"
+                new_sd[new_key] = value
+                handled = True
+            elif rest.startswith("ffn."):
+                ffn_part = rest[4:]
+                if ffn_part == "fc1.weight":
+                    new_sd[f"encoder.block.{block_idx}.layer.1.DenseReluDense.wi_1.weight"] = value
+                    handled = True
+                elif ffn_part == "gate.0.weight":
+                    new_sd[f"encoder.block.{block_idx}.layer.1.DenseReluDense.wi_0.weight"] = value
+                    handled = True
+                elif ffn_part == "fc2.weight":
+                    new_sd[f"encoder.block.{block_idx}.layer.1.DenseReluDense.wo.weight"] = value
+                    handled = True
+            elif rest == "norm1.weight":
+                new_key = f"encoder.block.{block_idx}.layer.0.layer_norm.weight"
+                new_sd[new_key] = value
+                handled = True
+            elif rest == "norm2.weight":
+                new_key = f"encoder.block.{block_idx}.layer.1.layer_norm.weight"
+                new_sd[new_key] = value
+                handled = True
+            elif rest == "pos_embedding.embedding.weight":
+                new_key = f"encoder.block.{block_idx}.layer.0.SelfAttention.relative_attention_bias.weight"
+                new_sd[new_key] = value
+                handled = True
+        if not handled:
+            print(f"Unknown key skipped: {key}")
+    return new_sd
+
+# ==================== MAIN LOADER ====================
 def get_umt5_encoder(
     model_path: str,
     tokenizer_subfolder: str = None,
     encoder_subfolder: str = None,
-    torch_dtype: str = torch.bfloat16,
-    comfy_files: List[str] = [
-        "text_encoders/umt5_xxl_fp16.safetensors",
-        "text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-    ],
-) -> UMT5EncoderModel:
-    """
-    Load the UMT5 encoder model from the specified path.
-    """
-    tokenizer = AutoTokenizer.from_pretrained(model_path, subfolder=tokenizer_subfolder)
-    comfy_path = get_comfy_path(comfy_files)
-    
-    # If the file doesn't exist locally, download it from the URL
-    if comfy_path is None and COMFY_MODELS_PATH is not None:
-        # Check for the first file in the list (umt5_xxl_bf16.safetensors)
-        target_filename = comfy_files[0] if comfy_files else "text_encoders/umt5_xxl_bf16.safetensors"
-        local_file_path = os.path.join(COMFY_MODELS_PATH, target_filename)
-        
-        if not os.path.exists(local_file_path):
-            print(f"Downloading UMT5 encoder from {UMT5_DOWNLOAD_URL}")
-            print(f"Saving to {local_file_path}")
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
-            download_file(UMT5_DOWNLOAD_URL, local_file_path, desc="Downloading UMT5 encoder")
-            print("Download complete!")
-        
-        if os.path.exists(local_file_path):
-            comfy_path = local_file_path
-    
-    if comfy_path is not None:
-        text_encoder = UMT5EncoderModel.from_single_file(
-            comfy_path, torch_dtype=torch_dtype
-        )
-    else:
-        print(f"Using {model_path} for UMT5 encoder.")
+    torch_dtype: torch.dtype = torch.bfloat16,
+    comfy_files: List[str] = None,
+) -> tuple[AutoTokenizer, UMT5EncoderModel]:
+    if comfy_files is None:
+        comfy_files = ["text_encoders/umt5_xxl_fp16.safetensors"]
+    effective_path, detected_subfolder = _normalize_umt5_path(model_path)
+    is_local_path = os.path.exists(effective_path)
+    print(f"[DEBUG] UMT5 loading - effective_path='{effective_path}', local={is_local_path}")
+    # 1. Old ai-toolkit structure (full backward compatibility)
+    if is_local_path and os.path.exists(os.path.join(effective_path, "text_encoder", "config.json")):
+        print("[INFO] Detected ai-toolkit/umt5_xxl_encoder structure (proven working)")
+        tokenizer = AutoTokenizer.from_pretrained(effective_path, subfolder="tokenizer")
         text_encoder = UMT5EncoderModel.from_pretrained(
-            model_path, subfolder=encoder_subfolder, torch_dtype=torch_dtype
+            effective_path, subfolder="text_encoder", torch_dtype=torch_dtype, low_cpu_mem_usage=True, ignore_mismatched_sizes=True
         )
+        return tokenizer, text_encoder
+    # 2. DeepBeepMeep/Wan2.1 native single-file format (with key remapping)
+    safetensors_path = None
+    if is_local_path:
+        for f in os.listdir(effective_path):
+            if f.endswith('.safetensors') and ('umt5' in f.lower() or 't5' in f.lower()):
+                safetensors_path = os.path.join(effective_path, f)
+                break
+    if safetensors_path and os.path.exists(safetensors_path) or "DeepBeepMeep/Wan2.1" in str(effective_path):
+        print(f"[INFO] Loading DeepBeepMeep/Wan2.1 native format (remapping keys)")
+        if safetensors_path and os.path.exists(safetensors_path):
+            state_dict = load_file(safetensors_path, device="cpu")
+        else:
+            # Cache download once
+            cache_dir = os.path.expanduser("~/.cache/umt5_wan")
+            os.makedirs(cache_dir, exist_ok=True)
+            cached_file = os.path.join(cache_dir, "models_t5_umt5-xxl-enc-bf16.safetensors")
+            if not os.path.exists(cached_file):
+                print("[INFO] Downloading DeepBeepMeep UMT5 (cached forever)...")
+                download_file(UMT5_DOWNLOAD_URL, cached_file)
+            state_dict = load_file(cached_file, device="cpu")
+        state_dict = remap_deepbeep_umt5_state_dict(state_dict)
+        config = UMT5Config.from_pretrained("google/umt5-xxl")
+        text_encoder = UMT5EncoderModel(config).to(dtype=torch_dtype)
+        missing, unexpected = text_encoder.load_state_dict(state_dict, strict=False)
+        print(f"[INFO] Remapped load → missing: {len(missing)}, unexpected: {len(unexpected)}")
+        if missing:
+            print("Missing keys:")
+            for m in sorted(missing):
+                print(m)
+        if unexpected:
+            print("Unexpected keys:")
+            for u in sorted(unexpected):
+                print(u)
+        tokenizer = AutoTokenizer.from_pretrained(effective_path if is_local_path else "DeepBeepMeep/Wan2.1", subfolder=UMT5_SUBFOLDER if not is_local_path else None)
+        return tokenizer, text_encoder
+    # 3. Fallback (standard HF / Comfy)
+    print("[INFO] Falling back to standard HF loading (ai-toolkit compatible)")
+    tokenizer = AutoTokenizer.from_pretrained(effective_path, subfolder=tokenizer_subfolder)
+    text_encoder = UMT5EncoderModel.from_pretrained(
+        effective_path, subfolder=encoder_subfolder, torch_dtype=torch_dtype, ignore_mismatched_sizes=True
+    )
     return tokenizer, text_encoder
-
