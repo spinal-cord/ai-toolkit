@@ -753,7 +753,8 @@ class Wan2214bModel(Wan21):
                 f"Found files: {list(safetensor_files.keys())}"
             )
         else:
-            model_dtype = torch.float8_e4m3fn
+            # model_dtype = torch.float8_e4m3fn
+            pass
         
         if 'low' not in safetensor_files:
             raise ValueError(
@@ -761,7 +762,8 @@ class Wan2214bModel(Wan21):
                 f"Found files: {list(safetensor_files.keys())}"
             )
         else:
-            model_dtype = torch.float8_e4m3fn
+            # model_dtype = torch.float8_e4m3fn
+            pass
         
         # Check if model is already in fp8 format
         is_already_quantized = model_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
