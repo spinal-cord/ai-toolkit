@@ -32,7 +32,7 @@ export default async function monitorJobs() {
           // Check if process is still running
           const { stdout } = await execAsync(`ps -p ${pid} -o pid=`);
           if (stdout.trim()) {
-            console.log(`Process ${pid} is still running, attempting to kill...`);
+            // console.log(`Process ${pid} is still running, attempting to kill...`);
 
             // Try graceful kill first (SIGTERM)
             try {
