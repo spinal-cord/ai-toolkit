@@ -37,7 +37,7 @@ export default async function monitorJobs() {
             // Try graceful kill first (SIGTERM)
             try {
               process.kill(parseInt(pid), 'SIGTERM');
-              console.log(`Sent SIGTERM to process ${pid}`);
+              // console.log(`Sent SIGTERM to process ${pid}`);
 
               // Give it 5 seconds to die gracefully
               await new Promise(resolve => setTimeout(resolve, 5000));
