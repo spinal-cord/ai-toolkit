@@ -59,7 +59,7 @@ export default async function processQueue() {
           await startJob(nextJob.id);
         } else {
           // no more jobs, stop the queue
-          console.log(`No more jobs in queue for GPU(s) ${queue.gpu_ids}, stopping queue`);
+          // console.log(`No more jobs in queue for GPU(s) ${queue.gpu_ids}, stopping queue`);
           await prisma.queue.update({
             where: { id: queue.id },
             data: { is_running: false },
