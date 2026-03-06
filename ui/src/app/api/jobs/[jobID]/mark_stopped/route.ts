@@ -20,7 +20,7 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     },
   });
 
-  console.log(`Job ${jobID} marked as stopped`);
+  // console.log(`Job ${jobID} marked as stopped`);
 
   return NextResponse.json(job);
 }
