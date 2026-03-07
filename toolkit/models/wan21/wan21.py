@@ -435,7 +435,7 @@ class Wan21(BaseModel):
             torch_dtype=dtype,
             comfy_files=self._comfy_te_file
         )
-
+        text_encoder.encoder.embed_tokens.weight = text_encoder.shared.weight
         text_encoder.to(self.device_torch, dtype=dtype)
         flush()
 
