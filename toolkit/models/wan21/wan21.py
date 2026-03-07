@@ -399,6 +399,7 @@ class Wan21(BaseModel):
         if os.path.exists(transformer_path):
             subfolder = None
             transformer_path = os.path.join(transformer_path, 'transformer')
+        
 
         # ====================== TEXT ENCODER PATH (choose one) ======================
         # OPTION 1 - DeepBeepMeep/Wan2.1 native (what you asked for)
@@ -410,7 +411,9 @@ class Wan21(BaseModel):
         # te_path = "ai-toolkit/umt5_xxl_encoder"
         # tokenizer_subfolder = "tokenizer"
         # encoder_subfolder = "text_encoder"
-
+        
+        te_path = "zootkitty/nsfw_wan_umt5-xxl_bf16_fixed"
+        
         # Auto-detect local folders
         if os.path.exists(os.path.join(model_path, 'umt5-xxl')) and te_path == "DeepBeepMeep/Wan2.1/umt5-xxl":
             te_path = os.path.join(model_path, 'umt5-xxl')
