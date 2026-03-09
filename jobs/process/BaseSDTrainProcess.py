@@ -2029,7 +2029,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print(f"Starting fresh from step 0 - clearing old metrics")
                 os.remove(self.metrics_logger.metrics_file)
 
-        optimizer_type = self.train_config.optimizer.lower()
+        optimizer_type = self.train_config.optimizer
         
         # esure params require grad
         self.ensure_params_requires_grad(force=True)
