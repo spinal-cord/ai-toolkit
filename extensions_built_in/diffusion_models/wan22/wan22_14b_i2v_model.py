@@ -116,29 +116,50 @@ class Wan2214bI2VModel(Wan2214bModel):
 	def get_noise_prediction(
 		self,
 		latent_model_input: torch.Tensor,
-		timestep: torch.Tensor,  # 0 to 1000 scale
+		timestep: torch.Tensor,
 		text_embeddings: PromptEmbeds,
 		batch: DataLoaderBatchDTO,
 		**kwargs
 	):
-		# videos come in (bs, num_frames, channels, height, width)
-		# images come in (bs, channels, height, width)
 		with torch.no_grad():
 			frames = batch.tensor
-			if len(frames.shape) == 4:
-				first_frames = frames
-			elif len(frames.shape) == 5:
-				first_frames = frames[:, 0]
-			else:
-				raise ValueError(f"Unknown frame shape {frames.shape}")
 			
-			# Add conditioning using the standalone function
-			conditioned_latent = add_first_frame_conditioning(
-				latent_model_input=latent_model_input,
-				first_frame=first_frames,
-				vae=self.vae
-			)
-		
+			if frames is not None:
+				# Standard path: Pixels are available in RAM
+				if len(frames.shape) == 4:
+					first_frames = frames
+				elif len(frames.shape) == 5:
+					first_frames = frames[:, 0]
+				else:
+					raise ValueError(f"Unknown frame shape {frames.shape}")
+
+				# Add conditioning using the standalone function
+				conditioned_latent = add_first_frame_conditioning(
+					latent_model_input=latent_model_input,
+					first_frame=first_frames,
+					vae=self.vae
+				)
+			else:
+				# Cached path: Pixels are None, construct 36-channel input from cached latents
+				cached_latents = batch.latents  # Shape: (B, 16, T, H, W)
+				B, C, T, H, W = cached_latents.shape
+				
+				# Extract the first frame's latent representation
+				first_frame_latent = cached_latents[:, :, 0:1, :, :]
+				
+				# Broadcast the first frame latent across all T temporal frames
+				first_frame_latent_rep = first_frame_latent.repeat(1, 1, T, 1, 1)
+				
+				# Create the 4-channel temporal mask (1.0 for the first frame, 0.0 for the rest)
+				mask = torch.zeros((B, 4, T, H, W), device=cached_latents.device, dtype=cached_latents.dtype)
+				mask[:, :, 0:1, :, :] = 1.0
+				
+				# Concatenate to form the 20-channel conditioning tensor
+				conditioning = torch.cat([first_frame_latent_rep, mask], dim=1)
+				
+				# Concatenate with the 16-channel noise latent to form the 36-channel input
+				conditioned_latent = torch.cat([latent_model_input, conditioning], dim=1)
+
 		noise_pred = self.model(
 			hidden_states=conditioned_latent,
 			timestep=timestep,
@@ -146,4 +167,5 @@ class Wan2214bI2VModel(Wan2214bModel):
 			return_dict=False,
 			**kwargs
 		)[0]
+
 		return noise_pred

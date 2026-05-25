@@ -192,7 +192,7 @@ class Wan22Pipeline(WanPipeline):
 			height,
 			width,
 			num_frames,
-			torch.bfloat16,               # ← changed from torch.float32
+			torch.float32,               # ← changed from torch.float32
 			device,
 			generator,
 			latents,
@@ -264,7 +264,7 @@ class Wan22Pipeline(WanPipeline):
 				if conditioning is not None:
 					# conditioning is first frame conditioning for 2.2 i2v
 					latent_model_input = torch.cat(
-						[latent_model_input, conditioning], dim=1)
+						[latent_model_input, conditioning.to(device, transformer_dtype)], dim=1)
 
 				noise_pred = current_model(
 					hidden_states=latent_model_input,
