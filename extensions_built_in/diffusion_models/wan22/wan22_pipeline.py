@@ -174,34 +174,30 @@ class Wan22Pipeline(WanPipeline):
 		conditioning = None  # wan2.2 i2v conditioning
 		if latents is not None:
 			if latents.shape[1] == 36:
-				# first 16 channels are latent, other 20 are conditioning
 				conditioning = latents[:, 16:]
 				latents = latents[:, :16]
 				num_channels_latents = 16
 		else:
-			# Handle T2V sampling on I2V models (in_channels == 36)
 			if num_channels_latents == 36:
 				num_channels_latents = 16
 
-		# ────────────────────────────────────────────────
-		# Force latents to bfloat16 (recommended for stability with bf16 VAE)
-		# ────────────────────────────────────────────────
+		# CRITICAL: Latents MUST be float32 for the scheduler's multistep math.
 		latents = self.prepare_latents(
 			batch_size * num_videos_per_prompt,
 			num_channels_latents,
 			height,
 			width,
 			num_frames,
-			torch.float32,               # ← changed from torch.float32
+			torch.float32,                 # ← MUST BE FLOAT32
 			device,
 			generator,
 			latents,
 		)
+
 		if conditioning is None and self.transformer.config.in_channels == 36:
-			# Create empty (zero) conditioning for T2V on I2V models
 			conditioning = torch.zeros(
 				(latents.shape[0], 20, latents.shape[2], latents.shape[3], latents.shape[4]),
-				dtype=latents.dtype,
+				dtype=torch.float32,       # ← Match latents dtype
 				device=latents.device
 			)
 

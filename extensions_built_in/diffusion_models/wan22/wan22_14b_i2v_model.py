@@ -63,7 +63,7 @@ class Wan2214bI2VModel(Wan2214bModel):
 				self.device_torch,
 				generator,
 				None,
-			).to(self.torch_dtype)
+			)
 
 			first_frame_n1p1 = (
 				TF.to_tensor(control_img)
