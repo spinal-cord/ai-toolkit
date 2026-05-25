@@ -80,24 +80,29 @@ class Wan2214bI2VModel(Wan2214bModel):
                 vae=self.vae
             )
 
-        output = pipeline(
-            prompt_embeds=conditional_embeds.text_embeds.to(
-                self.device_torch, dtype=self.torch_dtype
-            ),
-            negative_prompt_embeds=unconditional_embeds.text_embeds.to(
-                self.device_torch, dtype=self.torch_dtype
-            ),
-            height=height,
-            width=width,
-            num_inference_steps=gen_config.num_inference_steps,
-            guidance_scale=gen_config.guidance_scale,
-            latents=gen_config.latents,
-            num_frames=gen_config.num_frames,
-            generator=generator,
-            return_dict=False,
-            output_type="pil",
-            **extra,
-        )[0]
+
+		output = pipeline(
+			prompt_embeds=conditional_embeds.text_embeds.to(
+				self.device_torch, dtype=self.torch_dtype
+			),
+			negative_prompt_embeds=unconditional_embeds.text_embeds.to(
+				self.device_torch, dtype=self.torch_dtype
+			),
+			height=height,
+			width=width,
+			num_inference_steps=gen_config.num_inference_steps,
+			guidance_scale=gen_config.guidance_scale,
+			latents=gen_config.latents,
+			num_frames=gen_config.num_frames,
+			generator=generator,
+			return_dict=False,
+			output_type="pil",
+			# NAG (Negative Attention Guidance) parameters
+			nag_scale=gen_config.nag_scale,
+			nag_alpha=gen_config.nag_alpha,
+			nag_tau=gen_config.nag_tau,
+			**extra,
+		)[0]
 
         # shape = [1, frames, channels, height, width]
         batch_item = output[0]  # list of pil images

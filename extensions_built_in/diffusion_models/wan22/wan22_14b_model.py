@@ -70,244 +70,244 @@ scheduler_configUniPC = {
 
 
 def _process_state_dict_for_fp8(state_dict: Dict[str, torch.Tensor], target_dtype: torch.dtype = torch.bfloat16, debug: bool = True) -> Dict[str, torch.Tensor]:
-	"""
-	Process state dict to dequantize FP8 weights and map keys to diffusers format.
-	Handles:
-	- FP8 quantized weights with scale factors (scale_input, scale_weight)
-	- Key prefix removal (model., diffusion_model., transformer.)
-	- Key remapping for different naming conventions between FP8 and diffusers
-	The FP8 format uses different key names than diffusers:
-	- text_embedding -> condition_embedder.text_embedder.linear_*
-	- head.head -> proj_out
-	- scale_shift_table might be missing (needs to be initialized by diffusers)
-	- self_attn/cross_attn -> attn1/attn2 + to_q/to_k/to_v/to_out.0
-	- ffn.0/ffn.2 -> ffn.net.0.proj / ffn.net.2
-	- norm3 -> norm2
-	- modulation -> scale_shift_table (per-block + head)
-	- 'scaled_fp8' is a ComfyUI-only flag (will be skipped)
-	For non-FP8 (e.g., bf16) models, this function will still process key prefixes
-	and remapping but skip the dequantization step.
-	"""
-	processed_state_dict = {}
-	all_keys = list(state_dict.keys())
+    """
+    Process state dict to dequantize FP8 weights and map keys to diffusers format.
+    Handles:
+    - FP8 quantized weights with scale factors (scale_input, scale_weight)
+    - Key prefix removal (model., diffusion_model., transformer.)
+    - Key remapping for different naming conventions between FP8 and diffusers
+    The FP8 format uses different key names than diffusers:
+    - text_embedding -> condition_embedder.text_embedder.linear_*
+    - head.head -> proj_out
+    - scale_shift_table might be missing (needs to be initialized by diffusers)
+    - self_attn/cross_attn -> attn1/attn2 + to_q/to_k/to_v/to_out.0
+    - ffn.0/ffn.2 -> ffn.net.0.proj / ffn.net.2
+    - norm3 -> norm2
+    - modulation -> scale_shift_table (per-block + head)
+    - 'scaled_fp8' is a ComfyUI-only flag (will be skipped)
+    For non-FP8 (e.g., bf16) models, this function will still process key prefixes
+    and remapping but skip the dequantization step.
+    """
+    processed_state_dict = {}
+    all_keys = list(state_dict.keys())
 # Build set of all scale keys from the state dict
-	scale_keys = set()
-	for key in all_keys:
-		if 'scale_input' in key or 'scale_weight' in key or '._scale' in key:
-			scale_keys.add(key)
+    scale_keys = set()
+    for key in all_keys:
+        if 'scale_input' in key or 'scale_weight' in key or '._scale' in key:
+            scale_keys.add(key)
 # Check if this is an FP8 quantized model
 # FP8 models have keys with scale_input, scale_weight, or ._data suffixes
-	is_fp8_model = any(
-		'scale_input' in k or 'scale_weight' in k or k.endswith('._data')
-		for k in all_keys
-	)
-	if not is_fp8_model:
+    is_fp8_model = any(
+        'scale_input' in k or 'scale_weight' in k or k.endswith('._data')
+        for k in all_keys
+    )
+    if not is_fp8_model:
 # This is not an FP8 model (e.g., bf16) - just return
-		print("This is not an FP8 model (e.g., bf16)")
-		return processed_state_dict
+        print("This is not an FP8 model (e.g., bf16)")
+        return processed_state_dict
 # FP8 model - proceed with full processing
 # Debug: Print some key patterns to understand the structure
-	print(f"DEBUG: FP8 model detected. Total keys in state_dict: {len(all_keys)}")
+    print(f"DEBUG: FP8 model detected. Total keys in state_dict: {len(all_keys)}")
 # Print ALL unique key patterns to understand the structure
-	print("=== DEBUG: ALL KEY PATTERNS ===")
+    print("=== DEBUG: ALL KEY PATTERNS ===")
 # Group keys by their prefix after removing common prefixes
-	key_groups = {}
-	for key in all_keys:
+    key_groups = {}
+    for key in all_keys:
 # Try removing each prefix
-		new_key = key
-		for prefix in ["model.", "diffusion_model.", "transformer."]:
-			if new_key.startswith(prefix):
-				new_key = new_key[len(prefix):]
-				break
+        new_key = key
+        for prefix in ["model.", "diffusion_model.", "transformer."]:
+            if new_key.startswith(prefix):
+                new_key = new_key[len(prefix):]
+                break
 # Get the first part of the key
-		parts = new_key.split('.')
-		if len(parts) >= 2:
-			group = parts[0] + "." + parts[1] if len(parts) > 1 else parts[0]
-		else:
-			group = parts[0] if parts else "unknown"
-		if group not in key_groups:
-			key_groups[group] = []
-		key_groups[group].append(new_key)
-	for group, keys in sorted(key_groups.items()):
-		print(f"Group '{group}': {len(keys)} keys")
+        parts = new_key.split('.')
+        if len(parts) >= 2:
+            group = parts[0] + "." + parts[1] if len(parts) > 1 else parts[0]
+        else:
+            group = parts[0] if parts else "unknown"
+        if group not in key_groups:
+            key_groups[group] = []
+        key_groups[group].append(new_key)
+    for group, keys in sorted(key_groups.items()):
+        print(f"Group '{group}': {len(keys)} keys")
 # Print first 3 keys from each group
-		for k in keys[:3]:
-			print(f" - {k}")
+        for k in keys[:3]:
+            print(f" - {k}")
 # Print keys that contain specific patterns
-	print("\n=== DEBUG: KEYS WITH 'scale_input' ===")
-	scale_input_keys = [k for k in all_keys if 'scale_input' in k]
-	print(f"Found {len(scale_input_keys)} scale_input keys")
-	for k in scale_input_keys[:5]:
-		print(f" - {k}")
-	print("\n=== DEBUG: KEYS WITH 'scale_weight' ===")
-	scale_weight_keys = [k for k in all_keys if 'scale_weight' in k]
-	print(f"Found {len(scale_weight_keys)} scale_weight keys")
-	for k in scale_weight_keys[:5]:
-		print(f" - {k}")
-	print("\n=== DEBUG: KEYS WITH 'blocks' ===")
-	blocks_keys = [k for k in all_keys if 'blocks' in k]
-	print(f"Found {len(blocks_keys)} blocks keys")
+    print("\n=== DEBUG: KEYS WITH 'scale_input' ===")
+    scale_input_keys = [k for k in all_keys if 'scale_input' in k]
+    print(f"Found {len(scale_input_keys)} scale_input keys")
+    for k in scale_input_keys[:5]:
+        print(f" - {k}")
+    print("\n=== DEBUG: KEYS WITH 'scale_weight' ===")
+    scale_weight_keys = [k for k in all_keys if 'scale_weight' in k]
+    print(f"Found {len(scale_weight_keys)} scale_weight keys")
+    for k in scale_weight_keys[:5]:
+        print(f" - {k}")
+    print("\n=== DEBUG: KEYS WITH 'blocks' ===")
+    blocks_keys = [k for k in all_keys if 'blocks' in k]
+    print(f"Found {len(blocks_keys)} blocks keys")
 # Group by block number
-	block_nums = set()
-	for k in blocks_keys:
-		import re
-		match = re.search(r'blocks\.(\d+)', k)
-		if match:
-			block_nums.add(int(match.group(1)))
-	print(f"Block numbers: {sorted(block_nums)}")
+    block_nums = set()
+    for k in blocks_keys:
+        import re
+        match = re.search(r'blocks\.(\d+)', k)
+        if match:
+            block_nums.add(int(match.group(1)))
+    print(f"Block numbers: {sorted(block_nums)}")
 # Print one example from block 0
-	for k in blocks_keys[:5]:
-		print(f" - {k}")
-	print("\n=== DEBUG: KEYS WITH 'weight' (no scale) ===")
-	weight_keys = [k for k in all_keys if 'weight' in k.lower() and 'scale' not in k.lower()]
-	print(f"Found {len(weight_keys)} weight keys")
-	for k in weight_keys[:10]:
-		print(f" - {k}")
-	print("\n=== DEBUG: KEYS WITH 'bias' ===")
-	bias_keys = [k for k in all_keys if 'bias' in k.lower()]
-	print(f"Found {len(bias_keys)} bias keys")
-	for k in bias_keys[:10]:
-		print(f" - {k}")
-	print("\n=== DEBUG: KEYS WITH 'text_embedding' ===")
-	text_emb_keys = [k for k in all_keys if 'text_embedding' in k]
-	for k in text_emb_keys[:10]:
-		print(f" - {k}")
-	print("\n=== DEBUG: KEYS WITH 'head.head' ===")
-	head_keys = [k for k in all_keys if 'head.head' in k or 'head.' in k]
-	for k in head_keys[:10]:
-		print(f" - {k}")
-	print("\n=== DEBUG: KEYS WITH 'patch_embedding' ===")
-	patch_keys = [k for k in all_keys if 'patch_embedding' in k]
-	for k in patch_keys[:10]:
-		print(f" - {k}")
-	print("\n=== DEBUG: KEYS WITH 'modulation' ===")
-	mod_keys = [k for k in all_keys if 'modulation' in k]
-	for k in mod_keys[:10]:
-		print(f" - {k}")
-	print("\n=== DEBUG: SAMPLE KEYS (first 50) ===")
-	for k in all_keys[:50]:
-		print(f" - {k}")
+    for k in blocks_keys[:5]:
+        print(f" - {k}")
+    print("\n=== DEBUG: KEYS WITH 'weight' (no scale) ===")
+    weight_keys = [k for k in all_keys if 'weight' in k.lower() and 'scale' not in k.lower()]
+    print(f"Found {len(weight_keys)} weight keys")
+    for k in weight_keys[:10]:
+        print(f" - {k}")
+    print("\n=== DEBUG: KEYS WITH 'bias' ===")
+    bias_keys = [k for k in all_keys if 'bias' in k.lower()]
+    print(f"Found {len(bias_keys)} bias keys")
+    for k in bias_keys[:10]:
+        print(f" - {k}")
+    print("\n=== DEBUG: KEYS WITH 'text_embedding' ===")
+    text_emb_keys = [k for k in all_keys if 'text_embedding' in k]
+    for k in text_emb_keys[:10]:
+        print(f" - {k}")
+    print("\n=== DEBUG: KEYS WITH 'head.head' ===")
+    head_keys = [k for k in all_keys if 'head.head' in k or 'head.' in k]
+    for k in head_keys[:10]:
+        print(f" - {k}")
+    print("\n=== DEBUG: KEYS WITH 'patch_embedding' ===")
+    patch_keys = [k for k in all_keys if 'patch_embedding' in k]
+    for k in patch_keys[:10]:
+        print(f" - {k}")
+    print("\n=== DEBUG: KEYS WITH 'modulation' ===")
+    mod_keys = [k for k in all_keys if 'modulation' in k]
+    for k in mod_keys[:10]:
+        print(f" - {k}")
+    print("\n=== DEBUG: SAMPLE KEYS (first 50) ===")
+    for k in all_keys[:50]:
+        print(f" - {k}")
 # Additional debug prints for mapping-critical keys (as requested)
-	print("\n=== DEBUG: KEYS WITH 'self_attn' ===")
-	self_attn_keys = [k for k in all_keys if 'self_attn' in k]
-	print(f"Found {len(self_attn_keys)} self_attn keys")
-	for k in self_attn_keys[:8]:
-		print(f" - {k}")
-	print("\n=== DEBUG: KEYS WITH 'cross_attn' ===")
-	cross_attn_keys = [k for k in all_keys if 'cross_attn' in k]
-	print(f"Found {len(cross_attn_keys)} cross_attn keys")
-	for k in cross_attn_keys[:8]:
-		print(f" - {k}")
-	print("\n=== DEBUG: KEYS WITH 'ffn' ===")
-	ffn_keys = [k for k in all_keys if 'ffn' in k]
-	print(f"Found {len(ffn_keys)} ffn keys")
-	for k in ffn_keys[:8]:
-		print(f" - {k}")
-	print("\n=== DEBUG: KEYS WITH 'norm3' ===")
-	norm3_keys = [k for k in all_keys if 'norm3' in k]
-	print(f"Found {len(norm3_keys)} norm3 keys")
-	for k in norm3_keys[:5]:
-		print(f" - {k}")
-	print("\n=== DEBUG: KEYS WITH 'norm' (non-scale) ===")
-	norm_keys = [k for k in all_keys if 'norm' in k.lower() and 'scale' not in k.lower()]
-	print(f"Found {len(norm_keys)} norm keys")
-	for k in sorted(norm_keys)[:15]:
-		print(f" - {k}")
-	print("=== DEBUG: Starting key remapping and dequantization ===")
+    print("\n=== DEBUG: KEYS WITH 'self_attn' ===")
+    self_attn_keys = [k for k in all_keys if 'self_attn' in k]
+    print(f"Found {len(self_attn_keys)} self_attn keys")
+    for k in self_attn_keys[:8]:
+        print(f" - {k}")
+    print("\n=== DEBUG: KEYS WITH 'cross_attn' ===")
+    cross_attn_keys = [k for k in all_keys if 'cross_attn' in k]
+    print(f"Found {len(cross_attn_keys)} cross_attn keys")
+    for k in cross_attn_keys[:8]:
+        print(f" - {k}")
+    print("\n=== DEBUG: KEYS WITH 'ffn' ===")
+    ffn_keys = [k for k in all_keys if 'ffn' in k]
+    print(f"Found {len(ffn_keys)} ffn keys")
+    for k in ffn_keys[:8]:
+        print(f" - {k}")
+    print("\n=== DEBUG: KEYS WITH 'norm3' ===")
+    norm3_keys = [k for k in all_keys if 'norm3' in k]
+    print(f"Found {len(norm3_keys)} norm3 keys")
+    for k in norm3_keys[:5]:
+        print(f" - {k}")
+    print("\n=== DEBUG: KEYS WITH 'norm' (non-scale) ===")
+    norm_keys = [k for k in all_keys if 'norm' in k.lower() and 'scale' not in k.lower()]
+    print(f"Found {len(norm_keys)} norm keys")
+    for k in sorted(norm_keys)[:15]:
+        print(f" - {k}")
+    print("=== DEBUG: Starting key remapping and dequantization ===")
 # Define remapping function
-	def remap_key(key: str) -> str:
+    def remap_key(key: str) -> str:
 # Strip prefixes (already done but safety)
-		for prefix in ["model.", "diffusion_model.", "transformer."]:
-			if key.startswith(prefix):
-				key = key[len(prefix):]
-				break
+        for prefix in ["model.", "diffusion_model.", "transformer."]:
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+                break
 # Text embedding
-		if key.startswith('text_embedding.0.'):
-			return key.replace('text_embedding.0.', 'condition_embedder.text_embedder.linear_1.')
-		if key.startswith('text_embedding.2.'):
-			return key.replace('text_embedding.2.', 'condition_embedder.text_embedder.linear_2.')
+        if key.startswith('text_embedding.0.'):
+            return key.replace('text_embedding.0.', 'condition_embedder.text_embedder.linear_1.')
+        if key.startswith('text_embedding.2.'):
+            return key.replace('text_embedding.2.', 'condition_embedder.text_embedder.linear_2.')
 # Time embedding
-		if key.startswith('time_embedding.0.'):
-			return key.replace('time_embedding.0.', 'condition_embedder.time_embedder.linear_1.')
-		if key.startswith('time_embedding.2.'):
-			return key.replace('time_embedding.2.', 'condition_embedder.time_embedder.linear_2.')
-		if key.startswith('time_projection.1.'):
-			return key.replace('time_projection.1.', 'condition_embedder.time_proj.')
+        if key.startswith('time_embedding.0.'):
+            return key.replace('time_embedding.0.', 'condition_embedder.time_embedder.linear_1.')
+        if key.startswith('time_embedding.2.'):
+            return key.replace('time_embedding.2.', 'condition_embedder.time_embedder.linear_2.')
+        if key.startswith('time_projection.1.'):
+            return key.replace('time_projection.1.', 'condition_embedder.time_proj.')
 # Head
-		if key.startswith('head.head.'):
-			return key.replace('head.head.', 'proj_out.')
-		if key == 'head.modulation':
-			return 'scale_shift_table'
+        if key.startswith('head.head.'):
+            return key.replace('head.head.', 'proj_out.')
+        if key == 'head.modulation':
+            return 'scale_shift_table'
 # Blocks
-		if 'blocks.' in key:
+        if 'blocks.' in key:
 # attn remap + q/k/v/o
-			key = key.replace('.self_attn.', '.attn1.')
-			key = key.replace('.cross_attn.', '.attn2.')
-			key = re.sub(r'\.(q|k|v)\.', r'.to_\1.', key)
-			key = key.replace('.o.', '.to_out.0.')
+            key = key.replace('.self_attn.', '.attn1.')
+            key = key.replace('.cross_attn.', '.attn2.')
+            key = re.sub(r'\.(q|k|v)\.', r'.to_\1.', key)
+            key = key.replace('.o.', '.to_out.0.')
 # ffn
-			key = key.replace('.ffn.0.', '.ffn.net.0.proj.')
-			key = key.replace('.ffn.2.', '.ffn.net.2.')
+            key = key.replace('.ffn.0.', '.ffn.net.0.proj.')
+            key = key.replace('.ffn.2.', '.ffn.net.2.')
 # norm3
-			key = key.replace('.norm3.', '.norm2.')
+            key = key.replace('.norm3.', '.norm2.')
 # modulation
-			if '.modulation' in key:
-				key = key.replace('.modulation', '.scale_shift_table')
-		return key
-	import re
+            if '.modulation' in key:
+                key = key.replace('.modulation', '.scale_shift_table')
+        return key
+    import re
 # ComfyUI-specific keys to completely ignore (they don't exist in Diffusers)
-	ignore_keys = {'scaled_fp8', 'model.scaled_fp8', 'diffusion_model.scaled_fp8', 'transformer.scaled_fp8'}
+    ignore_keys = {'scaled_fp8', 'model.scaled_fp8', 'diffusion_model.scaled_fp8', 'transformer.scaled_fp8'}
 # Process each key in the state dict
-	for key, value in state_dict.items():
+    for key, value in state_dict.items():
 # Skip scale keys (they're handled with their base weights)
-		if key in scale_keys:
-			continue
+        if key in scale_keys:
+            continue
 # Skip known ComfyUI-only flags
-		if key in ignore_keys or key.replace('model.', '').replace('diffusion_model.', '').replace('transformer.', '') in ignore_keys:
-			continue
+        if key in ignore_keys or key.replace('model.', '').replace('diffusion_model.', '').replace('transformer.', '') in ignore_keys:
+            continue
 # Strip common prefixes to get base for remapping
-		stripped_key = key
-		for prefix in ["model.", "diffusion_model.", "transformer."]:
-			if stripped_key.startswith(prefix):
-				stripped_key = stripped_key[len(prefix):]
-				break
-		target_key = remap_key(stripped_key)
+        stripped_key = key
+        for prefix in ["model.", "diffusion_model.", "transformer."]:
+            if stripped_key.startswith(prefix):
+                stripped_key = stripped_key[len(prefix):]
+                break
+        target_key = remap_key(stripped_key)
 # Check if this is an FP8 quantized weight - use FULL original key for scale lookup
-		base = key
-		if base.endswith(('.weight', '.bias')):
-			base = '.'.join(base.split('.')[:-1])
+        base = key
+        if base.endswith(('.weight', '.bias')):
+            base = '.'.join(base.split('.')[:-1])
 # Get scale factors (they exist in original dict)
-		scale_input = state_dict.get(base + '.scale_input')
-		scale_weight = state_dict.get(base + '.scale_weight')
+        scale_input = state_dict.get(base + '.scale_input')
+        scale_weight = state_dict.get(base + '.scale_weight')
 # Dequantize if needed
-		if scale_input is not None or scale_weight is not None:
+        if scale_input is not None or scale_weight is not None:
 # Handle different scale formats (they might be float32 or bf16)
-			if scale_input is not None:
-				scale_input = scale_input.float()
-			if scale_weight is not None:
-				scale_weight = scale_weight.float()
+            if scale_input is not None:
+                scale_input = scale_input.float()
+            if scale_weight is not None:
+                scale_weight = scale_weight.float()
 # Dequantize: value * scale_input (if exists) * scale_weight (if exists)
-			if hasattr(value, 'float'):
-				value = value.float()
-			dequantized = value
-			if scale_input is not None:
-				dequantized = dequantized * scale_input
-			if scale_weight is not None:
-				dequantized = dequantized * scale_weight
+            if hasattr(value, 'float'):
+                value = value.float()
+            dequantized = value
+            if scale_input is not None:
+                dequantized = dequantized * scale_input
+            if scale_weight is not None:
+                dequantized = dequantized * scale_weight
 # Convert to target dtype
-			if target_dtype and target_dtype != torch.float32:
-				try:
-					dequantized = dequantized.to(dtype=target_dtype)
-				except:
-					pass
-			processed_state_dict[target_key] = dequantized
-			continue
+            if target_dtype and target_dtype != torch.float32:
+                try:
+                    dequantized = dequantized.to(dtype=target_dtype)
+                except:
+                    pass
+            processed_state_dict[target_key] = dequantized
+            continue
 # Regular key (norms, biases, patch_embedding, etc.) - just store (with dtype conversion if needed)
-		if target_dtype and value.dtype != target_dtype:
-			value = value.to(target_dtype)
-		processed_state_dict[target_key] = value
-	print(f"DEBUG: Processed {len(processed_state_dict)} keys to Diffusers bf16 format")
-	return processed_state_dict
+        if target_dtype and value.dtype != target_dtype:
+            value = value.to(target_dtype)
+        processed_state_dict[target_key] = value
+    print(f"DEBUG: Processed {len(processed_state_dict)} keys to Diffusers bf16 format")
+    return processed_state_dict
 
 class DualWanTransformer3DModel(torch.nn.Module):
     def __init__(
@@ -465,7 +465,7 @@ def find_safetensors_files_local(base_path: str) -> Dict[str, str]:
     # First, look in subfolders
     if os.path.isdir(base_path):
         subfolders = [d for d in os.listdir(base_path) 
-                     if os.path.isdir(os.path.join(base_path, d)) and not d.startswith('.')]
+                    if os.path.isdir(os.path.join(base_path, d)) and not d.startswith('.')]
         
         for folder in subfolders:
             folder_path = os.path.join(base_path, folder)
@@ -496,7 +496,7 @@ def find_safetensors_files_local(base_path: str) -> Dict[str, str]:
 
 
 def download_config_for_model(repo_id: str, filename: str = "config.json", 
-                               revision: str = "main", cache_dir: Optional[str] = None) -> Dict:
+                            revision: str = "main", cache_dir: Optional[str] = None) -> Dict:
     """
     Download config.json from a HuggingFace repo or use a default Wan2.2 config.
     """
@@ -537,7 +537,7 @@ def download_config_for_model(repo_id: str, filename: str = "config.json",
 
 
 def download_safetensors_file(repo_id: str, filename: str, 
-                               revision: str = "main", cache_dir: Optional[str] = None) -> str:
+                            revision: str = "main", cache_dir: Optional[str] = None) -> str:
     """
     Download a safetensors file from a HuggingFace repo and return local path.
     """
@@ -627,6 +627,9 @@ class Wan2214bModel(Wan21):
     _wan_generation_scheduler_config = scheduler_configUniPC
     _wan_expand_timesteps = False
     _wan_vae_path = "ai-toolkit/wan2.1-vae"
+    # Default flow shift values (can be overridden in config)
+    _default_flow_shift = 5.0
+    _default_inference_flow_shift = 5.0
 
     def __init__(
         self,
@@ -635,6 +638,9 @@ class Wan2214bModel(Wan21):
         dtype="bf16",
         custom_pipeline=None,
         noise_scheduler=None,
+        train_flow_shift=None,
+        sample_flow_shift=None,
+        inference_sampler="unipc",  # Default to unipc for better performance
         **kwargs,
     ):
         super().__init__(
@@ -650,6 +656,13 @@ class Wan2214bModel(Wan21):
         self._wan_cache = None
 
         self.is_multistage = True
+
+        # Store flow shift values from config
+        # train_flow_shift: for training scheduler
+        # sample_flow_shift: for inference scheduler
+        self.train_flow_shift = train_flow_shift if train_flow_shift is not None else self._default_flow_shift
+        self.sample_flow_shift = sample_flow_shift if sample_flow_shift is not None else self._default_inference_flow_shift
+        self.inference_sampler = inference_sampler
 
         # Detect if this is I2V or T2V model
         self.is_i2v = 'i2v' in model_config.name_or_path.lower()
@@ -805,7 +818,7 @@ class Wan2214bModel(Wan21):
             # For local models, try to find safetensors file
             if os.path.exists(transformer_path_2):
                 safetensors_files = [f for f in os.listdir(transformer_path_2) 
-                                   if f.endswith('.safetensors')]
+                                if f.endswith('.safetensors')]
                 if safetensors_files:
                     state_dict = load_file(os.path.join(transformer_path_2, safetensors_files[0]))
         
@@ -1020,8 +1033,31 @@ class Wan2214bModel(Wan21):
 
         return transformer
 
-    def get_generation_pipeline(self):
-        scheduler = UniPCMultistepScheduler(**self._wan_generation_scheduler_config)
+    def get_generation_pipeline(self, inference_sampler=None, flow_shift=None):
+        # Use instance values if not provided
+        if inference_sampler is None:
+            inference_sampler = self.inference_sampler
+        if flow_shift is None:
+            flow_shift = self.sample_flow_shift
+        
+        # Build scheduler config with custom flow_shift if provided
+        sched_config = dict(scheduler_configUniPC)
+        if flow_shift is not None:
+            sched_config['flow_shift'] = flow_shift
+        
+        # Create scheduler based on inference_sampler setting
+        if inference_sampler and inference_sampler.lower() == 'unipc':
+            scheduler = UniPCMultistepScheduler(**sched_config)
+        elif inference_sampler and inference_sampler.lower() == 'euler':
+            from diffusers import FlowMatchEulerDiscreteScheduler
+            scheduler = FlowMatchEulerDiscreteScheduler(**sched_config)
+        elif inference_sampler and inference_sampler.lower() == 'flowmatch':
+            from diffusers import FlowMatchEulerDiscreteScheduler
+            scheduler = FlowMatchEulerDiscreteScheduler(**sched_config)
+        else:
+            # Default to UniPC
+            scheduler = UniPCMultistepScheduler(**sched_config)
+        
         pipeline = Wan22Pipeline(
             vae=self.vae,
             transformer=self.model.transformer_1,
@@ -1041,8 +1077,33 @@ class Wan2214bModel(Wan21):
 
     # static method to get the scheduler
     @staticmethod
-    def get_train_scheduler():
-        scheduler = CustomFlowMatchEulerDiscreteScheduler(**scheduler_config)
+    def get_train_scheduler(flow_shift=None, noise_scheduler=None):
+        # Default flow shift for wan22 14b
+        default_shift = 5.0
+        shift = flow_shift if flow_shift is not None else default_shift
+        
+        # Use noise_scheduler from config if provided, default to unipc
+        scheduler_type = noise_scheduler if noise_scheduler else "unipc"
+        
+        if scheduler_type.lower() == "unipc":
+            train_config = {
+                "num_train_timesteps": 1000,
+                "use_dynamic_shifting": False,
+                "flow_shift": shift,
+                "predict_x0": True,
+                "solver_order": 2,
+                "solver_type": "bh2",
+                "lower_order_final": True,
+            }
+            scheduler = UniPCMultistepScheduler(**train_config)
+        else:
+            # Default to flowmatch for backward compatibility
+            train_config = {
+                "num_train_timesteps": 1000,
+                "shift": shift,
+                "use_dynamic_shifting": False,
+            }
+            scheduler = CustomFlowMatchEulerDiscreteScheduler(**train_config)
         return scheduler
 
     def get_base_model_version(self):
@@ -1207,6 +1268,10 @@ class Wan2214bModel(Wan21):
             generator=generator,
             return_dict=False,
             output_type="pil",
+            # NAG (Negative Attention Guidance) parameters
+            nag_scale=gen_config.nag_scale,
+            nag_alpha=gen_config.nag_alpha,
+            nag_tau=gen_config.nag_tau,
             **extra
         )[0]
 
