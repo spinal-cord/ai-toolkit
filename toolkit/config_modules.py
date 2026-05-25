@@ -75,9 +75,9 @@ class SampleItem:
         self.do_cfg_norm: bool = kwargs.get('do_cfg_norm', False)
         
         # NAG (Negative Attention Guidance) parameters - only for models that support it
-        self.nag_scale: float = kwargs.get('nag_scale', 20.0)
+        self.nag_scale: float = kwargs.get('nag_scale', 1.0)
         self.nag_alpha: float = kwargs.get('nag_alpha', 1.0)
-        self.nag_tau: float = kwargs.get('nag_tau', 5.0)
+        self.nag_tau: float = kwargs.get('nag_tau', 4.0)
 
 class SampleConfig:
     def __init__(self, **kwargs):
@@ -123,9 +123,9 @@ class SampleConfig:
         # NAG_scale: 1.0-20.0 (default 1.0 to enable, 0 to disable)
         # NAG_tau: 1.0-5.0 (default 3.5)
         # NAG_alpha: 0.0-2.0 (default 0.5)
-        self.nag_scale: float = kwargs.get('nag_scale', 20.0)
+        self.nag_scale: float = kwargs.get('nag_scale', 1.0)
         self.nag_alpha: float = kwargs.get('nag_alpha', 1.0)
-        self.nag_tau: float = kwargs.get('nag_tau', 5.0)
+        self.nag_tau: float = kwargs.get('nag_tau', 4.0)
         
     @property
     def prompts(self):
@@ -1071,9 +1071,9 @@ class GenerateImageConfig:
             ctrl_idx: int = 0,
             do_cfg_norm: bool = False,
             # NAG (Negative Attention Guidance) parameters - only for models that support it
-            nag_scale: float = 20.0,
+            nag_scale: float = 1.0,
             nag_alpha: float = 1.0,
-            nag_tau: float = 5.0,
+            nag_tau: float = 4.0,
     ):
         self.width: int = width
         self.height: int = height

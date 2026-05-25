@@ -78,9 +78,9 @@ class Wan22Pipeline(WanPipeline):
 		# NAG_scale: 1.0-20.0 (default 1.0 to enable, 0 to disable)
 		# NAG_tau: 1.0-5.0 (default 3.5)
 		# NAG_alpha: 0.0-2.0 (default 0.5)
-		nag_scale: float = 20.0,
+		nag_scale: float = 1.0,
 		nag_alpha: float = 1.0,
-		nag_tau: float = 5.0,
+		nag_tau: float = 4.0,
 	):
 
 		if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
@@ -300,11 +300,11 @@ class Wan22Pipeline(WanPipeline):
 					# Apply tau-based thresholding:
 					# Compute the scale (similar to attention scores in Wan2GP)
 					# scale = dot(x_pos, x_neg) / (||x_pos|| * ||x_neg||)
-					norm_pos = torch.norm(noise_pred, p=2, dim=-1, keepdim=True)
-					norm_neg = torch.norm(noise_uncond_raw, p=2, dim=-1, keepdim=True)
+					norm_pos = torch.norm(noise_pred, p=2, dim=1, keepdim=True)
+					norm_neg = torch.norm(noise_uncond_raw, p=2, dim=1, keepdim=True)
 					
 					# Compute similarity-based scale (cosine similarity)
-					scale = torch.sum(noise_pred * noise_uncond_raw, dim=-1, keepdim=True) / (norm_pos * norm_neg + 1e-8)
+					scale = torch.sum(noise_pred * noise_uncond_raw, dim=1, keepdim=True) / (norm_pos * norm_neg + 1e-8)
 					scale = torch.nan_to_num(scale, nan=0.0, posinf=10.0, neginf=-10.0)
 					
 					# Wan2GP: factor = 1 / (norm_guidance + 1e-7) * norm_positive * nag_tau
