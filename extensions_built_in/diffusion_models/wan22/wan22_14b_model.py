@@ -33,6 +33,169 @@ from .wan22_5b_model import (
 from toolkit.memory_management import MemoryManager
 from safetensors.torch import load_file, save_file
 
+import re
+import gc
+from typing import Dict
+from safetensors import safe_open
+
+def _remap_wan_key(key: str) -> str:
+    """Remap FP8/ComfyUI keys to Diffusers format."""
+    # Strip common prefixes
+    for prefix in ["model.diffusion_model.", "model.", "diffusion_model.", "transformer."]:
+        if key.startswith(prefix):
+            key = key[len(prefix):]
+            break
+            
+    # Ignore ComfyUI FP8 flags
+    if key in ('scaled_fp8',):
+        return None
+
+    # Head
+    if key.startswith('head.head.'):
+        return key.replace('head.head.', 'proj_out.')
+    if key == 'head.modulation':
+        return 'scale_shift_table'
+
+    # Condition Embedder
+    if key.startswith('text_embedding.0.'):
+        return key.replace('text_embedding.0.', 'condition_embedder.text_embedder.linear_1.')
+    if key.startswith('text_embedding.2.'):
+        return key.replace('text_embedding.2.', 'condition_embedder.text_embedder.linear_2.')
+    if key.startswith('time_embedding.0.'):
+        return key.replace('time_embedding.0.', 'condition_embedder.time_embedder.linear_1.')
+    if key.startswith('time_embedding.2.'):
+        return key.replace('time_embedding.2.', 'condition_embedder.time_embedder.linear_2.')
+    if key.startswith('time_projection.1.'):
+        return key.replace('time_projection.1.', 'condition_embedder.time_proj.')
+
+    # Blocks
+    if key.startswith('blocks.'):
+        if key.endswith('.modulation'):
+            return key.replace('.modulation', '.scale_shift_table')
+        
+        if '.norm3.' in key:
+            key = key.replace('.norm3.', '.norm2.')
+            
+        if '.self_attn.' in key:
+            key = key.replace('.self_attn.', '.attn1.')
+        if '.cross_attn.' in key:
+            key = key.replace('.cross_attn.', '.attn2.')
+            
+        key = re.sub(r'\.(q|k|v)\.', r'.to_\1.', key)
+        if '.o.' in key:
+            key = key.replace('.o.', '.to_out.0.')
+            
+        if '.ffn.0.' in key:
+            key = key.replace('.ffn.0.', '.ffn.net.0.proj.')
+        if '.ffn.2.' in key:
+            key = key.replace('.ffn.2.', '.ffn.net.2.')
+            
+        return key
+
+    return key
+
+def _process_and_cache_fp8(safetensors_path: str, cache_path: str, target_dtype: torch.dtype) -> Dict[str, torch.Tensor]:
+    """
+    Streams tensors from the FP8 safetensors file, dequantizes them, remaps keys, 
+    and saves the result to a cached safetensors file.
+    """
+    processed_state_dict = {}
+    
+    print(f"  Streaming and dequantizing tensors to {target_dtype}...")
+    
+    with safe_open(safetensors_path, framework="pt", device="cpu") as f:
+        all_keys = list(f.keys())
+        
+        # 1. Collect all scale factors into memory (they are tiny float32 tensors)
+        scales = {}
+        for key in all_keys:
+            if key.endswith('.scale_input') or key.endswith('.scale_weight'):
+                scales[key] = f.get_tensor(key).to(torch.float32)
+                
+        # 2. Process weights
+        for key in all_keys:
+            # Skip scale keys and ComfyUI flags entirely
+            if key.endswith('.scale_input') or key.endswith('.scale_weight') or key.endswith('scaled_fp8'):
+                continue
+                
+            target_key = _remap_wan_key(key)
+            if target_key is None:
+                continue
+                
+            value = f.get_tensor(key)
+            
+            # Find corresponding scales using the exact original key
+            scale_input = scales.get(key + '.scale_input')
+            scale_weight = scales.get(key + '.scale_weight')
+            
+            # Dequantize if scales exist
+            if scale_input is not None or scale_weight is not None:
+                value = value.to(torch.float32)
+                if scale_input is not None:
+                    value = value * scale_input
+                if scale_weight is not None:
+                    value = value * scale_weight
+                    
+            # Convert to target dtype
+            value = value.to(target_dtype)
+            processed_state_dict[target_key] = value
+
+    print(f"  Saving remapped model to cache: {os.path.basename(cache_path)}")
+    save_file(processed_state_dict, cache_path)
+    print(f"✓ Cached successfully.")
+    
+    return processed_state_dict
+
+def load_transformer_from_safetensors(safetensors_path: str, config: Dict,
+                                    dtype: torch.dtype, device: torch.device,
+                                    is_high_noise: bool = True) -> WanTransformer3DModel:
+    """
+    Load a WanTransformer3DModel from a safetensors file and config.
+    Handles FP8 quantized weights by dequantizing them and caching the result to disk.
+    """
+    import hashlib
+    
+    if "hidden_size" in config and "dim" not in config:
+        config["dim"] = config.pop("hidden_size")
+        
+    model = WanTransformer3DModel(**config)
+    
+    # Define cache directory inside /workspace/ai-toolkit/
+    cache_dir = "/workspace/ai-toolkit/remapped_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    original_filename = os.path.basename(safetensors_path)
+    base, ext = os.path.splitext(original_filename)
+    
+    # Add a short hash of the original path to avoid collisions between different models
+    path_hash = hashlib.md5(safetensors_path.encode()).hexdigest()[:8]
+    cache_filename = f"{base}_{path_hash}_remapped_{dtype}{ext}"
+    cache_path = os.path.join(cache_dir, cache_filename)
+    
+    if os.path.exists(cache_path):
+        print(f"✓ Found cached remapped model: {cache_filename}")
+        print("  Loading directly from cache (fast path)...")
+        processed_state_dict = load_file(cache_path, device="cpu")
+    else:
+        print(f"Cache not found. Processing model and caching to disk...")
+        print(f"  Cache path: {cache_path}")
+        processed_state_dict = _process_and_cache_fp8(safetensors_path, cache_path, dtype)
+        
+    missing_keys, unexpected_keys = model.load_state_dict(processed_state_dict, strict=False)
+    if missing_keys:
+        print(f"Warning: Missing keys when loading transformer: {missing_keys[:5]}...")
+    if unexpected_keys:
+        print(f"Warning: Unexpected keys when loading transformer: {unexpected_keys[:5]}...")
+        
+    del processed_state_dict
+    gc.collect()
+
+    model = model.to(dtype=dtype)
+    print("Moved model with dtype == ", dtype)
+    if device != torch.device('cpu'):
+        model = model.to(device)
+
+    return model
 
 boundary_ratio_t2v = 0.875
 boundary_ratio_i2v = 0.9
@@ -550,36 +713,6 @@ def download_safetensors_file(repo_id: str, filename: str,
     )
     return local_path
 
-
-def load_transformer_from_safetensors(safetensors_path: str, config: Dict, 
-                                        dtype: torch.dtype, device: torch.device,
-                                        is_high_noise: bool = True) -> WanTransformer3DModel:
-    """
-    Load a WanTransformer3DModel from a safetensors file and config.
-    Handles FP8 quantized weights by dequantizing them to the target dtype.
-    """
-    # Create model from config
-    model = WanTransformer3DModel(**config)
-    
-    # Load weights
-    state_dict = load_file(safetensors_path)
-    
-    # Process state dict to handle FP8 quantization and key mapping
-    processed_state_dict = _process_state_dict_for_fp8(state_dict, dtype)
-    
-    # Load state dict
-    missing_keys, unexpected_keys = model.load_state_dict(processed_state_dict, strict=False)
-    if missing_keys:
-        print(f"Warning: Missing keys when loading transformer: {missing_keys[:5]}...")
-    if unexpected_keys:
-        print(f"Warning: Unexpected keys when loading transformer: {unexpected_keys[:5]}...")
-    
-    # Move to device and dtype
-    model = model.to(dtype=dtype)
-    if device != torch.device('cpu'):
-        model = model.to(device)
-    
-    return model
 
 
 def _is_fp8_quantized_key(key: str) -> bool:
