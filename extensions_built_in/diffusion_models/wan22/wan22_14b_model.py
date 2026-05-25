@@ -1,5 +1,7 @@
 from functools import partial
 import os
+import json
+import tempfile
 from typing import Any, Dict, Optional, Union, List
 from typing_extensions import Self
 import torch
@@ -18,6 +20,7 @@ from toolkit.samplers.custom_flowmatch_sampler import (
 from toolkit.util.quantize import quantize_model
 from .wan22_pipeline import Wan22Pipeline
 from diffusers import WanTransformer3DModel
+from huggingface_hub import hf_hub_download, list_repo_files
 
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
 from torchvision.transforms import functional as TF
@@ -161,6 +164,191 @@ class DualWanTransformer3DModel(torch.nn.Module):
         return self
 
 
+def find_safetensors_files_in_repo(repo_id: str, revision: str = "main") -> Dict[str, str]:
+    """
+    Search for .safetensors files in a HuggingFace repo.
+    First searches in folders, then falls back to root.
+    Returns dict with 'high' and 'low' keys pointing to file paths.
+    """
+    try:
+        all_files = list_repo_files(repo_id, revision=revision)
+    except Exception as e:
+        raise ValueError(f"Could not list files in repo {repo_id}: {e}")
+    
+    # Collect all .safetensors files with their paths
+    safetensor_files = {}
+    
+    # First, look for safetensors in subfolders
+    folders_with_safetensors = {}
+    root_safetensors = []
+    
+    for f in all_files:
+        if f.endswith('.safetensors'):
+            # Check if it's in a subfolder
+            if '/' in f:
+                folder = f.split('/')[0]
+                if folder not in folders_with_safetensors:
+                    folders_with_safetensors[folder] = []
+                folders_with_safetensors[folder].append(f)
+            else:
+                root_safetensors.append(f)
+    
+    # Try to find HIGH and LOW in folder-based safetensors first
+    for folder, files in folders_with_safetensors.items():
+        for f in files:
+            filename = os.path.basename(f).lower()
+            if 'high' in filename:
+                safetensor_files['high'] = f
+            elif 'low' in filename:
+                safetensor_files['low'] = f
+    
+    # If not found in folders, try root
+    if 'high' not in safetensor_files or 'low' not in safetensor_files:
+        for f in root_safetensors:
+            filename = f.lower()
+            if 'high' in filename and 'high' not in safetensor_files:
+                safetensor_files['high'] = f
+            elif 'low' in filename and 'low' not in safetensor_files:
+                safetensor_files['low'] = f
+    
+    return safetensor_files
+
+
+def find_safetensors_files_local(base_path: str) -> Dict[str, str]:
+    """
+    Search for .safetensors files in a local directory.
+    First searches in subfolders, then falls back to root.
+    Returns dict with 'high' and 'low' keys pointing to file paths.
+    """
+    safetensor_files = {}
+    
+    # First, look in subfolders
+    if os.path.isdir(base_path):
+        subfolders = [d for d in os.listdir(base_path) 
+                     if os.path.isdir(os.path.join(base_path, d)) and not d.startswith('.')]
+        
+        for folder in subfolders:
+            folder_path = os.path.join(base_path, folder)
+            files = [f for f in os.listdir(folder_path) 
+                    if f.endswith('.safetensors')]
+            
+            for f in files:
+                filename = f.lower()
+                if 'high' in filename:
+                    safetensor_files['high'] = os.path.join(folder_path, f)
+                elif 'low' in filename:
+                    safetensor_files['low'] = os.path.join(folder_path, f)
+    
+    # If not found in subfolders, look in root
+    if 'high' not in safetensor_files or 'low' not in safetensor_files:
+        if os.path.isdir(base_path):
+            files = [f for f in os.listdir(base_path) 
+                    if f.endswith('.safetensors') and os.path.isfile(os.path.join(base_path, f))]
+            
+            for f in files:
+                filename = f.lower()
+                if 'high' in filename and 'high' not in safetensor_files:
+                    safetensor_files['high'] = os.path.join(base_path, f)
+                elif 'low' in filename and 'low' not in safetensor_files:
+                    safetensor_files['low'] = os.path.join(base_path, f)
+    
+    return safetensor_files
+
+
+def download_config_for_model(repo_id: str, filename: str = "config.json", 
+                               revision: str = "main", cache_dir: Optional[str] = None) -> Dict:
+    """
+    Download config.json from a HuggingFace repo or use a default Wan2.2 config.
+    """
+    try:
+        config_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            revision=revision,
+            cache_dir=cache_dir,
+            force_download=False,
+        )
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    except Exception:
+        # Return default Wan 2.2 14B config
+        return {
+            "in_channels": 16,
+            "out_channels": 16,
+            "hidden_size": 3072,
+            "num_hidden_layers": 30,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 24,
+            "cross_attention_dim": 4096,
+            "caption_projection_dim": 4096,
+            "max_sequence_length": 512,
+            "max_batch_size": 16,
+            "activation": "gelu-approximate",
+            "attention_head_dim": 128,
+            "patch_size": [1, 2, 2],
+            "moe_intermediate_dim": 6144,
+            "num_experts": 1,
+            "expert_capacity": 1.0,
+            "use_moe": False,
+            "qk_lora": False,
+            "qk_norm": False,
+            "attention_mode": "ta_flash",
+        }
+
+
+def download_safetensors_file(repo_id: str, filename: str, 
+                               revision: str = "main", cache_dir: Optional[str] = None) -> str:
+    """
+    Download a safetensors file from a HuggingFace repo and return local path.
+    """
+    local_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        revision=revision,
+        cache_dir=cache_dir,
+        force_download=False,
+    )
+    return local_path
+
+
+def load_transformer_from_safetensors(safetensors_path: str, config: Dict, 
+                                        dtype: torch.dtype, device: torch.device,
+                                        is_high_noise: bool = True) -> WanTransformer3DModel:
+    """
+    Load a WanTransformer3DModel from a safetensors file and config.
+    """
+    # Create model from config
+    model = WanTransformer3DModel(**config)
+    
+    # Load weights
+    state_dict = load_file(safetensors_path)
+    
+    # Handle potential key prefix differences
+    # Common prefixes: "model.", "diffusion_model.", ""
+    processed_state_dict = {}
+    for key, value in state_dict.items():
+        # Remove common prefixes if present
+        new_key = key
+        for prefix in ["model.", "diffusion_model.", "transformer."]:
+            if new_key.startswith(prefix):
+                new_key = new_key[len(prefix):]
+        processed_state_dict[new_key] = value
+    
+    # Load state dict
+    missing_keys, unexpected_keys = model.load_state_dict(processed_state_dict, strict=False)
+    if missing_keys:
+        print(f"Warning: Missing keys when loading transformer: {missing_keys[:5]}...")
+    if unexpected_keys:
+        print(f"Warning: Unexpected keys when loading transformer: {unexpected_keys[:5]}...")
+    
+    # Move to device and dtype
+    model = model.to(dtype=dtype)
+    if device != torch.device('cpu'):
+        model = model.to(device)
+    
+    return model
+
+
 class Wan2214bModel(Wan21):
     arch = "wan22_14b"
     _wan_generation_scheduler_config = scheduler_configUniPC
@@ -262,6 +450,35 @@ class Wan2214bModel(Wan21):
                 "Loading LoRA is not supported for Wan2.2 models currently"
             )
 
+        # Determine if we're loading from HuggingFace or local path
+        is_hf_path = '/' in transformer_path and not os.path.exists(transformer_path)
+        
+        # Check if standard transformer folders exist (for backward compatibility)
+        has_standard_structure = False
+        
+        if is_hf_path:
+            # Check if this is a HF repo with standard structure
+            try:
+                files = list_repo_files(transformer_path)
+                has_standard_structure = 'transformer/config.json' in files or 'transformer_2/config.json' in files
+            except:
+                has_standard_structure = False
+        else:
+            # Check local paths
+            transformer_1_path = transformer_path if subfolder else os.path.join(transformer_path, "transformer")
+            has_standard_structure = os.path.exists(transformer_1_path) and os.path.exists(os.path.join(transformer_1_path, "config.json"))
+        
+        if has_standard_structure:
+            # Use original loading method for standard diffusers format
+            return self._load_wan_transformer_standard(transformer_path, subfolder)
+        else:
+            # Use new method for custom safetensors format
+            return self._load_wan_transformer_custom(transformer_path, subfolder, is_hf_path)
+
+    def _load_wan_transformer_standard(self, transformer_path, subfolder=None):
+        """
+        Load transformers using the standard diffusers format with transformer/ and transformer_2/ folders.
+        """
         # transformer path can be a directory that ends with /transformer or a hf path.
 
         transformer_path_1 = transformer_path
@@ -279,7 +496,7 @@ class Wan2214bModel(Wan21):
             # we have a hf path, replace it with transformer_2 subfolder
             subfolder_2 = "transformer_2"
 
-        self.print_and_status_update("Loading transformer 1")
+        self.print_and_status_update("Loading transformer 1 (standard format)")
         dtype = self.torch_dtype
         transformer_1 = WanTransformer3DModel.from_pretrained(
             transformer_path_1,
@@ -309,7 +526,7 @@ class Wan2214bModel(Wan21):
         else:
             transformer_1.to(self.device_torch)
 
-        self.print_and_status_update("Loading transformer 2")
+        self.print_and_status_update("Loading transformer 2 (standard format)")
         dtype = self.torch_dtype
         transformer_2 = WanTransformer3DModel.from_pretrained(
             transformer_path_2,
@@ -338,7 +555,119 @@ class Wan2214bModel(Wan21):
             transformer_2.to("cpu")
         else:
             transformer_2.to(self.device_torch)
-    
+        
+        return self._create_dual_transformer(transformer_1, transformer_2)
+
+    def _load_wan_transformer_custom(self, transformer_path, subfolder=None, is_hf_path: bool = True):
+        """
+        Load transformers from custom safetensors files (HIGH and LOW noise models).
+        Searches for .safetensors files in folders or root of the repo/path.
+        """
+        dtype = self.torch_dtype
+        device = self.device_torch
+        
+        self.print_and_status_update("Searching for safetensors files in repo")
+        
+        safetensor_files = {}
+        
+        if is_hf_path:
+            # HuggingFace repo
+            safetensor_files = find_safetensors_files_in_repo(transformer_path)
+        else:
+            # Local path
+            safetensor_files = find_safetensors_files_local(transformer_path)
+        
+        if 'high' not in safetensor_files:
+            raise ValueError(
+                f"Could not find a .safetensors file with 'high' in the name in {transformer_path}. "
+                f"Found files: {list(safetensor_files.keys())}"
+            )
+        
+        if 'low' not in safetensor_files:
+            raise ValueError(
+                f"Could not find a .safetensors file with 'low' in the name in {transformer_path}. "
+                f"Found files: {list(safetensor_files.keys())}"
+            )
+        
+        self.print_and_status_update(f"Found HIGH noise model: {safetensor_files['high']}")
+        self.print_and_status_update(f"Found LOW noise model: {safetensor_files['low']}")
+        
+        # Get config (try to download from repo or use default)
+        config = None
+        if is_hf_path:
+            try:
+                # Try to find config.json in the same folder as the safetensors
+                high_folder = os.path.dirname(safetensor_files['high'])
+                if high_folder:
+                    config_filename = os.path.join(high_folder, "config.json")
+                    config = download_config_for_model(transformer_path, config_filename)
+                else:
+                    # In root
+                    config = download_config_for_model(transformer_path, "config.json")
+            except Exception as e:
+                self.print_and_status_update(f"Could not download config.json, using default: {e}")
+                config = download_config_for_model(transformer_path, "config.json")
+        else:
+            # Local path - check for config.json in same folder as safetensors
+            high_path = safetensor_files['high']
+            config_path = os.path.join(os.path.dirname(high_path), "config.json")
+            
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+            else:
+                # Use default config
+                config = download_config_for_model("", "config.json")
+        
+        # Download or load safetensors files
+        self.print_and_status_update("Loading HIGH noise transformer")
+        
+        if is_hf_path:
+            high_path = download_safetensors_file(transformer_path, safetensor_files['high'])
+        else:
+            high_path = safetensor_files['high']
+        
+        transformer_1 = load_transformer_from_safetensors(
+            high_path, config, dtype, device, is_high_noise=True
+        )
+        
+        if self.model_config.low_vram:
+            self.print_and_status_update("Moving HIGH noise transformer to CPU")
+            transformer_1.to('cpu')
+            flush()
+        
+        if self.model_config.quantize and self.model_config.accuracy_recovery_adapter is None:
+            self.print_and_status_update("Quantizing HIGH noise Transformer")
+            quantize_model(self, transformer_1)
+            flush()
+        
+        self.print_and_status_update("Loading LOW noise transformer")
+        
+        if is_hf_path:
+            low_path = download_safetensors_file(transformer_path, safetensor_files['low'])
+        else:
+            low_path = safetensor_files['low']
+        
+        transformer_2 = load_transformer_from_safetensors(
+            low_path, config, dtype, device, is_high_noise=False
+        )
+        
+        if self.model_config.low_vram:
+            self.print_and_status_update("Moving LOW noise transformer to CPU")
+            transformer_2.to('cpu')
+            flush()
+        
+        if self.model_config.quantize and self.model_config.accuracy_recovery_adapter is None:
+            self.print_and_status_update("Quantizing LOW noise Transformer")
+            quantize_model(self, transformer_2)
+            flush()
+        
+        return self._create_dual_transformer(transformer_1, transformer_2)
+
+    def _create_dual_transformer(self, transformer_1, transformer_2):
+        """
+        Create DualWanTransformer3DModel from two transformers.
+        """
         layer_offloading_transformer = self.model_config.layer_offloading and self.model_config.layer_offloading_transformer_percent > 0
         # make the combined model
         self.print_and_status_update("Creating DualWanTransformer3DModel")
