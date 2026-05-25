@@ -12,31 +12,31 @@ from diffusers.image_processor import PipelineImageInput
 
 class Wan22Pipeline(WanPipeline):
 	def __init__(
-        self,
-        tokenizer: AutoTokenizer,
-        text_encoder: UMT5EncoderModel,
-        transformer: WanTransformer3DModel,
-        vae: AutoencoderKLWan,
-        scheduler: FlowMatchEulerDiscreteScheduler,
-        transformer_2: Optional[WanTransformer3DModel] = None,
-        boundary_ratio: Optional[float] = None,
-        expand_timesteps: bool = False,
-        device: torch.device = torch.device("cuda"),
-        aggressive_offload: bool = False,
+		self,
+		tokenizer: AutoTokenizer,
+		text_encoder: UMT5EncoderModel,
+		transformer: WanTransformer3DModel,
+		vae: AutoencoderKLWan,
+		scheduler: FlowMatchEulerDiscreteScheduler,
+		transformer_2: Optional[WanTransformer3DModel] = None,
+		boundary_ratio: Optional[float] = None,
+		expand_timesteps: bool = False,
+		device: torch.device = torch.device("cuda"),
+		aggressive_offload: bool = False,
 	):
-        # Force VAE → bfloat16 early
+		# Force VAE → bfloat16 early
 		vaeb16 = vae.to(dtype=torch.bfloat16, device=device)
 
 		super().__init__(
-            vae=vaeb16,
-            tokenizer=tokenizer,
-            text_encoder=text_encoder,
-            transformer=transformer,
-            transformer_2=transformer_2,
-            boundary_ratio=boundary_ratio,
-            expand_timesteps=expand_timesteps,
-            scheduler=scheduler,
-        )
+			vae=vaeb16,
+			tokenizer=tokenizer,
+			text_encoder=text_encoder,
+			transformer=transformer,
+			transformer_2=transformer_2,
+			boundary_ratio=boundary_ratio,
+			expand_timesteps=expand_timesteps,
+			scheduler=scheduler,
+		)
 
 		self._aggressive_offload = aggressive_offload
 		self._exec_device = device
@@ -65,11 +65,19 @@ class Wan22Pipeline(WanPipeline):
 		attention_kwargs: Optional[Dict[str, Any]] = None,
 		callback_on_step_end: Optional[
 			Union[Callable[[int, int, Dict], None],
-			      PipelineCallback, MultiPipelineCallbacks]
+				PipelineCallback, MultiPipelineCallbacks]
 		] = None,
 		callback_on_step_end_tensor_inputs: List[str] = ["latents"],
 		max_sequence_length: int = 512,
 		noise_mask: Optional[torch.Tensor] = None,
+
+		# NAG (Negative Attention Guidance) parameters
+		# NAG_scale: 1.0-20.0 (default 1.0 to enable, 0 to disable)
+		# NAG_tau: 1.0-5.0 (default 3.5)
+		# NAG_alpha: 0.0-2.0 (default 0.5)
+		nag_scale: float = 20.0,
+		nag_alpha: float = 1.0,
+		nag_tau: float = 5.0,
 	):
 
 		if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
@@ -164,6 +172,10 @@ class Wan22Pipeline(WanPipeline):
 				conditioning = latents[:, 16:]
 				latents = latents[:, :16]
 				num_channels_latents = 16
+		else:
+			# Handle T2V sampling on I2V models (in_channels == 36)
+			if num_channels_latents == 36:
+				num_channels_latents = 16
 
 		# ────────────────────────────────────────────────
 		# Force latents to bfloat16 (recommended for stability with bf16 VAE)
@@ -179,6 +191,13 @@ class Wan22Pipeline(WanPipeline):
 			generator,
 			latents,
 		)
+		if conditioning is None and self.transformer.config.in_channels == 36:
+			# Create empty (zero) conditioning for T2V on I2V models
+			conditioning = torch.zeros(
+				(latents.shape[0], 20, latents.shape[2], latents.shape[3], latents.shape[4]),
+				dtype=latents.dtype,
+				device=latents.device
+			)
 
 		mask = noise_mask
 		if mask is None:
@@ -242,15 +261,68 @@ class Wan22Pipeline(WanPipeline):
 					return_dict=False,
 				)[0]
 
-				if self.do_classifier_free_guidance:
-					noise_uncond = current_model(
+				# NAG (Negative Attention Guidance) - Based on Wan2GP's approach
+				# NAG works even without CFG (guidance_scale <= 1), which is a key feature
+				# The formula is: x_guidance = x_neg * (1 - nag_scale) + x_pos * nag_scale
+				# Then apply tau thresholding and alpha blending
+				# IMPORTANT: NAG is applied to raw predictions BEFORE CFG
+				if nag_scale > 1 and negative_prompt_embeds is not None:
+					# Get negative prediction (raw, before CFG)
+					noise_uncond_raw = current_model(
 						hidden_states=latent_model_input,
 						timestep=timestep,
 						encoder_hidden_states=negative_prompt_embeds,
 						attention_kwargs=attention_kwargs,
 						return_dict=False,
 					)[0]
-					noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
+					
+					# Wan2GP formula: x_guidance = x_neg * (1 - nag_scale) + x_pos * nag_scale
+					# This creates a weighted combination where:
+					# - nag_scale = 1: x_guidance = x_pos (no negative influence)
+					# - nag_scale > 1: adds negative influence
+					
+					# Compute weighted guidance using Wan2GP's exact formula
+					noise_nag = noise_uncond_raw * (1 - nag_scale) + noise_pred * nag_scale
+					
+					# Apply tau-based thresholding:
+					# Compute the scale (similar to attention scores in Wan2GP)
+					# scale = dot(x_pos, x_neg) / (||x_pos|| * ||x_neg||)
+					norm_pos = torch.norm(noise_pred, p=2, dim=-1, keepdim=True)
+					norm_neg = torch.norm(noise_uncond_raw, p=2, dim=-1, keepdim=True)
+					
+					# Compute similarity-based scale (cosine similarity)
+					scale = torch.sum(noise_pred * noise_uncond_raw, dim=-1, keepdim=True) / (norm_pos * norm_neg + 1e-8)
+					scale = torch.nan_to_num(scale, nan=0.0, posinf=10.0, neginf=-10.0)
+					
+					# Wan2GP: factor = 1 / (norm_guidance + 1e-7) * norm_positive * nag_tau
+					factor = 1.0 / (norm_neg + 1e-7) * norm_pos * nag_tau
+					
+					# Apply threshold: where scale > nag_tau, apply the factor
+					noise_nag = torch.where(
+						scale > nag_tau,
+						noise_nag * factor,
+						noise_nag
+					)
+					
+					# Final blending: x_final = x_guidance * nag_alpha + x_pos * (1 - nag_alpha)
+					noise_pred = noise_nag * nag_alpha + noise_pred * (1 - nag_alpha)
+				
+				# Apply CFG if enabled (after NAG)
+				if self.do_classifier_free_guidance:
+					# We need to recompute noise_uncond for CFG (could reuse if already computed for NAG)
+					if nag_scale > 1 and negative_prompt_embeds is not None:
+						# Reuse the raw uncond we computed for NAG
+						noise_uncond = noise_uncond_raw
+					else:
+						noise_uncond = current_model(
+							hidden_states=latent_model_input,
+							timestep=timestep,
+							encoder_hidden_states=negative_prompt_embeds,
+							attention_kwargs=attention_kwargs,
+							return_dict=False,
+						)[0]
+					noise_pred = noise_uncond + current_guidance_scale * \
+						(noise_pred - noise_uncond)
 
 				# compute the previous noisy sample x_t -> x_t-1
 				latents = self.scheduler.step(

@@ -505,6 +505,9 @@ class Wan2214bModel(Wan21):
     _wan_generation_scheduler_config = scheduler_configUniPC
     _wan_expand_timesteps = False
     _wan_vae_path = "ai-toolkit/wan2.1-vae"
+    # Default flow shift values (can be overridden in config)
+    _default_flow_shift = 5.0
+    _default_inference_flow_shift = 5.0
 
     def __init__(
         self,
@@ -513,6 +516,9 @@ class Wan2214bModel(Wan21):
         dtype="bf16",
         custom_pipeline=None,
         noise_scheduler=None,
+        train_flow_shift=None,
+        sample_flow_shift=None,
+        inference_sampler="unipc",  # Default to unipc for better performance
         **kwargs,
     ):
         super().__init__(
@@ -528,6 +534,13 @@ class Wan2214bModel(Wan21):
         self._wan_cache = None
 
         self.is_multistage = True
+
+        # Store flow shift values from config
+        # train_flow_shift: for training scheduler
+        # sample_flow_shift: for inference scheduler
+        self.train_flow_shift = train_flow_shift if train_flow_shift is not None else self._default_flow_shift
+        self.sample_flow_shift = sample_flow_shift if sample_flow_shift is not None else self._default_inference_flow_shift
+        self.inference_sampler = inference_sampler
 
         # Detect if this is I2V or T2V model
         self.is_i2v = 'i2v' in model_config.name_or_path.lower()
@@ -896,8 +909,31 @@ class Wan2214bModel(Wan21):
 
         return transformer
 
-    def get_generation_pipeline(self):
-        scheduler = UniPCMultistepScheduler(**self._wan_generation_scheduler_config)
+    def get_generation_pipeline(self, inference_sampler=None, flow_shift=None):
+        # Use instance values if not provided
+        if inference_sampler is None:
+            inference_sampler = self.inference_sampler
+        if flow_shift is None:
+            flow_shift = self.sample_flow_shift
+        
+        # Build scheduler config with custom flow_shift if provided
+        sched_config = dict(scheduler_configUniPC)
+        if flow_shift is not None:
+            sched_config['flow_shift'] = flow_shift
+        
+        # Create scheduler based on inference_sampler setting
+        if inference_sampler and inference_sampler.lower() == 'unipc':
+            scheduler = UniPCMultistepScheduler(**sched_config)
+        elif inference_sampler and inference_sampler.lower() == 'euler':
+            from diffusers import FlowMatchEulerDiscreteScheduler
+            scheduler = FlowMatchEulerDiscreteScheduler(**sched_config)
+        elif inference_sampler and inference_sampler.lower() == 'flowmatch':
+            from diffusers import FlowMatchEulerDiscreteScheduler
+            scheduler = FlowMatchEulerDiscreteScheduler(**sched_config)
+        else:
+            # Default to UniPC
+            scheduler = UniPCMultistepScheduler(**sched_config)
+        
         pipeline = Wan22Pipeline(
             vae=self.vae,
             transformer=self.model.transformer_1,
@@ -917,8 +953,33 @@ class Wan2214bModel(Wan21):
 
     # static method to get the scheduler
     @staticmethod
-    def get_train_scheduler():
-        scheduler = CustomFlowMatchEulerDiscreteScheduler(**scheduler_config)
+    def get_train_scheduler(flow_shift=None, noise_scheduler=None):
+        # Default flow shift for wan22 14b
+        default_shift = 5.0
+        shift = flow_shift if flow_shift is not None else default_shift
+        
+        # Use noise_scheduler from config if provided, default to unipc
+        scheduler_type = noise_scheduler if noise_scheduler else "unipc"
+        
+        if scheduler_type.lower() == "unipc":
+            train_config = {
+                "num_train_timesteps": 1000,
+                "use_dynamic_shifting": False,
+                "flow_shift": shift,
+                "predict_x0": True,
+                "solver_order": 2,
+                "solver_type": "bh2",
+                "lower_order_final": True,
+            }
+            scheduler = UniPCMultistepScheduler(**train_config)
+        else:
+            # Default to flowmatch for backward compatibility
+            train_config = {
+                "num_train_timesteps": 1000,
+                "shift": shift,
+                "use_dynamic_shifting": False,
+            }
+            scheduler = CustomFlowMatchEulerDiscreteScheduler(**train_config)
         return scheduler
 
     def get_base_model_version(self):
@@ -1083,6 +1144,10 @@ class Wan2214bModel(Wan21):
             generator=generator,
             return_dict=False,
             output_type="pil",
+            # NAG (Negative Attention Guidance) parameters
+            nag_scale=gen_config.nag_scale,
+            nag_alpha=gen_config.nag_alpha,
+            nag_tau=gen_config.nag_tau,
             **extra
         )[0]
 

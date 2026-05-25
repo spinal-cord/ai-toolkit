@@ -321,6 +321,9 @@ class Wan21(BaseModel):
             dtype='bf16',
             custom_pipeline=None,
             noise_scheduler=None,
+            train_flow_shift=None,
+            sample_flow_shift=None,
+            inference_sampler=None,
             **kwargs
     ):
         super().__init__(device, model_config, dtype,
@@ -328,6 +331,11 @@ class Wan21(BaseModel):
         self.is_flow_matching = True
         self.is_transformer = True
         self.target_lora_modules = ['WanTransformer3DModel']
+        
+        # Store flow shift and inference sampler settings
+        self.train_flow_shift = train_flow_shift
+        self.sample_flow_shift = sample_flow_shift
+        self.inference_sampler = inference_sampler
 
         # cache for holding noise
         self.effective_noise = None

@@ -1616,7 +1616,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         ModelClass = get_model_class(self.model_config)
         # if the model class has get_train_scheduler static method
         if hasattr(ModelClass, 'get_train_scheduler'):
-            sampler = ModelClass.get_train_scheduler()
+            # Pass flow_shift from train config if available
+            flow_shift = getattr(self.train_config, 'flow_shift', None)
+            noise_scheduler = getattr(self.train_config, 'noise_scheduler', None)
+            sampler = ModelClass.get_train_scheduler(flow_shift=flow_shift, noise_scheduler=noise_scheduler)
         else:
             # get the noise scheduler
             arch = 'sd'
@@ -1648,6 +1651,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             dtype=self.train_config.dtype,
             custom_pipeline=self.custom_pipeline,
             noise_scheduler=sampler,
+            train_flow_shift=getattr(self.train_config, 'flow_shift', None),
+            sample_flow_shift=getattr(self.sample_config, 'flow_shift', None),
+            inference_sampler=getattr(self.sample_config, 'inference_sampler', None),
         )
         
         self.hook_after_sd_init_before_load()
