@@ -103,8 +103,8 @@ def _process_state_dict_for_fp8(state_dict: Dict[str, torch.Tensor], target_dtyp
 	)
 	if not is_fp8_model:
 # This is not an FP8 model (e.g., bf16) - just return
-		print("This is not an FP8 model (e.g., bf16)")
-		return processed_state_dict
+		print("This is not an FP8 model (e.g., bf16), but keys will be remapped")
+		# return processed_state_dict
 # FP8 model - proceed with full processing
 # Debug: Print some key patterns to understand the structure
 	print(f"DEBUG: FP8 model detected. Total keys in state_dict: {len(all_keys)}")
