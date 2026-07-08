@@ -759,7 +759,17 @@ class Wan2214bModel(Wan21):
         else:
             # Check local paths
             transformer_1_path = transformer_path if subfolder else os.path.join(transformer_path, "transformer")
-            has_standard_structure = os.path.exists(transformer_1_path) and os.path.exists(os.path.join(transformer_1_path, "config.json"))
+            # Check if this is a LoRA/custom path (contains .safetensors files with high/low names)
+            if os.path.isdir(transformer_path):
+                lora_files = [f for f in os.listdir(transformer_path) 
+                             if f.endswith('.safetensors') and os.path.isfile(os.path.join(transformer_path, f))]
+                has_lora_files = any('high' in f.lower() or 'low' in f.lower() for f in lora_files)
+                if has_lora_files:
+                    # LoRA format - use custom loader
+                    has_standard_structure = False
+                else:
+                    # Check for standard structure
+                    has_standard_structure = os.path.exists(transformer_1_path) and os.path.exists(os.path.join(transformer_1_path, "config.json"))
         
         if has_standard_structure:
             # Use original loading method for standard diffusers format
