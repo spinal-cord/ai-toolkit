@@ -88,43 +88,31 @@ def load_config_from_path(safetensors_path: str, model_path: str) -> dict:
 def lora_key_to_model_key(lora_key: str) -> str:
     """
     Map a LoRA tensor key to the corresponding Wan 2.2 model tensor key.
-
-    The LoRA was trained using a Wan2.1-style Unet naming convention:
-        lora_unet_blocks_{N}_ffn_0
-        lora_unet_blocks_{N}_self_attn_k
-        lora_unet_head_head
-        lora_unet_text_embedding_0
-        ...
-
-    The Wan 2.2 model uses a different naming convention:
-        model.diffusion_model.blocks.{N}.ffn.0
-        model.diffusion_model.blocks.{N}.self_attn.k
-        model.diffusion_model.head.head
-        model.diffusion_model.text_embedding.0
-        ...
-
-    This function translates from the LoRA naming to the model naming.
+    
+    Handles TWO naming conventions:
+    1. Old format (Wan2.1-style Unet): lora_unet_blocks_{N}_ffn_0
+    2. New format (Standard diffusers): diffusion_model.blocks.{N}.ffn.0
+    
+    For the old format, translates from unet_* naming to diffusion_model.* naming.
+    For the new format, returns the key as-is (it's already in the correct format).
     """
-    # Remove the "lora_" prefix
-    key = lora_key.replace("lora_", "", 1)
-
-    # Convert "unet_" to "diffusion_model." (Wan2.2 uses diffusion_model, not unet)
-    key = key.replace("unet_", "diffusion_model.", 1)
-
-    # Convert "blocks_N_" to "blocks.N." (only for the block pattern)
-    key = re.sub(r"^diffusion_model\.blocks_(\d+)_", r"diffusion_model.blocks.\1.", key)
-
-    # Convert the last underscore to a dot.
-    # For block keys: self_attn_k -> self_attn.k
-    # For non-block keys: text_embedding_0 -> text_embedding.0
-    last_underscore = key.rfind("_")
-    if last_underscore != -1:
-        key = key[:last_underscore] + "." + key[last_underscore + 1:]
-
-    # Add "model." prefix
-    key = "model." + key
-
-    return key
+    # Check if this is the old format (starts with "lora_unet_" or contains "unet_")
+    if lora_key.startswith("lora_unet_") or ("unet_" in lora_key and not lora_key.startswith("diffusion_model")):
+        # Old format: lora_unet_blocks_N_ffn_0 -> model.diffusion_model.blocks.N.ffn.0
+        key = lora_key.replace("lora_", "", 1)
+        key = key.replace("unet_", "diffusion_model.", 1)
+        key = re.sub(r"^diffusion_model\.blocks_(\d+)_", r"diffusion_model.blocks.\1.", key)
+        last_underscore = key.rfind("_")
+        if last_underscore != -1:
+            key = key[:last_underscore] + "." + key[last_underscore + 1:]
+        key = "model." + key
+        return key
+    else:
+        # New format: already in diffusers naming, just add "model." prefix
+        # e.g., "diffusion_model.blocks.0.cross_attn.k" -> "model.diffusion_model.blocks.0.cross_attn.k"
+        if not lora_key.startswith("model."):
+            return "model." + lora_key
+        return lora_key
 
 
 def merge_lora_into_state_dict(
@@ -135,11 +123,10 @@ def merge_lora_into_state_dict(
     """
     Merge LoRA weights into the base model state dict.
 
-    LoRA format: for each linear layer, there are typically:
-    - {key}.lora_down.weight  (down projection)
-    - {key}.lora_up.weight    (up projection)
-    - {key}.alpha             (scaling factor, optional)
-
+    Supports two LoRA naming conventions:
+    1. Old format (Wan2.1-style): lora_unet_blocks_{N}_ffn_0.lora_down.weight
+    2. New format (Standard diffusers): diffusion_model.blocks.{N}.ffn.0.lora_A.weight
+    
     Merged weight = base_weight + scale * (lora_up @ lora_down) * (alpha / rank)
     """
     merged = {}
@@ -174,22 +161,27 @@ def merge_lora_into_state_dict(
         if "A" not in pairs or "B" not in pairs:
             continue
 
-        # Find the corresponding base weight key.
-        # The LoRA uses a different naming convention (unet_blocks_N_...)
-        # than the Wan 2.2 model (diffusion_model.blocks.N...).
-        # Translate the LoRA key to the model key first.
+        # Translate LoRA key to model key
         model_key = lora_key_to_model_key(base_key)
+        
+        # Try direct match first
         candidate_keys = [
             model_key + ".weight",
             model_key + ".bias",
         ]
 
-        # Find matching base weight
         base_weight_key = None
         for ck in candidate_keys:
             if ck in base_state_dict and "lora" not in ck:
                 base_weight_key = ck
                 break
+
+        if base_weight_key is None:
+            # Fallback: search for partial matches
+            for key in base_state_dict:
+                if key.startswith(model_key) and "lora" not in key and key.endswith(".weight"):
+                    base_weight_key = key
+                    break
 
         if base_weight_key is None:
             print(f"  Warning: Could not find base weight for key: {base_key}")
@@ -211,7 +203,6 @@ def merge_lora_into_state_dict(
         scale_factor = scale * (alpha / lora_A.shape[0])
 
         # Compute the delta weight
-        # For linear layers: delta = scale_factor * (lora_B @ lora_A)
         delta = scale_factor * (lora_B @ lora_A)
 
         # Add to base weight
