@@ -563,10 +563,20 @@ def load_transformer_from_safetensors(safetensors_path: str, config: Dict,
     
     # Load weights
     state_dict = load_file(safetensors_path)
+
+    # Debug: Print the actual dtype being used
+    print(f"Target dtype: {dtype}")
     
-    # Process state dict to handle FP8 quantization and key mapping
-    processed_state_dict = _process_state_dict_for_fp8(state_dict, dtype)
-    
+    # FIX: Use the 'dtype' variable, not the 'torch.dtype' class
+    if dtype != torch.bfloat16:
+        print("Processing state dict for FP8/Remapping (non-bf16)")
+        # Process state dict to handle FP8 quantization and key mapping
+        processed_state_dict = _process_state_dict_for_fp8(state_dict, dtype)
+    else:
+        print("Skipping remapping (bf16 model detected)")
+        # FIX: Assign the raw state dict so it's not undefined
+        processed_state_dict = state_dict
+
     # Load state dict
     missing_keys, unexpected_keys = model.load_state_dict(processed_state_dict, strict=False)
     if missing_keys:
@@ -580,6 +590,7 @@ def load_transformer_from_safetensors(safetensors_path: str, config: Dict,
         model = model.to(device)
     
     return model
+
 
 
 def _is_fp8_quantized_key(key: str) -> bool:
@@ -724,7 +735,16 @@ class Wan2214bModel(Wan21):
             )
 
         # Determine if we're loading from HuggingFace or local path
-        is_hf_path = '/' in transformer_path and not os.path.exists(transformer_path)
+        # Local paths: exist on filesystem, or are absolute/relative paths (start with /, ./, ../)
+        # HF repo IDs: namespace/repo_name format that doesn't exist locally
+        if os.path.exists(transformer_path):
+            is_hf_path = False
+        elif os.path.isabs(transformer_path) or transformer_path.startswith('./') or transformer_path.startswith('../'):
+            # Absolute or relative path - treat as local even if it doesn't exist yet
+            is_hf_path = False
+        else:
+            # Could be an HF repo ID (namespace/repo_name)
+            is_hf_path = True
         
         # Check if standard transformer folders exist (for backward compatibility)
         has_standard_structure = False
@@ -772,8 +792,17 @@ class Wan2214bModel(Wan21):
         # This works for both HuggingFace models (downloaded) and local models
         dtype = self.torch_dtype
         
-        # Check if this is a HuggingFace path
-        is_hf_path = '/' in transformer_path and not os.path.exists(transformer_path)
+        # Determine if loading from HuggingFace repo or local path
+        # Local paths: exist on filesystem, or are absolute/relative paths (start with /, ./, ../)
+        # HF repo IDs: namespace/repo_name format that doesn't exist locally
+        if os.path.exists(transformer_path):
+            is_hf_path = False
+        elif os.path.isabs(transformer_path) or transformer_path.startswith('./') or transformer_path.startswith('../'):
+            # Absolute or relative path - treat as local even if it doesn't exist yet
+            is_hf_path = False
+        else:
+            # Could be an HF repo ID (namespace/repo_name)
+            is_hf_path = True
         
         state_dict = None
         if is_hf_path:
@@ -805,6 +834,7 @@ class Wan2214bModel(Wan21):
         
         # Process state dict for debug output (works for both FP8 and bf16 models)
         if state_dict is not None:
+            print(f"rocess state dict for debug output")
             processed_state_dict = _process_state_dict_for_fp8(state_dict, dtype)
         
         self.print_and_status_update("Loading transformer 1 (standard format)")
