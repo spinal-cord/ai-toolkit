@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import os
+import re
 import sys
 import json
 from collections import OrderedDict
@@ -84,6 +85,48 @@ def load_config_from_path(safetensors_path: str, model_path: str) -> dict:
     return download_config_for_model("", "config.json")
 
 
+def lora_key_to_model_key(lora_key: str) -> str:
+    """
+    Map a LoRA tensor key to the corresponding Wan 2.2 model tensor key.
+
+    The LoRA was trained using a Wan2.1-style Unet naming convention:
+        lora_unet_blocks_{N}_ffn_0
+        lora_unet_blocks_{N}_self_attn_k
+        lora_unet_head_head
+        lora_unet_text_embedding_0
+        ...
+
+    The Wan 2.2 model uses a different naming convention:
+        model.diffusion_model.blocks.{N}.ffn.0
+        model.diffusion_model.blocks.{N}.self_attn.k
+        model.diffusion_model.head.head
+        model.diffusion_model.text_embedding.0
+        ...
+
+    This function translates from the LoRA naming to the model naming.
+    """
+    # Remove the "lora_" prefix
+    key = lora_key.replace("lora_", "", 1)
+
+    # Convert "unet_" to "diffusion_model." (Wan2.2 uses diffusion_model, not unet)
+    key = key.replace("unet_", "diffusion_model.", 1)
+
+    # Convert "blocks_N_" to "blocks.N." (only for the block pattern)
+    key = re.sub(r"^diffusion_model\.blocks_(\d+)_", r"diffusion_model.blocks.\1.", key)
+
+    # Convert the last underscore to a dot.
+    # For block keys: self_attn_k -> self_attn.k
+    # For non-block keys: text_embedding_0 -> text_embedding.0
+    last_underscore = key.rfind("_")
+    if last_underscore != -1:
+        key = key[:last_underscore] + "." + key[last_underscore + 1:]
+
+    # Add "model." prefix
+    key = "model." + key
+
+    return key
+
+
 def merge_lora_into_state_dict(
     base_state_dict: dict,
     lora_state_dict: dict,
@@ -93,11 +136,11 @@ def merge_lora_into_state_dict(
     Merge LoRA weights into the base model state dict.
 
     LoRA format: for each linear layer, there are typically:
-    - {key}.lora_A.weight  (down projection)
-    - {key}.lora_B.weight  (up projection)
-    - {key}.alpha          (scaling factor, optional)
+    - {key}.lora_down.weight  (down projection)
+    - {key}.lora_up.weight    (up projection)
+    - {key}.alpha             (scaling factor, optional)
 
-    Merged weight = base_weight + scale * (lora_B @ lora_A) * (alpha / rank)
+    Merged weight = base_weight + scale * (lora_up @ lora_down) * (alpha / rank)
     """
     merged = {}
 
@@ -131,14 +174,14 @@ def merge_lora_into_state_dict(
         if "A" not in pairs or "B" not in pairs:
             continue
 
-        # Find the corresponding base weight key
-        # The base key in the model could be:
-        # - "to_q.weight", "to_k.weight", etc.
-        # - "q_proj.weight", "k_proj.weight", etc.
-        # - "linear.weight", etc.
+        # Find the corresponding base weight key.
+        # The LoRA uses a different naming convention (unet_blocks_N_...)
+        # than the Wan 2.2 model (diffusion_model.blocks.N...).
+        # Translate the LoRA key to the model key first.
+        model_key = lora_key_to_model_key(base_key)
         candidate_keys = [
-            base_key + ".weight",
-            base_key + ".lora_down.weight",  # skip
+            model_key + ".weight",
+            model_key + ".bias",
         ]
 
         # Find matching base weight
@@ -149,14 +192,8 @@ def merge_lora_into_state_dict(
                 break
 
         if base_weight_key is None:
-            # Try matching with different suffixes
-            for key in base_state_dict:
-                if key.startswith(base_key) and "lora" not in key and key.endswith(".weight"):
-                    base_weight_key = key
-                    break
-
-        if base_weight_key is None:
             print(f"  Warning: Could not find base weight for key: {base_key}")
+            print(f"    (Mapped to model key: {model_key})")
             continue
 
         if base_weight_key in merged_keys:
@@ -260,7 +297,7 @@ def main():
     base_high = os.path.basename(safetensor_files["high"])
     name_high, ext_high = os.path.splitext(base_high)
     high_output = os.path.join(output_path, f"{name_high}_lora{ext_high}")
-    
+
     print(f"\nSaving merged HIGH noise model to {high_output}")
     save_file(merged_high_sd, high_output, metadata={"format": "pt"})
 
@@ -268,10 +305,9 @@ def main():
     base_low = os.path.basename(safetensor_files["low"])
     name_low, ext_low = os.path.splitext(base_low)
     low_output = os.path.join(output_path, f"{name_low}_lora{ext_low}")
-    
+
     print(f"Saving merged LOW noise model to {low_output}")
     save_file(merged_low_sd, low_output, metadata={"format": "pt"})
-    
 
     # Copy config.json if it exists
     config_path = os.path.join(os.path.dirname(safetensor_files["high"]), "config.json")
