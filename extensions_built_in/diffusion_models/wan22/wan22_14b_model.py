@@ -566,16 +566,9 @@ def load_transformer_from_safetensors(safetensors_path: str, config: Dict,
 
     # Debug: Print the actual dtype being used
     print(f"Target dtype: {dtype}")
-    
-    # FIX: Use the 'dtype' variable, not the 'torch.dtype' class
-    if dtype != torch.bfloat16:
-        print("Processing state dict for FP8/Remapping (non-bf16)")
-        # Process state dict to handle FP8 quantization and key mapping
-        processed_state_dict = _process_state_dict_for_fp8(state_dict, dtype)
-    else:
-        print("Skipping remapping (bf16 model detected)")
-        # FIX: Assign the raw state dict so it's not undefined
-        processed_state_dict = state_dict
+
+    print("Processing state dict")
+    processed_state_dict = _process_state_dict_for_fp8(state_dict, dtype)
 
     # Load state dict
     missing_keys, unexpected_keys = model.load_state_dict(processed_state_dict, strict=False)
