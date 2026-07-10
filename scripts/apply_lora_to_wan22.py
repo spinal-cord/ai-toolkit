@@ -57,7 +57,7 @@ def parse_args():
         "--scale",
         type=float,
         default=1.0,
-        help="LoRA scale/multiplier (default: 1.0)",
+        help="LoRA scale/multiplier (default: 1.0)"
     )
     parser.add_argument(
         "--dtype",
@@ -87,32 +87,95 @@ def load_config_from_path(safetensors_path: str, model_path: str) -> dict:
 
 def lora_key_to_model_key(lora_key: str) -> str:
     """
-    Map a LoRA tensor key to the corresponding Wan 2.2 model tensor key.
+    Map a LoRA tensor key to the corresponding Wan 2.2 Diffusers model tensor key.
     
-    Handles TWO naming conventions:
-    1. Old format (Wan2.1-style Unet): lora_unet_blocks_{N}_ffn_0
-    2. New format (Standard diffusers): diffusion_model.blocks.{N}.ffn.0
-    
-    For the old format, translates from unet_* naming to diffusion_model.* naming.
-    For the new format, returns the key as-is (it's already in the correct format).
+    The base model state dict is processed through `_process_state_dict_for_fp8`,
+    which remaps keys from ComfyUI/FP8 naming to Diffusers naming:
+      - cross_attn.k/q/v/o -> attn2.to_k/to_q/to_v/to_out.0
+      - self_attn.k/q/v/o -> attn1.to_k/to_q/to_v/to_out.0
+      - ffn.0/ffn.2        -> ffn.net.0.proj / ffn.net.2
+      - head.head          -> proj_out
+      - text_embedding.N   -> condition_embedder.text_embedder.linear_N
+      - time_embedding.N   -> condition_embedder.time_embedder.linear_N
+      - time_projection.1  -> condition_embedder.time_proj
+      
+    This function produces keys that match the remapped (Diffusers) format so
+    the LoRA merge can find the correct base weights.
     """
-    # Check if this is the old format (starts with "lora_unet_" or contains "unet_")
+    # Map LoRA base keys to Diffusers-format model keys
+    # The lora_key is the base key (without .alpha, .lora_down.weight, .lora_up.weight suffixes)
+    
+    # Handle block-level attention and FFN keys: lora_unet_blocks_{N}_{type}_{sub}
+    if "_blocks_" in lora_key:
+        # Extract block number
+        match = re.match(r"lora_unet_blocks_(\d+)_(.+)", lora_key)
+        if match:
+            block_idx = match.group(1)
+            remainder = match.group(2)
+            
+            # Map the remainder to Diffusers naming
+            # remainder format: cross_attn_k, cross_attn_o, cross_attn_q, cross_attn_v,
+            #                   self_attn_k, self_attn_o, self_attn_q, self_attn_v,
+            #                   ffn_0, ffn_2
+            if remainder.startswith("cross_attn_"):
+                attn_type = "attn2"
+                sub = remainder[len("cross_attn_"):]
+                if sub == "k":
+                    return f"diffusion_model.blocks.{block_idx}.{attn_type}.to_k"
+                elif sub == "q":
+                    return f"diffusion_model.blocks.{block_idx}.{attn_type}.to_q"
+                elif sub == "v":
+                    return f"diffusion_model.blocks.{block_idx}.{attn_type}.to_v"
+                elif sub == "o":
+                    return f"diffusion_model.blocks.{block_idx}.{attn_type}.to_out.0"
+            elif remainder.startswith("self_attn_"):
+                attn_type = "attn1"
+                sub = remainder[len("self_attn_"):]
+                if sub == "k":
+                    return f"diffusion_model.blocks.{block_idx}.{attn_type}.to_k"
+                elif sub == "q":
+                    return f"diffusion_model.blocks.{block_idx}.{attn_type}.to_q"
+                elif sub == "v":
+                    return f"diffusion_model.blocks.{block_idx}.{attn_type}.to_v"
+                elif sub == "o":
+                    return f"diffusion_model.blocks.{block_idx}.{attn_type}.to_out.0"
+            elif remainder == "ffn_0":
+                return f"diffusion_model.blocks.{block_idx}.ffn.net.0.proj"
+            elif remainder == "ffn_2":
+                return f"diffusion_model.blocks.{block_idx}.ffn.net.2"
+    
+    # Handle head key: lora_unet_head_head
+    if lora_key == "lora_unet_head_head":
+        return "diffusion_model.proj_out"
+    
+    # Handle text embedding keys: lora_unet_text_embedding_{0,2}
+    match = re.match(r"lora_unet_text_embedding_(\d+)", lora_key)
+    if match:
+        idx = match.group(1)
+        return f"condition_embedder.text_embedder.linear_{idx}"
+    
+    # Handle time embedding keys: lora_unet_time_embedding_{0,2}
+    match = re.match(r"lora_unet_time_embedding_(\d+)", lora_key)
+    if match:
+        idx = match.group(1)
+        return f"condition_embedder.time_embedder.linear_{idx}"
+    
+    # Handle time projection key: lora_unet_time_projection_1
+    if lora_key == "lora_unet_time_projection_1":
+        return "condition_embedder.time_proj"
+    
+    # Fallback: try to handle generic unet_ prefixed keys by remapping to diffusers format
     if lora_key.startswith("lora_unet_") or ("unet_" in lora_key and not lora_key.startswith("diffusion_model")):
-        # Old format: lora_unet_blocks_N_ffn_0 -> model.diffusion_model.blocks.N.ffn.0
         key = lora_key.replace("lora_", "", 1)
         key = key.replace("unet_", "diffusion_model.", 1)
         key = re.sub(r"^diffusion_model\.blocks_(\d+)_", r"diffusion_model.blocks.\1.", key)
         last_underscore = key.rfind("_")
         if last_underscore != -1:
             key = key[:last_underscore] + "." + key[last_underscore + 1:]
-        key = "model." + key
         return key
-    else:
-        # New format: already in diffusers naming, just add "model." prefix
-        # e.g., "diffusion_model.blocks.0.cross_attn.k" -> "model.diffusion_model.blocks.0.cross_attn.k"
-        if not lora_key.startswith("model."):
-            return "model." + lora_key
-        return lora_key
+    
+    # If already in diffusers format, return as-is
+    return lora_key
 
 
 def merge_lora_into_state_dict(
@@ -161,7 +224,7 @@ def merge_lora_into_state_dict(
         if "A" not in pairs or "B" not in pairs:
             continue
 
-        # Translate LoRA key to model key
+        # Translate LoRA key to Diffusers model key (matching the remapped state dict)
         model_key = lora_key_to_model_key(base_key)
         
         # Try direct match first
