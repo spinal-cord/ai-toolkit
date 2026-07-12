@@ -63,7 +63,8 @@ def get_optimizer(
         print(f"Using lr {use_lr}")
         # let net be the neural network you want to train
         # you can choose weight decay value based on your problem, 0 by default
-        optimizer = Prodigy(params, lr=use_lr, eps=1e-8, use_bias_correction=True, d0=5e-5, d_coef=1.0, safeguard_warmup=True, **optimizer_params)
+        safe_params = {k: v for k, v in optimizer_params.items() if k not in ("use_bias_correction", "d0", "d_coef", "safeguard_warmup")}
+        optimizer = Prodigy(params, lr=use_lr, eps=1e-8, use_bias_correction=True, d0=5e-5, d_coef=1.0, safeguard_warmup=True, **safe_params)
     elif lower_type == "adam8":
         from toolkit.optimizers.adam8bit import Adam8bit
 
