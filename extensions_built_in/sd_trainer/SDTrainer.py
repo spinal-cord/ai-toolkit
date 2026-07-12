@@ -2034,6 +2034,40 @@ class SDTrainer(BaseSDTrainProcess):
                         prior_pred=prior_pred,
                     )
                 else:
+                    # If the text embedding is not successfully obtained in the previous encoding stage, perform a safe fallback to avoid a None error.
+                    # At the same time, extract the control graph from the batch again here to avoid missing data due to the upstream prompt_kwargs not being set.
+                    if self.sd.encode_control_in_text_embeddings:
+                        if getattr(self.sd, 'has_multiple_control_images', False) and batch.control_tensor_list is not None:
+                            # Multiple images: Grouped by control channel and stacked into a batch tensor list
+                            num_controls = len(batch.control_tensor_list[0])
+                            batched_controls = []
+                            for c_idx in range(num_controls):
+                                per_items = [item_controls[c_idx] for item_controls in batch.control_tensor_list]
+                                batched = torch.stack(per_items, dim=0).to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                                batched_controls.append(batched)
+                            prompt_kwargs['control_images'] = batched_controls
+                        elif batch.control_tensor is not None:
+                            # Single image: Directly use batch tensors
+                            prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                    if conditional_embeds is None:
+                        # Encode a default embedding using the prompt word of the current batch; if no prompt word is specified, encode an empty string.
+                        fallback_prompts = conditioned_prompts if conditioned_prompts is not None else ['']
+                        conditional_embeds = self.sd.encode_prompt(
+                            fallback_prompts,
+                            prompt_2,
+                            dropout_prob=self.train_config.prompt_dropout_prob,
+                            long_prompts=self.do_long_prompts,
+                            **prompt_kwargs
+                        ).to(self.device_torch, dtype=dtype)
+                    if self.train_config.do_cfg and unconditional_embeds is None:
+                        # When CFG is enabled but no unconditional embedding is generated, fall back to generating an unconditional embedding with an empty hint.
+                        unconditional_embeds = self.sd.encode_prompt(
+                            self.batch_negative_prompt if hasattr(self, 'batch_negative_prompt') else [''],
+                            self.batch_negative_prompt if hasattr(self, 'batch_negative_prompt') else [''],
+                            dropout_prob=self.train_config.prompt_dropout_prob,
+                            long_prompts=self.do_long_prompts,
+                            **prompt_kwargs
+                        ).to(self.device_torch, dtype=dtype)
                     with self.timer('predict_unet'):
                         noise_pred = self.predict_noise(
                             noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
