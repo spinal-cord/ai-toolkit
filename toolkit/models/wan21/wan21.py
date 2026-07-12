@@ -398,8 +398,17 @@ class Wan21(BaseModel):
         subfolder = 'transformer'
         transformer_path = model_path
         if os.path.exists(transformer_path):
-            subfolder = None
-            transformer_path = os.path.join(transformer_path, 'transformer')
+            # Check if this is a LoRA/custom path (contains .safetensors files directly)
+            # If so, the path itself is the LoRA directory, not a parent of transformer/
+            has_safetensors = any(f.endswith('.safetensors') for f in os.listdir(transformer_path) if os.path.isfile(os.path.join(transformer_path, f)))
+            if has_safetensors:
+                # LoRA/custom path - files are directly in this directory
+                # Keep subfolder as 'transformer' so load_wan_transformer uses the path as-is
+                pass  # subfolder remains 'transformer', transformer_path remains model_path
+            else:
+                # Standard transformer directory structure - transformer files are in transformer/ subfolder
+                subfolder = None
+                transformer_path = os.path.join(transformer_path, 'transformer')
         
         te_path = "ai-toolkit/umt5_xxl_encoder"   
         if os.path.exists(os.path.join(model_path, 'text_encoder')):
