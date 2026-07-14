@@ -2,7 +2,9 @@
 from functools import partial
 import torch
 import yaml
+from safetensors.torch import load_file as load_safetensors
 from toolkit.accelerator import unwrap_model
+from toolkit.train_tools import get_torch_dtype
 from toolkit.basic import flush
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from toolkit.dequantize import patch_dequantization_on_save
@@ -11,7 +13,11 @@ from toolkit.models.base_model import BaseModel
 from toolkit.prompt_utils import PromptEmbeds
 from transformers import AutoTokenizer, UMT5EncoderModel
 from diffusers import  WanPipeline, WanTransformer3DModel, AutoencoderKL
-from .autoencoder_kl_wan import AutoencoderKLWan
+from .autoencoder_kl_wan import (
+    AutoencoderKLWan,
+    detect_alternative_vae_naming,
+    normalize_vae_state_dict,
+)
 import os
 import sys
 
@@ -83,6 +89,105 @@ scheduler_config = {
     "use_dynamic_shifting": False
 }
 
+
+
+def _get_vae_safetensor_file(source: str, subfolder: Optional[str] = None) -> str:
+    """
+    Return the path to the VAE safetensor file in `source`.
+
+    `source` may be:
+      - A local directory (with or without `subfolder`).
+      - A HuggingFace repo ID — in this case we download the file listing
+        first and pick the first `*.safetensors` file we find.
+    """
+    import os
+    from huggingface_hub import hf_hub_download, list_repo_files
+
+    def _in_dir(dir_path: str) -> str:
+        for f in os.listdir(dir_path):
+            if f.endswith(".safetensors"):
+                return os.path.join(dir_path, f)
+        # Try subfolder
+        if subfolder:
+            sub = os.path.join(dir_path, subfolder)
+            if os.path.isdir(sub):
+                for f in os.listdir(sub):
+                    if f.endswith(".safetensors"):
+                        return os.path.join(sub, f)
+        raise FileNotFoundError(
+            f"No .safetensors file found in {dir_path}"
+            + (f"/{subfolder}" if subfolder else "")
+        )
+
+    if os.path.exists(source):
+        return _in_dir(source)
+
+    # HuggingFace repo — download the VAE config file to discover the
+    # repository type, then fetch the first safetensors file.
+    # We use `hf_hub_download` with `filename="diffusers_state_dict.safetensors"`
+    # as a fallback, otherwise list the repo files.
+    try:
+        files = list_repo_files(source)
+    except Exception:
+        # If listing fails, try downloading the default filename.
+        return hf_hub_download(source, filename="diffusers_state_dict.safetensors")
+
+    # Prefer explicitly-named VAE files.
+    vae_candidates = [
+        f for f in files
+        if f.endswith(".safetensors") and ("vae" in f.lower() or "diffusers_state_dict" in f)
+    ]
+    if vae_candidates:
+        return hf_hub_download(source, filename=vae_candidates[0])
+
+    # Fallback: first safetensors file in the repo.
+    safetensors = [f for f in files if f.endswith(".safetensors")]
+    if safetensors:
+        return hf_hub_download(source, filename=safetensors[0])
+
+    raise FileNotFoundError(
+        f"No .safetensors file found in HF repo '{source}'"
+    )
+
+
+
+
+# Hardcoded VAE config for Wan 2.1/2.2 VAE loading.
+# This eliminates the need to ship a diffusers model_index.json alongside
+# the safetensors weight file and avoids the pickle-based torch.load() path
+# that fails on safetensors files with
+#   _pickle.UnpicklingError: invalid load key, '\x00'.
+_WAN_VAE_CONFIG = {
+    "_class_name": "AutoencoderKLWan",
+    "_diffusers_version": "0.35.0.dev0",
+    "_name_or_path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    "attn_scales": [],
+    "base_dim": 96,
+    "decoder_base_dim": None,
+    "dim_mult": [1, 2, 4, 4],
+    "dropout": 0.0,
+    "in_channels": 3,
+    "is_residual": False,
+    "latents_mean": [
+        -0.7571, -0.7089, -0.9113, 0.1075,
+        -0.1745, 0.9653, -0.1517, 1.5508,
+        0.4134, -0.0715, 0.5517, -0.3632,
+        -0.1922, -0.9497, 0.2503, -0.2921
+    ],
+    "latents_std": [
+        2.8184, 1.4541, 2.3275, 2.6558,
+        1.2196, 1.7708, 2.6052, 2.0743,
+        3.2687, 2.1526, 2.8652, 1.5579,
+        1.6382, 1.1253, 2.8251, 1.916
+    ],
+    "num_res_blocks": 2,
+    "out_channels": 3,
+    "patch_size": None,
+    "scale_factor_spatial": 8,
+    "scale_factor_temporal": 4,
+    "temperal_downsample": [False, True, True],
+    "z_dim": 16
+}
 
 class AggressiveWanUnloadPipeline(WanPipeline):
     def __init__(
@@ -458,19 +563,108 @@ class Wan21(BaseModel):
 
         scheduler = Wan21.get_train_scheduler()
         self.print_and_status_update("Loading VAE")
-        # IMPORTANT: Load VAE in its native/binary dtype to avoid unwanted conversions.
-        # For WAN VAEs published in BF16, align to the training dtype (bf16) here.
-        # Using fp32 here will upcast BF16 weights and can cause soft/pixelated outputs.
-        vae_dtype = self.torch_dtype
-        if self._wan_vae_path is not None:
-            # load the vae from individual repo
-            vae = AutoencoderKLWan.from_pretrained(
-                self._wan_vae_path, torch_dtype=vae_dtype
-            ).to(dtype=vae_dtype)
+
+        # ---- Resolve VAE source path ----
+        # Priority:
+        #   1. `model_config.custom_vae_name_or_path` — user-specified custom
+        #      VAE repo/path (e.g. a community fp32 VAE).
+        #   2. Class-level `_wan_vae_path` — the default VAE repo for this
+        #      Wan model family (e.g. "ai-toolkit/wan2.1-vae").
+        #   3. `extras_name_or_path` / local `vae/` subfolder — the
+        #      fallback used by non-wan2.1 models.
+        vae_source = self.model_config.custom_vae_name_or_path
+        if vae_source is None:
+            vae_source = self._wan_vae_path
+        if vae_source is None:
+            vae_source = vae_path
+            vae_subfolder = "vae"
         else:
-            vae = AutoencoderKLWan.from_pretrained(
-                vae_path, subfolder="vae", torch_dtype=vae_dtype
-            ).to(dtype=vae_dtype)
+            vae_subfolder = None
+
+        # ---- Resolve VAE dtype ----
+        # `model_config.vae_dtype` lets the user override the VAE precision
+        # independently of the transformer dtype.  This is useful when a
+        # custom fp32 VAE is provided (e.g. for improved first-frame encoding
+        # quality in I2V).  Falls back to the model's torch_dtype.
+        vae_dtype_str = self.model_config.vae_dtype
+        vae_dtype = get_torch_dtype(vae_dtype_str)
+        
+        # Log VAE source and precision
+        source_type = "local path" if os.path.exists(vae_source) else "HuggingFace repo"
+        self.print_and_status_update(
+            f"=== VAE Loading Configuration ===\n"
+            f"  Source: {vae_source} ({source_type})\n"
+            f"  Subfolder: {vae_subfolder or '(root)'}\n"
+            f"  Target dtype: {vae_dtype} ({self.model_config.vae_dtype or 'model default'})\n"
+            f"  Using hardcoded VAE config (_WAN_VAE_CONFIG)"
+        )
+
+        # Load the VAE by:
+        #   1. Using the hardcoded VAE config (_WAN_VAE_CONFIG) so we do not
+        #      rely on a diffusers model_index.json being present next to the
+        #      weight file.
+        #   2. Auto-detecting the weight file format (.safetensors, .pt, .pth,
+        #      or .bin) and using the appropriate loader.
+        #   3. Normalizing the state dict if the VAE uses an alternative
+        #      tensor naming scheme, and applying it to the model.
+        #
+        # This approach works for both the official Wan VAE and custom fp32
+        # VAEs (e.g. for improved first-frame encoding quality in I2V), and
+        # handles both safetensors and PyTorch pickle formats.
+        vae = AutoencoderKLWan.from_config(_WAN_VAE_CONFIG)
+        self.print_and_status_update("  ✓ VAE model instantiated from hardcoded config")
+
+        weight_file = _get_vae_safetensor_file(vae_source, vae_subfolder)
+        
+        # Log file discovery
+        file_type = "safetensors" if weight_file.endswith(".safetensors") else "PyTorch"
+        self.print_and_status_update(
+            f"  ✓ Discovered weight file: {os.path.basename(weight_file)}\n"
+            f"    Full path: {weight_file}\n"
+            f"    Format: {file_type}"
+        )
+        
+        # Auto-detect file format and use appropriate loader
+        if weight_file.endswith(".safetensors"):
+            self.print_and_status_update("  → Loading with safetensors library (safetensors.torch.load_file)")
+            state_dict = load_safetensors(weight_file)
+        elif weight_file.endswith((".pt", ".pth", ".bin")):
+            self.print_and_status_update("  → Loading with PyTorch (torch.load, weights_only=False)")
+            state_dict = torch.load(weight_file, map_location="cpu", weights_only=False)
+        else:
+            # Fallback: try safetensors first, then torch.load
+            ext = weight_file.split('.')[-1]
+            self.print_and_status_update(
+                f"  → Unknown extension (.{ext}), attempting safetensors loader first"
+            )
+            try:
+                state_dict = load_safetensors(weight_file)
+            except Exception as e:
+                self.print_and_status_update(
+                    f"  → Safetensors failed ({type(e).__name__}), falling back to torch.load"
+                )
+                state_dict = torch.load(weight_file, map_location="cpu", weights_only=False)
+        
+        # Log state dict info
+        num_tensors = len(state_dict)
+        self.print_and_status_update(
+            f"  ✓ Loaded state dict: {num_tensors} tensors"
+        )
+        
+        if detect_alternative_vae_naming(state_dict):
+            self.print_and_status_update(
+                "  → Detected alternative VAE naming scheme — normalizing tensors"
+            )
+            state_dict = normalize_vae_state_dict(state_dict)
+            self.print_and_status_update("  ✓ Tensor names normalized")
+        
+        vae.load_state_dict(state_dict)
+        self.print_and_status_update("  ✓ State dict loaded into VAE model")
+
+        vae = vae.to(dtype=vae_dtype)
+        self.print_and_status_update(
+            f"  ✓ VAE moved to dtype: {vae_dtype}"
+        )
         flush()
 
         self.print_and_status_update("Making pipe")

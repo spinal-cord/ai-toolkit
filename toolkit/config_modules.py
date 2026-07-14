@@ -703,6 +703,15 @@ class ModelConfig:
         # only setup for some models but will prevent having to download the te for
         # 20 different model variants
         self.extras_name_or_path = kwargs.get("extras_name_or_path", self.name_or_path)
+
+        # Custom VAE path - overrides the default _wan_vae_path for Wan models.
+        # Can be a HuggingFace repo ID (e.g. "ai-toolkit/wan2.1-vae") or a local
+        # directory path. When set, it takes precedence over the model's
+        # class-level _wan_vae_path attribute. Useful for loading custom or
+        # alternative VAE variants (e.g. fp32 precision, community-trained VAEs).
+        # The loaded VAE state dict is automatically normalized to the standard
+        # AutoencoderKLWan naming scheme if it uses an alternative convention.
+        self.custom_vae_name_or_path = kwargs.get("custom_vae_name_or_path", None)
         
         # path to an accuracy recovery adapter, either local or remote
         self.accuracy_recovery_adapter = kwargs.get("accuracy_recovery_adapter", None)

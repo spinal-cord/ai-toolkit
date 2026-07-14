@@ -270,6 +270,15 @@ export const modelArchs: ModelArch[] = [
         },
         {},
       ],
+      // Custom VAE path — can be a HuggingFace repo ID (e.g.
+      // "ai-toolkit/wan2.1-vae") or a local directory.  When set, it overrides
+      // the model's default _wan_vae_path.  Useful for loading community or
+      // alternative-precision VAEs (e.g. fp32).
+      'config.process[0].model.custom_vae_name_or_path': [undefined, undefined],
+      // VAE dtype override.  Defaults to the model dtype (bf16 for Wan 2.2).
+      // Set to "float32" to use an fp32 VAE (may improve first-frame encoding
+      // quality for I2V at the cost of more VRAM).
+      'config.process[0].model.vae_dtype': ['bf16', 'bf16'],
     },
     disableSections: ['network.conv'],
     additionalSections: ['datasets.num_frames', 'model.low_vram', 'model.multistage', 'model.layer_offloading', 'datasets.auto_frame_count'],
@@ -302,6 +311,15 @@ export const modelArchs: ModelArch[] = [
         },
         {},
       ],
+      // Custom VAE path — can be a HuggingFace repo ID (e.g.
+      // "ai-toolkit/wan2.1-vae") or a local directory.  When set, it overrides
+      // the model's default _wan_vae_path.  Useful for loading community or
+      // alternative-precision VAEs (e.g. fp32).
+      'config.process[0].model.custom_vae_name_or_path': [undefined, undefined],
+      // VAE dtype override.  Defaults to the model dtype (bf16 for Wan 2.2).
+      // Set to "float32" to use an fp32 VAE (may improve first-frame encoding
+      // quality for I2V at the cost of more VRAM).
+      'config.process[0].model.vae_dtype': ['bf16', 'bf16'],
     },
     disableSections: ['network.conv'],
     additionalSections: [
