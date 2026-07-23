@@ -1325,7 +1325,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # add dynamic noise offset. Dynamic noise is offsetting the noise to the same channelwise mean as the latents
                 # this will negate any noise offsets
                 if self.train_config.dynamic_noise_offset and not is_reg:
-                    latents_channel_mean = latents.mean(dim=(2, 3), keepdim=True) / 2
+                    if latents.ndim == 5:
+                        dims = (2, 3, 4)
+                    else:
+                        dims = (2, 3)
+                    latents_channel_mean = latents.mean(dim=dims, keepdim=True) / 2
                     # subtract channel mean to that we compensate for the mean of the latents on the noise offset per channel
                     noise = noise + latents_channel_mean
 
