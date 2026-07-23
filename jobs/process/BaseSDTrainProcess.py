@@ -868,8 +868,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.step_num = meta['training_info']['step']
             if 'epoch' in meta['training_info']:
                 self.epoch_num = meta['training_info']['epoch']
+            # Increment step to avoid re-executing the last completed step
+            # The saved step is the step that was just completed, so we start from the next step
+            self.step_num += 1
             self.start_step = self.step_num
-            print_acc(f"Found step {self.step_num} in metadata, starting from there")
+            print_acc(f"Found step {self.step_num - 1} in metadata, starting from step {self.step_num}")
 
     def load_weights(self, path):
         if self.network is not None:
@@ -907,8 +910,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.step_num = meta['training_info']['step']
                 if 'epoch' in meta['training_info']:
                     self.epoch_num = meta['training_info']['epoch']
+                # Increment step to avoid re-executing the last completed step
+                self.step_num += 1
                 self.start_step = self.step_num
-                print_acc(f"Found step {self.step_num} in metadata, starting from there")
+                print_acc(f"Found step {self.step_num - 1} in metadata, starting from step {self.step_num}")
 
     # def get_sigmas(self, timesteps, n_dim=4, dtype=torch.float32):
     #     self.sd.noise_scheduler.set_timesteps(1000, device=self.device_torch)
@@ -1910,7 +1915,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if latest_save_path is not None:
                     self.embedding.load_embedding_from_file(latest_save_path, self.device_torch)
                     if self.embedding.step > 1:
-                        self.step_num = self.embedding.step
+                        self.step_num = self.embedding.step + 1  # Increment to avoid re-executing last step
                         self.start_step = self.step_num
 
                 # self.step_num = self.embedding.step
