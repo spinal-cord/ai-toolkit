@@ -87,18 +87,18 @@ def get_optimizer(
         else:
             raise ValueError(f'Unknown optimizer type {optimizer_type}')
     elif lower_type == 'adam':
-        optimizer = torch.optim.Adam(params, lr=float(learning_rate), eps=1e-8, **optimizer_params)
+        optimizer = torch.optim.Adam(params, lr=torch.tensor(learning_rate), eps=1e-8, **optimizer_params)
     elif lower_type == 'adamw':
-        optimizer = torch.optim.AdamW(params, lr=float(learning_rate), eps=1e-8, **optimizer_params)
+        optimizer = torch.optim.AdamW(params, lr=torch.tensor(learning_rate), eps=1e-8, **optimizer_params)
     elif lower_type == 'adamw_fused':
         fused_params = dict(optimizer_params)
         fused_params.setdefault("fused", True)
         try:
-            optimizer = torch.optim.AdamW(params, lr=float(learning_rate), eps=1e-8, **fused_params)
+            optimizer = torch.optim.AdamW(params, lr=torch.tensor(learning_rate), eps=1e-8, **fused_params)
         except TypeError:
             # Older torch builds do not support fused AdamW; fallback safely.
             fused_params.pop("fused", None)
-            optimizer = torch.optim.AdamW(params, lr=float(learning_rate), eps=1e-8, **fused_params)
+            optimizer = torch.optim.AdamW(params, lr=torch.tensor(learning_rate), eps=1e-8, **fused_params)
     elif lower_type == 'lion':
         try:
             from lion_pytorch import Lion
@@ -106,7 +106,7 @@ def get_optimizer(
         except ImportError:
             raise ImportError("Please install lion_pytorch to use Lion optimizer -> pip install lion-pytorch")
     elif lower_type == 'adagrad':
-        optimizer = torch.optim.Adagrad(params, lr=float(learning_rate), **optimizer_params)
+        optimizer = torch.optim.Adagrad(params, lr=torch.tensor(learning_rate), **optimizer_params)
     elif lower_type == 'adafactor':
         from toolkit.optimizers.adafactor import Adafactor
         if 'relative_step' not in optimizer_params:
@@ -115,16 +115,16 @@ def get_optimizer(
             optimizer_params['scale_parameter'] = False
         if 'warmup_init' not in optimizer_params:
             optimizer_params['warmup_init'] = False
-        optimizer = Adafactor(params, lr=float(learning_rate), **optimizer_params)
+        optimizer = Adafactor(params, lr=torch.tensor(learning_rate), **optimizer_params)
     elif lower_type == 'automagic':
         from toolkit.optimizers.automagic import Automagic
-        optimizer = Automagic(params, lr=float(learning_rate), **optimizer_params)
+        optimizer = Automagic(params, lr=torch.tensor(learning_rate), **optimizer_params)
     elif lower_type == 'automagic2':
         from toolkit.optimizers.automagic2 import Automagic2
-        optimizer = Automagic2(params, lr=float(learning_rate), **optimizer_params)
+        optimizer = Automagic2(params, lr=torch.tensor(learning_rate), **optimizer_params)
     elif lower_type == 'automagic3':
         from toolkit.optimizers.automagic3 import Automagic3
-        optimizer = Automagic3(params, lr=float(learning_rate), **optimizer_params)
+        optimizer = Automagic3(params, lr=torch.tensor(learning_rate), **optimizer_params)
     else:
         raise ValueError(f'Unknown optimizer type {optimizer_type}')
     return optimizer
