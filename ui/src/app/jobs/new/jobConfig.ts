@@ -11,6 +11,7 @@ export const defaultDatasetConfig: DatasetConfig = {
   caption_ext: 'txt',
   caption_dropout_rate: 0.05,
   cache_latents_to_disk: false,
+  cache_latents: false,
   is_reg: false,
   network_weight: 1,
   resolution: [512, 768, 1024],

@@ -1029,11 +1029,24 @@ export default function SimpleJob({
                     <div>
                       <FormGroup label="Settings" className="">
                         <Checkbox
-                          label="Cache Latents"
+                          label="Cache latents to disk"
                           checked={dataset.cache_latents_to_disk || false}
-                          onChange={value =>
-                            setJobConfig(value, `config.process[0].datasets[${i}].cache_latents_to_disk`)
-                          }
+                          onChange={value => {
+                            setJobConfig(value, `config.process[0].datasets[${i}].cache_latents_to_disk`);
+                            if (value) {
+                              setJobConfig(false, `config.process[0].datasets[${i}].cache_latents`);
+                            }
+                          }}
+                        />
+                        <Checkbox
+                          label="Cache latents to RAM"
+                          checked={dataset.cache_latents || false}
+                          onChange={value => {
+                            setJobConfig(value, `config.process[0].datasets[${i}].cache_latents`);
+                            if (value) {
+                              setJobConfig(false, `config.process[0].datasets[${i}].cache_latents_to_disk`);
+                            }
+                          }}
                         />
                         <Checkbox
                           label="Is Regularization"
