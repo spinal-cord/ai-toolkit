@@ -119,20 +119,75 @@ class Wan2214bI2VModel(Wan2214bModel):
         # videos come in (bs, num_frames, channels, height, width)
         # images come in (bs, channels, height, width)
         with torch.no_grad():
-            frames = batch.tensor
-            if len(frames.shape) == 4:
-                first_frames = frames
-            elif len(frames.shape) == 5:
-                first_frames = frames[:, 0]
-            else:
-                raise ValueError(f"Unknown frame shape {frames.shape}")
-            
-            # Add conditioning using the standalone function
-            conditioned_latent = add_first_frame_conditioning(
-                latent_model_input=latent_model_input,
-                first_frame=first_frames,
-                vae=self.vae
-            )
+            conditioned_latent = latent_model_input
+            if batch.dataset_config.do_i2v:
+                if batch.first_frame_latents is not None:
+                    # Use cached first frame latents
+                    first_frame_latents = batch.first_frame_latents.to(
+                        self.device_torch, self.torch_dtype
+                    )
+                    
+                    device = latent_model_input.device
+                    dtype = latent_model_input.dtype
+                    
+                    batch_size = latent_model_input.shape[0]
+                    num_latent_frames = latent_model_input.shape[2]
+                    num_frames = (num_latent_frames - 1) * 4 + 1
+                    
+                    vae_scale_factor_temporal = 2 ** sum(self.vae.temperal_downsample)
+                    latent_height = first_frame_latents.shape[3]
+                    latent_width = first_frame_latents.shape[4]
+                    
+                    # Initialize mask for all frames
+                    mask_lat_size = torch.ones(
+                        batch_size, 1, num_frames, latent_height, latent_width, device=device, dtype=dtype)
+                    
+                    # Set all non-first frames to 0
+                    mask_lat_size[:, :, 1:] = 0
+                    
+                    # Special handling for first frame
+                    first_frame_mask = mask_lat_size[:, :, 0:1]
+                    first_frame_mask = torch.repeat_interleave(
+                        first_frame_mask, dim=2, repeats=vae_scale_factor_temporal)
+                    
+                    # Combine first frame mask with rest
+                    mask_lat_size = torch.concat(
+                        [first_frame_mask, mask_lat_size[:, :, 1:, :]], dim=2)
+                    
+                    # Reshape and transpose for model input
+                    mask_lat_size = mask_lat_size.view(
+                        batch_size, -1, vae_scale_factor_temporal, latent_height, latent_width)
+                    mask_lat_size = mask_lat_size.transpose(1, 2)
+                    
+                    # Pad first frame latents to match temporal dimension
+                    latent_condition = torch.zeros(
+                        batch_size, first_frame_latents.shape[1], num_latent_frames, latent_height, latent_width,
+                        device=device, dtype=dtype
+                    )
+                    latent_condition[:, :, 0:1] = first_frame_latents
+                    
+                    # Combine conditioning with latent input
+                    first_frame_condition = torch.concat(
+                        [mask_lat_size, latent_condition], dim=1)
+                    conditioned_latent = torch.cat(
+                        [latent_model_input, first_frame_condition], dim=1)
+                else:
+                    frames = batch.tensor
+                    if frames is None:
+                        raise ValueError("batch.tensor is None and batch.first_frame_latents is None. Cannot compute I2V conditioning. Ensure cache_latents_to_disk is working or do_i2v is correctly set.")
+                    if len(frames.shape) == 4:
+                        first_frames = frames
+                    elif len(frames.shape) == 5:
+                        first_frames = frames[:, 0]
+                    else:
+                        raise ValueError(f"Unknown frame shape {frames.shape}")
+                    
+                    # Add conditioning using the standalone function
+                    conditioned_latent = add_first_frame_conditioning(
+                        latent_model_input=latent_model_input,
+                        first_frame=first_frames,
+                        vae=self.vae
+                    )
         
         noise_pred = self.model(
             hidden_states=conditioned_latent,
