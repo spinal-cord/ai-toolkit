@@ -798,7 +798,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
     def hook_train_loop(self, batch):
         # return loss
+        # Subclasses that support multistage training should override this method
+        # and handle switch_boundary_every logic (e.g., SDTrainer).
         return 0.0
+    
+    def switch_boundary_if_needed(self):
+        """Increment current_boundary_index based on switch_boundary_every.
+        
+        Default implementation cycles through all boundaries. Subclasses that
+        support multistage training with selective boundary training (e.g., SDTrainer
+        with trainable_multistage_boundaries) should override this.
+        """
+        if self.sd.is_multistage and self.train_config.switch_boundary_every > 0:
+            self.steps_this_boundary += 1
+            if self.steps_this_boundary >= self.train_config.switch_boundary_every:
+                self.steps_this_boundary = 0
+                # Cycle through boundaries: 0 -> 1 -> ... -> N-1 -> 0
+                num_boundaries = len(self.sd.multistage_boundaries)
+                self.current_boundary_index = (self.current_boundary_index + 1) % num_boundaries
     
     def hook_after_sd_init_before_load(self):
         pass
@@ -1246,7 +1263,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         indice_choices = [0, 250, 500, 750]
                     elif self.train_config.timestep_type == 'eight_step':
                         indice_choices = [0, 125, 250, 375, 500, 625, 750, 875]
-                    timestep_indices = torch.tensor(random.choices(indice_choices, k=batch_size), device=self.device_torch)
+                    
+                    # For multistage models, map the fixed indices to the current boundary range
+                    if self.sd.is_multistage:
+                        # Map from [0, 999] to [min_noise_steps, max_noise_steps]
+                        mapped_choices = [
+                            int(min_noise_steps + (idx / 999.0) * (max_noise_steps - min_noise_steps))
+                            for idx in indice_choices
+                        ]
+                        timestep_indices = torch.tensor(random.choices(mapped_choices, k=batch_size), device=self.device_torch)
+                    else:
+                        timestep_indices = torch.tensor(random.choices(indice_choices, k=batch_size), device=self.device_torch)
                     timestep_indices = timestep_indices.long()
                 elif self.train_config.timestep_type == 'next_sample':
                     timestep_indices = torch.randint(
@@ -1315,8 +1342,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     boundaries = [1] + self.sd.multistage_boundaries
                     boundary_max, boundary_min = boundaries[self.current_boundary_index], boundaries[self.current_boundary_index + 1]
                     # Ensure timesteps stay strictly within (boundary_min * 1000, boundary_max * 1000) range
+                    # Add small epsilon to min to ensure timestep > boundary_min * 1000
+                    # (prevents boundary == timestep which would incorrectly select the low-noise expert)
                     # Subtract small epsilon from max to avoid edge case where timestep equals boundary
-                    timesteps = torch.clamp(timesteps, min=boundary_min * 1000, max=(boundary_max * 1000) - 0.01)
+                    timesteps = torch.clamp(timesteps, min=boundary_min * 1000 + 0.01, max=(boundary_max * 1000) - 0.01)
 
             with self.timer('prepare_noise'):
                 # get noise
@@ -1871,6 +1900,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     config['default_lr'] = self.train_config.lr
                 if 'learning_rate' in sig.parameters:
                     config['learning_rate'] = self.train_config.lr
+                
+                # For multistage models, support per-expert learning rates.
+                # Use self.network.is_multistage (property on LoRANetwork) — not self.sd,
+                # because is_multistage is defined on the network, not the diffusion model.
+                if self.network.is_multistage:
+                    opt_params = self.train_config.optimizer_params or {}
+                    # Support both multiplier-based and absolute LR settings
+                    if 'high_noise_lr_multiplier' in opt_params:
+                        config['high_noise_lr'] = self.train_config.lr * opt_params['high_noise_lr_multiplier']
+                    if 'low_noise_lr_multiplier' in opt_params:
+                        config['low_noise_lr'] = self.train_config.lr * opt_params['low_noise_lr_multiplier']
+                    # Also support absolute LR overrides
+                    if 'high_noise_lr' in opt_params:
+                        config['high_noise_lr'] = opt_params['high_noise_lr']
+                    if 'low_noise_lr' in opt_params:
+                        config['low_noise_lr'] = opt_params['low_noise_lr']
+                
+                config['optimizer_params'] = self.train_config.optimizer_params
                 params_net = self.network.prepare_optimizer_params(
                     **config
                 )
@@ -2388,6 +2435,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.step_num = step
             # default to true so various things can turn it off
             self.is_grad_accumulation_step = True
+            # Handle multistage boundary switching before processing the batch
+            self.switch_boundary_if_needed()
             if self.train_config.free_u:
                 self.sd.pipeline.enable_freeu(s1=0.9, s2=0.2, b1=1.1, b2=1.2)
             if self.progress_bar is not None:
@@ -2528,7 +2577,32 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     else:
                         learning_rate = optimizer.param_groups[0]['lr']
 
-                    prog_bar_string = f"lr: {learning_rate:.1e}"
+                    # For multistage models, show per-expert learning rates
+                    high_noise_lr = None
+                    low_noise_lr = None
+                    is_multistage = getattr(self.network, 'is_multistage', False)
+                    if is_multistage:
+                        for group in optimizer.param_groups:
+                            name = group.get('name', '')
+                            # Get effective learning rate (handle Prodigy/Dadaptation where lr * d = effective lr)
+                            group_lr = group['lr']
+                            if hasattr(group, 'd'):
+                                group_lr = group['d'] * group_lr
+                            
+                            if name == 'high_noise_loras' or name.startswith('high_noise_loras_block_'):
+                                high_noise_lr = group_lr
+                            elif name == 'low_noise_loras' or name.startswith('low_noise_loras_block_'):
+                                low_noise_lr = group_lr
+
+                    if is_multistage:
+                        prog_bar_string = ""
+                        if high_noise_lr is not None:
+                            prog_bar_string += f"lr_high: {high_noise_lr:.1e} "
+                        if low_noise_lr is not None:
+                            prog_bar_string += f"lr_low: {low_noise_lr:.1e} "
+                        prog_bar_string = prog_bar_string.strip()
+                    else:
+                        prog_bar_string = f"lr: {learning_rate:.1e}"
                     for key, value in loss_dict.items():
                         prog_bar_string += f" {key}: {value:.3e}"
 
@@ -2587,15 +2661,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                     if loss_dict is not None:
                                         for key, value in loss_dict.items():
                                             self.writer.add_scalar(f"{key}", value, self.step_num)
-                                        self.writer.add_scalar(f"lr", learning_rate, self.step_num)
+                                        if is_multistage:
+                                            if high_noise_lr is not None:
+                                                self.writer.add_scalar(f"lr_high", high_noise_lr, self.step_num)
+                                            if low_noise_lr is not None:
+                                                self.writer.add_scalar(f"lr_low", low_noise_lr, self.step_num)
+                                        else:
+                                            self.writer.add_scalar(f"lr", learning_rate, self.step_num)
                                 if self.progress_bar is not None:
                                     self.progress_bar.unpause()
                         
                         if self.accelerator.is_main_process:
                             # log to logger
-                            self.logger.log({
-                                'learning_rate': learning_rate,
-                            })
+                            log_dict = {}
+                            if is_multistage:
+                                if high_noise_lr is not None:
+                                    log_dict['learning_rate_high'] = high_noise_lr
+                                if low_noise_lr is not None:
+                                    log_dict['learning_rate_low'] = low_noise_lr
+                            else:
+                                log_dict['learning_rate'] = learning_rate
+                            self.logger.log(log_dict)
                             if loss_dict is not None:
                                 for key, value in loss_dict.items():
                                     self.logger.log({
@@ -2610,9 +2696,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     elif self.logging_config.log_every is None:
                         if self.accelerator.is_main_process:
                             # log every step
-                            self.logger.log({
-                                'learning_rate': learning_rate,
-                            })
+                            log_dict = {}
+                            if is_multistage:
+                                if high_noise_lr is not None:
+                                    log_dict['learning_rate_high'] = high_noise_lr
+                                if low_noise_lr is not None:
+                                    log_dict['learning_rate_low'] = low_noise_lr
+                            else:
+                                log_dict['learning_rate'] = learning_rate
+                            self.logger.log(log_dict)
                             for key, value in loss_dict.items():
                                 self.logger.log({
                                     f'loss/{key}': value,

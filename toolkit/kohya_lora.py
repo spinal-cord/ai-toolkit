@@ -15,7 +15,8 @@ import torch
 import re
 
 
-RE_UPDOWN = re.compile(r"(up|down)_blocks_(\d+)_(resnets|upsamplers|downsamplers|attentions)_(\d+)_")
+RE_UPDOWN = re.compile(r"(up|down)?_blocks_(\d+)_(resnets|upsamplers|downsamplers|attentions|attentions)_(\d+)_")
+RE_WAN22_BLOCK = re.compile(r"blocks_(\d+)_attentions_(\d+)_")
 
 
 class LoRAModule(torch.nn.Module):
@@ -77,6 +78,13 @@ class LoRAModule(torch.nn.Module):
         self.dropout = dropout
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
+        # Track which transformer expert this LoRA belongs to (for multistage models).
+        # None means it's a shared/legacy LoRA not tied to a specific expert.
+        self._owner_transformer: Optional[str] = None
+
+    def set_owner_transformer(self, name: str):
+        """Mark this LoRA as belonging to a specific transformer expert."""
+        self._owner_transformer = name
 
     def apply_to(self):
         self.org_forward = self.org_module.forward
@@ -678,6 +686,17 @@ def get_block_index(lora_name: str) -> int:
             block_idx = 1 + idx  # 0に該当するLoRAは存在しない
         elif g[0] == "up":
             block_idx = LoRANetwork.NUM_OF_BLOCKS + 1 + idx
+        elif g[0] is None or g[0] == "":
+            # Wan 2.2 style: blocks_N_... without up/down prefix
+            block_idx = 1 + idx
+
+    elif RE_WAN22_BLOCK.search(lora_name):
+        # Wan 2.2 style: blocks_N_attentions_M_...
+        g = RE_WAN22_BLOCK.search(lora_name).groups()
+        i = int(g[0])
+        j = int(g[1])
+        idx = 3 * i + j
+        block_idx = 1 + idx
 
     elif "mid_block_" in lora_name:
         block_idx = LoRANetwork.NUM_OF_BLOCKS  # idx=12
@@ -805,6 +824,14 @@ class LoRANetwork(torch.nn.Module):
             root_module: torch.nn.Module,
             target_replace_modules: List[torch.nn.Module],
         ) -> List[LoRAModule]:
+            # For multistage models, detect the owner transformer from the module path.
+            # DualWanTransformer3DModel.named_modules() yields paths like
+            # "transformer_1.blocks.0.attn1.to_q" or "transformer_2.blocks.0.attn1.to_q".
+            _is_multistage_root = (
+                hasattr(root_module, 'transformer_1') and hasattr(root_module, 'transformer_2')
+                if is_unet else False
+            )
+
             prefix = (
                 self.LORA_PREFIX_UNET
                 if is_unet
@@ -869,6 +896,21 @@ class LoRANetwork(torch.nn.Module):
                                 rank_dropout=rank_dropout,
                                 module_dropout=module_dropout,
                             )
+
+                            # Tag the LoRA with its owning transformer expert for multistage models.
+                            # The outer loop variable `name` is the path of the matched target module
+                            # (e.g. "" for DualWanTransformer3DModel, "transformer_1" for WanTransformer3DModel).
+                            # The inner loop variable `child_name` is the path within that module
+                            # (e.g. "blocks.0.attn1.to_q"). The owner transformer is detected from
+                            # child_name (or equivalently from lora_name which encodes the full path).
+                            if _is_multistage_root:
+                                if child_name.startswith("transformer_1"):
+                                    lora.set_owner_transformer("transformer_1")
+                                elif child_name.startswith("transformer_2"):
+                                    lora.set_owner_transformer("transformer_2")
+                                # If child_name doesn't start with either prefix, it's a shared module
+                                # (e.g., the DualWanTransformer3DModel wrapper itself) — leave as None.
+
                             loras.append(lora)
             return loras, skipped
 
@@ -896,8 +938,40 @@ class LoRANetwork(torch.nn.Module):
         if modules_dim is not None or self.conv_lora_dim is not None or conv_block_dims is not None:
             target_modules += LoRANetwork.UNET_TARGET_REPLACE_MODULE_CONV2D_3X3
 
+        # For multistage models (Wan 2.2 14B), the unet is a DualWanTransformer3DModel
+        # whose named_modules() paths contain ".transformer_1." or ".transformer_2."
+        # This is a structural property of the unet — it does not depend on whether
+        # any LoRAs were actually created (a user could have an empty target_modules).
+        self._is_multistage_unet = hasattr(unet, 'transformer_1') and hasattr(unet, 'transformer_2')
+
         self.unet_loras, skipped_un = create_modules(True, None, unet, target_modules)
         print(f"create LoRA for U-Net: {len(self.unet_loras)} modules.")
+
+        # Partition unet LoRAs per expert based on the owner tag set during create_modules().
+        # For non-multistage models, all LoRAs are tagged "shared" and go into the legacy list.
+        self.unet_loras_expert1: List[LoRAModule] = []
+        self.unet_loras_expert2: List[LoRAModule] = []
+        self.unet_loras_shared: List[LoRAModule] = []
+        for lora in self.unet_loras:
+            owner = getattr(lora, '_owner_transformer', None)
+            if owner == "transformer_1":
+                self.unet_loras_expert1.append(lora)
+            elif owner == "transformer_2":
+                self.unet_loras_expert2.append(lora)
+            else:
+                self.unet_loras_shared.append(lora)
+
+        if self._is_multistage_unet:
+            print(
+                f"Multistage mode: {len(self.unet_loras_expert1)} LoRAs for transformer_1 "
+                f"(high-noise), {len(self.unet_loras_expert2)} for transformer_2 (low-noise), "
+                f"{len(self.unet_loras_shared)} shared."
+            )
+
+    @property
+    def is_multistage(self) -> bool:
+        """True if the underlying unet is a DualWanTransformer3DModel (has transformer_1 and transformer_2)."""
+        return bool(self._is_multistage_unet)
 
         skipped = skipped_te + skipped_un
         if varbose and len(skipped) > 0:
@@ -935,6 +1009,15 @@ class LoRANetwork(torch.nn.Module):
         return info
 
     def apply_to(self, text_encoder, unet, apply_text_encoder=True, apply_unet=True):
+        """
+        Apply LoRA modules to text encoder and/or unet.
+        
+        For multistage models (Wan 2.2 14B), the unet is a DualWanTransformer3DModel
+        containing two separate transformers. The network constructor already partitioned
+        LoRAs into unet_loras_expert1 / unet_loras_expert2 based on the module path.
+        Each LoRA owns its own org_module (a distinct nn.Linear), so no cloning is needed —
+        we simply call apply_to() on each LoRA, which patches its own org_module.forward.
+        """
         if apply_text_encoder:
             print("enable LoRA for text encoder")
         else:
@@ -944,10 +1027,40 @@ class LoRANetwork(torch.nn.Module):
             print("enable LoRA for U-Net")
         else:
             self.unet_loras = []
+            self.unet_loras_expert1 = []
+            self.unet_loras_expert2 = []
+            self.unet_loras_shared = []
 
-        for lora in self.text_encoder_loras + self.unet_loras:
-            lora.apply_to()
-            self.add_module(lora.lora_name, lora)
+        # Apply text encoder LoRAs
+        if self.text_encoder_loras:
+            for lora in self.text_encoder_loras:
+                lora.apply_to()
+                self.add_module(lora.lora_name, lora)
+
+        # Multistage path: apply each expert's LoRAs to their respective transformer.
+        # Each LoRA's org_module is the nn.Linear from its owned transformer,
+        # so apply_to() patches only that transformer's forward — no conflict.
+        if self.unet_loras_expert1:
+            for lora in self.unet_loras_expert1:
+                lora.apply_to()
+                self.add_module(lora.lora_name, lora)
+
+        if self.unet_loras_expert2:
+            for lora in self.unet_loras_expert2:
+                lora.apply_to()
+                self.add_module(lora.lora_name, lora)
+
+        # Shared (non-multistage or wrapper-level) LoRAs: apply to unet as a whole.
+        if self.unet_loras_shared:
+            for lora in self.unet_loras_shared:
+                lora.apply_to()
+                self.add_module(lora.lora_name, lora)
+
+        # Legacy fallback: if no expert-specific lists were populated, use the flat list.
+        if not self.unet_loras_expert1 and not self.unet_loras_expert2 and not self.unet_loras_shared:
+            for lora in self.unet_loras:
+                lora.apply_to()
+                self.add_module(lora.lora_name, lora)
 
     # マージできるかどうかを返す
     def is_mergeable(self):
@@ -1012,7 +1125,26 @@ class LoRANetwork(torch.nn.Module):
         return lr_weight
 
     # 二つのText Encoderに別々の学習率を設定できるようにするといいかも
-    def prepare_optimizer_params(self, text_encoder_lr, unet_lr, default_lr):
+    def prepare_optimizer_params(
+        self,
+        text_encoder_lr=None,
+        unet_lr=None,
+        default_lr=None,
+        high_noise_lr=None,
+        low_noise_lr=None,
+        default_weight_decay=None,
+        default_lr_bump=None,
+        default_min_lr=None,
+        default_max_lr=None,
+        optimizer_params=None,
+        **kwargs,
+    ):
+        """
+        Prepare optimizer parameter groups.
+        
+        For multistage models (Wan 2.2 14B), returns separate groups for each expert.
+        For non-multistage models, returns the legacy single group.
+        """
         self.requires_grad_(True)
         all_params = []
 
@@ -1026,9 +1158,78 @@ class LoRANetwork(torch.nn.Module):
             param_data = {"params": enumerate_params(self.text_encoder_loras)}
             if text_encoder_lr is not None:
                 param_data["lr"] = text_encoder_lr
+            if default_weight_decay is not None:
+                param_data["weight_decay"] = default_weight_decay
+            param_data["name"] = "text_encoder"
             all_params.append(param_data)
 
-        if self.unet_loras:
+        # For multistage models, use per-expert LoRA lists
+        if self.is_multistage:
+            # High noise expert (transformer_1)
+            if self.unet_loras_expert1:
+                if self.block_lr:
+                    block_idx_to_lora = {}
+                    for lora in self.unet_loras_expert1:
+                        idx = get_block_index(lora.lora_name)
+                        if idx not in block_idx_to_lora:
+                            block_idx_to_lora[idx] = []
+                        block_idx_to_lora[idx].append(lora)
+
+                    for idx, block_loras in block_idx_to_lora.items():
+                        param_data = {"params": enumerate_params(block_loras)}
+                        lr = high_noise_lr if high_noise_lr is not None else (unet_lr if unet_lr is not None else default_lr)
+                        if lr is not None:
+                            param_data["lr"] = lr * self.get_lr_weight(block_loras[0])
+                        if default_weight_decay is not None:
+                            param_data["weight_decay"] = default_weight_decay
+                        param_data["name"] = f"high_noise_loras_block_{idx}"
+                        if ("lr" in param_data) and (param_data["lr"] == 0):
+                            continue
+                        all_params.append(param_data)
+                else:
+                    param_data = {"params": enumerate_params(self.unet_loras_expert1)}
+                    if high_noise_lr is not None:
+                        param_data["lr"] = high_noise_lr
+                    elif unet_lr is not None:
+                        param_data["lr"] = unet_lr
+                    if default_weight_decay is not None:
+                        param_data["weight_decay"] = default_weight_decay
+                    param_data["name"] = "high_noise_loras"
+                    all_params.append(param_data)
+
+            # Low noise expert (transformer_2)
+            if self.unet_loras_expert2:
+                if self.block_lr:
+                    block_idx_to_lora = {}
+                    for lora in self.unet_loras_expert2:
+                        idx = get_block_index(lora.lora_name)
+                        if idx not in block_idx_to_lora:
+                            block_idx_to_lora[idx] = []
+                        block_idx_to_lora[idx].append(lora)
+
+                    for idx, block_loras in block_idx_to_lora.items():
+                        param_data = {"params": enumerate_params(block_loras)}
+                        lr = low_noise_lr if low_noise_lr is not None else (unet_lr if unet_lr is not None else default_lr)
+                        if lr is not None:
+                            param_data["lr"] = lr * self.get_lr_weight(block_loras[0])
+                        if default_weight_decay is not None:
+                            param_data["weight_decay"] = default_weight_decay
+                        param_data["name"] = f"low_noise_loras_block_{idx}"
+                        if ("lr" in param_data) and (param_data["lr"] == 0):
+                            continue
+                        all_params.append(param_data)
+                else:
+                    param_data = {"params": enumerate_params(self.unet_loras_expert2)}
+                    if low_noise_lr is not None:
+                        param_data["lr"] = low_noise_lr
+                    elif unet_lr is not None:
+                        param_data["lr"] = unet_lr
+                    if default_weight_decay is not None:
+                        param_data["weight_decay"] = default_weight_decay
+                    param_data["name"] = "low_noise_loras"
+                    all_params.append(param_data)
+        elif self.unet_loras:
+            # Legacy non-multistage path
             if self.block_lr:
                 # 学習率のグラフをblockごとにしたいので、blockごとにloraを分類
                 block_idx_to_lora = {}
@@ -1046,6 +1247,9 @@ class LoRANetwork(torch.nn.Module):
                         param_data["lr"] = unet_lr * self.get_lr_weight(block_loras[0])
                     elif default_lr is not None:
                         param_data["lr"] = default_lr * self.get_lr_weight(block_loras[0])
+                    if default_weight_decay is not None:
+                        param_data["weight_decay"] = default_weight_decay
+                    param_data["name"] = f"unet_loras_block_{idx}"
                     if ("lr" in param_data) and (param_data["lr"] == 0):
                         continue
                     all_params.append(param_data)
@@ -1054,6 +1258,9 @@ class LoRANetwork(torch.nn.Module):
                 param_data = {"params": enumerate_params(self.unet_loras)}
                 if unet_lr is not None:
                     param_data["lr"] = unet_lr
+                if default_weight_decay is not None:
+                    param_data["weight_decay"] = default_weight_decay
+                param_data["name"] = "unet_loras"
                 all_params.append(param_data)
 
         return all_params

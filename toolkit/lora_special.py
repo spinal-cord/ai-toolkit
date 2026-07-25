@@ -137,6 +137,13 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
         self.is_checkpointing = False
+        # Track which transformer expert this LoRA belongs to (for multistage models).
+        # None means it's a shared/legacy LoRA not tied to a specific expert.
+        self._owner_transformer: Optional[str] = None
+
+    def set_owner_transformer(self, name: str):
+        """Mark this LoRA as belonging to a specific transformer expert."""
+        self._owner_transformer = name
 
     def apply_to(self):
         self.org_forward = self.org_module[0].forward
@@ -477,6 +484,15 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             skipped = []
             attached_modules = []
             lora_shape_dict = {}
+
+            # For multistage models, detect the owner transformer from the module path.
+            # DualWanTransformer3DModel.named_modules() yields paths like
+            # "transformer_1.blocks.0.attn1.to_q" or "transformer_2.blocks.0.attn1.to_q".
+            _is_multistage_root = (
+                hasattr(root_module, 'transformer_1') and hasattr(root_module, 'transformer_2')
+                if is_unet else False
+            )
+
             for name, module in root_module.named_modules():
                 if module.__class__.__name__ in target_replace_modules:
                     for child_name, child_module in module.named_modules():
@@ -614,6 +630,21 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                                 use_bias=use_bias,
                                 **module_kwargs
                             )
+
+                            # Tag the LoRA with its owning transformer expert for multistage models.
+                            # The outer loop variable `name` is the path of the matched target module
+                            # (e.g. "" for DualWanTransformer3DModel, "transformer_1" for WanTransformer3DModel).
+                            # The inner loop variable `child_name` is the path within that module
+                            # (e.g. "blocks.0.attn1.to_q"). The owner transformer is detected from
+                            # child_name (or equivalently from lora_name which encodes the full path).
+                            if _is_multistage_root:
+                                if child_name.startswith("transformer_1"):
+                                    lora.set_owner_transformer("transformer_1")
+                                elif child_name.startswith("transformer_2"):
+                                    lora.set_owner_transformer("transformer_2")
+                                # If child_name doesn't start with either prefix, it's a shared module
+                                # (e.g., the DualWanTransformer3DModel wrapper itself) — leave as None.
+
                             loras.append(lora)
                             if self.network_type.lower() == "lokr":
                                 try:
@@ -698,6 +729,33 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             skipped_un = []
         print(f"create LoRA for U-Net: {len(self.unet_loras)} modules.")
 
+        # For multistage models (Wan 2.2 14B), the unet is a DualWanTransformer3DModel
+        # whose named_modules() paths contain ".transformer_1." or ".transformer_2."
+        # This is a structural property of the unet — it does not depend on whether
+        # any LoRAs were actually created (a user could have an empty target_modules).
+        self._is_multistage_unet = hasattr(unet, 'transformer_1') and hasattr(unet, 'transformer_2')
+
+        # Partition unet LoRAs per expert based on the owner tag set during create_modules().
+        # For non-multistage models, all LoRAs are tagged "shared" and go into the legacy list.
+        self.unet_loras_expert1: List[LoRAModule] = []
+        self.unet_loras_expert2: List[LoRAModule] = []
+        self.unet_loras_shared: List[LoRAModule] = []
+        for lora in self.unet_loras:
+            owner = getattr(lora, '_owner_transformer', None)
+            if owner == "transformer_1":
+                self.unet_loras_expert1.append(lora)
+            elif owner == "transformer_2":
+                self.unet_loras_expert2.append(lora)
+            else:
+                self.unet_loras_shared.append(lora)
+
+        if self._is_multistage_unet:
+            print(
+                f"Multistage mode: {len(self.unet_loras_expert1)} LoRAs for transformer_1 "
+                f"(high-noise), {len(self.unet_loras_expert2)} for transformer_2 (low-noise), "
+                f"{len(self.unet_loras_shared)} shared."
+            )
+
         skipped = skipped_te + skipped_un
         if varbose and len(skipped) > 0:
             print(
@@ -755,10 +813,146 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                 unet.conv_in = self.unet_conv_in
                 unet.conv_out = self.unet_conv_out
 
-    def prepare_optimizer_params(self, text_encoder_lr, unet_lr, default_lr):
-        # call Lora prepare_optimizer_params
-        all_params = super().prepare_optimizer_params(text_encoder_lr, unet_lr, default_lr)
+    @property
+    def is_multistage(self) -> bool:
+        """True if the underlying unet is a DualWanTransformer3DModel (has transformer_1 and transformer_2)."""
+        return bool(self._is_multistage_unet)
 
+    def prepare_optimizer_params(
+        self,
+        text_encoder_lr=None,
+        unet_lr=None,
+        default_lr=None,
+        high_noise_lr=None,
+        low_noise_lr=None,
+        default_weight_decay=None,
+        default_lr_bump=None,
+        default_min_lr=None,
+        default_max_lr=None,
+        optimizer_params=None,
+        **kwargs,
+    ):
+        # Check if we're training a WAN 2.2 14B MoE model
+        base_model = self.base_model_ref() if self.base_model_ref is not None else None
+        is_wan22_moe = base_model is not None and hasattr(base_model, 'arch') and base_model.arch in ["wan22_14b", "wan22_14b_i2v"]
+
+        # If MoE model and optimizer_params provided, split param groups for high/low noise experts
+        if is_wan22_moe and optimizer_params is not None and self.unet_loras:
+            return self._prepare_moe_optimizer_params(
+                text_encoder_lr, unet_lr, default_lr, optimizer_params,
+                high_noise_lr=high_noise_lr,
+                low_noise_lr=low_noise_lr,
+            )
+
+        # Otherwise use standard param group creation
+        all_params = super().prepare_optimizer_params(
+            text_encoder_lr, unet_lr, default_lr,
+            high_noise_lr=high_noise_lr,
+            low_noise_lr=low_noise_lr,
+            default_weight_decay=default_weight_decay,
+            default_lr_bump=default_lr_bump,
+            default_min_lr=default_min_lr,
+            default_max_lr=default_max_lr,
+            optimizer_params=optimizer_params,
+            **kwargs,
+        )
+
+        if self.full_train_in_out:
+            base_model = self.base_model_ref() if self.base_model_ref is not None else None
+            if self.is_pixart or self.is_auraflow or self.is_flux or (base_model is not None and base_model.arch == "wan21"):
+                all_params.append({"lr": unet_lr, "params": list(self.transformer_pos_embed.parameters())})
+                all_params.append({"lr": unet_lr, "params": list(self.transformer_proj_out.parameters())})
+            else:
+                all_params.append({"lr": unet_lr, "params": list(self.unet_conv_in.parameters())})
+                all_params.append({"lr": unet_lr, "params": list(self.unet_conv_out.parameters())})
+
+        return all_params
+
+    def _prepare_moe_optimizer_params(self, text_encoder_lr, unet_lr, default_lr, optimizer_params, high_noise_lr=None, low_noise_lr=None):
+        """
+        Prepare optimizer params with separate groups for High Noise and Low Noise experts.
+        Allows per-expert lr_bump, min_lr, max_lr configuration for automagic optimizer.
+        Per-expert LR overrides (high_noise_lr / low_noise_lr) take precedence over the base unet_lr.
+        """
+        self.requires_grad_(True)
+        all_params = []
+
+        def enumerate_params(loras):
+            params = []
+            for lora in loras:
+                params.extend(lora.parameters())
+            return params
+
+        # Handle text encoder loras (standard, no splitting)
+        if self.text_encoder_loras:
+            param_data = {"params": enumerate_params(self.text_encoder_loras)}
+            if text_encoder_lr is not None:
+                param_data["lr"] = text_encoder_lr
+            all_params.append(param_data)
+
+        # Split unet_loras by transformer (High Noise = transformer_1, Low Noise = transformer_2)
+        if self.unet_loras:
+            high_noise_loras = []
+            low_noise_loras = []
+            other_loras = []
+
+            for lora in self.unet_loras:
+                # Note: lora_name uses $$ as separator, so check for 'transformer_1' substring
+                # This correctly matches names like "transformer$$transformer_1$$blocks$$0$$attn1$$to_q"
+                if 'transformer_1' in lora.lora_name:
+                    high_noise_loras.append(lora)
+                elif 'transformer_2' in lora.lora_name:
+                    low_noise_loras.append(lora)
+                else:
+                    other_loras.append(lora)
+
+            # Extract per-expert optimizer params with fallback to defaults
+            default_lr_bump = optimizer_params.get('lr_bump')
+            default_min_lr = optimizer_params.get('min_lr')
+            default_max_lr = optimizer_params.get('max_lr')
+
+            # High Noise Expert param group
+            if high_noise_loras:
+                high_noise_params = {"params": enumerate_params(high_noise_loras)}
+                lr = high_noise_lr if high_noise_lr is not None else (unet_lr if unet_lr is not None else default_lr)
+                if lr is not None:
+                    high_noise_params["lr"] = lr
+
+                # Add per-expert optimizer params if using automagic
+                if default_lr_bump is not None:
+                    high_noise_params["lr_bump"] = optimizer_params.get('high_noise_lr_bump', default_lr_bump)
+                if default_min_lr is not None:
+                    high_noise_params["min_lr"] = optimizer_params.get('high_noise_min_lr', default_min_lr)
+                if default_max_lr is not None:
+                    high_noise_params["max_lr"] = optimizer_params.get('high_noise_max_lr', default_max_lr)
+
+                all_params.append(high_noise_params)
+
+            # Low Noise Expert param group
+            if low_noise_loras:
+                low_noise_params = {"params": enumerate_params(low_noise_loras)}
+                lr = low_noise_lr if low_noise_lr is not None else (unet_lr if unet_lr is not None else default_lr)
+                if lr is not None:
+                    low_noise_params["lr"] = lr
+
+                # Add per-expert optimizer params if using automagic
+                if default_lr_bump is not None:
+                    low_noise_params["lr_bump"] = optimizer_params.get('low_noise_lr_bump', default_lr_bump)
+                if default_min_lr is not None:
+                    low_noise_params["min_lr"] = optimizer_params.get('low_noise_min_lr', default_min_lr)
+                if default_max_lr is not None:
+                    low_noise_params["max_lr"] = optimizer_params.get('low_noise_max_lr', default_max_lr)
+
+                all_params.append(low_noise_params)
+
+            # Other loras (not transformer-specific) - use defaults
+            if other_loras:
+                other_params = {"params": enumerate_params(other_loras)}
+                if unet_lr is not None:
+                    other_params["lr"] = unet_lr
+                all_params.append(other_params)
+
+        # Add full_train_in_out params if needed
         if self.full_train_in_out:
             base_model = self.base_model_ref() if self.base_model_ref is not None else None
             if self.is_pixart or self.is_auraflow or self.is_flux or (base_model is not None and base_model.arch == "wan21"):

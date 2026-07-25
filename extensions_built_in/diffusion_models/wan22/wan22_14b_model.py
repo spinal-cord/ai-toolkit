@@ -310,6 +310,16 @@ def _process_state_dict_for_fp8(state_dict: Dict[str, torch.Tensor], target_dtyp
 	return processed_state_dict
 
 class DualWanTransformer3DModel(torch.nn.Module):
+    """
+    Wraps two WanTransformer3DModel instances (high-noise and low-noise experts).
+    
+    Key design principles:
+    - Each transformer has its OWN LoRA modules attached at construction time.
+    - No runtime weight swapping via .copy_() — that breaks optimizer integration.
+    - No torch.cuda.empty_cache() in the inner loop — that causes 2-minute sampling delays.
+    - The active transformer swap happens once per stage, not per timestep batch.
+    """
+
     def __init__(
         self,
         transformer_1: WanTransformer3DModel,
@@ -328,6 +338,7 @@ class DualWanTransformer3DModel(torch.nn.Module):
         self.boundary: float = self.boundary_ratio * 1000
         self.low_vram: bool = low_vram
         self._active_transformer_name = "transformer_1"  # default to transformer_1
+        self._prev_active_transformer_name = "transformer_1"  # for change detection in forward
 
     @property
     def device(self) -> torch.device:
@@ -362,7 +373,7 @@ class DualWanTransformer3DModel(torch.nn.Module):
         attention_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
-        # determine if doing high noise or low noise by meaning the timestep.
+        # determine if doing high noise or low noise by mean of the timestep.
         # timesteps are in the range of 0 to 1000, so we can use a threshold
         with torch.no_grad():
             if timestep.float().mean().item() > self.boundary:
@@ -370,15 +381,24 @@ class DualWanTransformer3DModel(torch.nn.Module):
             else:
                 t_name = "transformer_2"
 
-            # check if we are changing the active transformer, if so, we need to swap the one in
-            # vram if low_vram is enabled
-            # todo swap the loras as well
-            if t_name != self._active_transformer_name:
+            # Always update _active_transformer_name so the trainer can attribute
+            # the loss to whichever expert processed this batch.
+            self._active_transformer_name = t_name
+
+            # Check if we are changing the active transformer.
+            # Only do device shuffle if low_vram; NEVER touch LoRA weights.
+            if t_name != self._prev_active_transformer_name:
+                self._prev_active_transformer_name = t_name
                 if self.low_vram:
-                    getattr(self, self._active_transformer_name).to("cpu")
+                    # Move inactive transformer to CPU, active to GPU.
+                    # The LoRA modules are sub-modules of each transformer,
+                    # so they move with their parent automatically.
+                    other = "transformer_2" if t_name == "transformer_1" else "transformer_1"
+                    getattr(self, other).to("cpu")
                     getattr(self, t_name).to(self.device_torch)
-                    torch.cuda.empty_cache()
-                self._active_transformer_name = t_name
+                    # NOTE: We deliberately do NOT call torch.cuda.empty_cache() here.
+                    # That call forces the allocator to release and reallocate workspace,
+                    # causing the 2-minute sampling delay reported in the bug.
 
         if self.transformer.device != hidden_states.device:
             if self.low_vram:
@@ -1118,7 +1138,9 @@ class Wan2214bModel(Wan21):
             save_file(state_dict, output_path, metadata=metadata)
             return
 
-        # we need to build out both dictionaries for high and low noise LoRAs
+        # we need to build out both dictionaries for high and low noise LoRAs.
+        # LoRA keys contain "transformer_1" or "transformer_2" in the module name
+        # (with underscores, e.g. lora_unet_transformer_1_blocks_0_attn1_to_q.lora_down.weight).
         high_noise_lora = {}
         low_noise_lora = {}
         
@@ -1126,13 +1148,34 @@ class Wan2214bModel(Wan21):
         only_train_low_noise = self.train_low_noise and not self.train_high_noise
 
         for key in state_dict:
-            if ".transformer_1." in key or only_train_high_noise:
-                # this is a high noise LoRA
-                new_key = key.replace(".transformer_1.", ".")
+            if "transformer_1" in key or only_train_high_noise:
+                # this is a high noise LoRA — strip the transformer_1/2 substring
+                # from the module-name portion so the saved key matches standard LoRA format.
+                # Handle both key formats:
+                #   - lora_unet_transformer_1_blocks_0... (single underscore, from WanTransformer3DModel target)
+                #   - lora_unet__transformer_1_blocks_0... (double underscore, from DualWanTransformer3DModel target)
+                new_key = key.replace("_transformer_1_", "_").replace("_transformer_1.", ".")
+                # Also handle the case where the key has the double-underscore prefix
+                # and _transformer_1_ didn't fully strip it (leaving transformer_1 in the key).
+                # This happens when the original key was lora_unet__transformer_1_... and
+                # the replace collapsed __ to _, leaving lora_unet_transformer_1_... — we need
+                # to strip transformer_1_ again if it's still there.
+                if "_transformer_1_" in new_key:
+                    new_key = new_key.replace("_transformer_1_", "_")
+                # Normalize double underscores to single underscores to ensure
+                # the saved key matches the format expected by load_lora.
+                while "__" in new_key:
+                    new_key = new_key.replace("__", "_")
                 high_noise_lora[new_key] = state_dict[key]
-            elif ".transformer_2." in key or only_train_low_noise:
+            elif "transformer_2" in key or only_train_low_noise:
                 # this is a low noise LoRA
-                new_key = key.replace(".transformer_2.", ".")
+                new_key = key.replace("_transformer_2_", "_").replace("_transformer_2.", ".")
+                if "_transformer_2_" in new_key:
+                    new_key = new_key.replace("_transformer_2_", "_")
+                # Normalize double underscores to single underscores to ensure
+                # the saved key matches the format expected by load_lora.
+                while "__" in new_key:
+                    new_key = new_key.replace("__", "_")
                 low_noise_lora[new_key] = state_dict[key]
 
         # loras have either LORA_MODEL_NAME_000005000.safetensors or LORA_MODEL_NAME.safetensors
@@ -1174,29 +1217,65 @@ class Wan2214bModel(Wan21):
             # load the high noise LoRA
             high_noise_lora = load_file(high_noise_lora_path)
             for key in high_noise_lora:
-                new_key = key.replace(
-                    "diffusion_model.", "diffusion_model.transformer_1."
-                )
+                # Support both model-weight format (diffusion_model.blocks...)
+                # and network module-name format (lora_unet_blocks...)
+                if key.startswith("diffusion_model."):
+                    new_key = key.replace(
+                        "diffusion_model.", "diffusion_model.transformer_1."
+                    )
+                elif "lora_" in key:
+                    # Network module-name format: re-insert transformer_1 into
+                    # the module name (e.g. lora_unet_blocks_0 -> lora_unet_transformer_1_blocks_0).
+                    # Handle both saved key formats:
+                    #   - lora_unet_blocks_0... (fully stripped, from single-underscore target)
+                    #   - lora_unet__blocks_0... (double underscore, from DualWanTransformer3DModel target)
+                    if "_transformer_1_" in key:
+                        # Already has transformer_1 — leave as-is.
+                        new_key = key
+                    else:
+                        new_key = key.replace("lora_unet_", "lora_unet_transformer_1_")
+                    # Normalize double underscores to single underscores to match
+                    # the state_dict key format.
+                    while "__" in new_key:
+                        new_key = new_key.replace("__", "_")
+                else:
+                    new_key = key
                 combined_dict[new_key] = high_noise_lora[key]
         if os.path.exists(low_noise_lora_path) and self.train_low_noise:
             # load the low noise LoRA
             low_noise_lora = load_file(low_noise_lora_path)
             for key in low_noise_lora:
-                new_key = key.replace(
-                    "diffusion_model.", "diffusion_model.transformer_2."
-                )
+                if key.startswith("diffusion_model."):
+                    new_key = key.replace(
+                        "diffusion_model.", "diffusion_model.transformer_2."
+                    )
+                elif "lora_" in key:
+                    if "_transformer_2_" in key:
+                        # Already has transformer_2 — leave as-is.
+                        new_key = key
+                    else:
+                        new_key = key.replace("lora_unet_", "lora_unet_transformer_2_")
+                    # Normalize double underscores to single underscores to match
+                    # the state_dict key format.
+                    while "__" in new_key:
+                        new_key = new_key.replace("__", "_")
+                else:
+                    new_key = key
                 combined_dict[new_key] = low_noise_lora[key]
         
         # if we are not training both stages, we wont have transformer designations in the keys
         if not self.train_high_noise or not self.train_low_noise:
             new_dict = {}
             for key in combined_dict:
-                if ".transformer_1." in key:
-                    new_key = key.replace(".transformer_1.", ".")
-                elif ".transformer_2." in key:
-                    new_key = key.replace(".transformer_2.", ".")
+                if "transformer_1" in key:
+                    new_key = key.replace("_transformer_1_", "_").replace("transformer_1.", ".")
+                elif "transformer_2" in key:
+                    new_key = key.replace("_transformer_2_", "_").replace("transformer_2.", ".")
                 else:
                     new_key = key
+                # Normalize double underscores to single underscores.
+                while "__" in new_key:
+                    new_key = new_key.replace("__", "_")
                 new_dict[new_key] = combined_dict[key]
             combined_dict = new_dict
 

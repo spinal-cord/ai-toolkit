@@ -2184,11 +2184,12 @@ class SDTrainer(BaseSDTrainProcess):
         self.optimizer.zero_grad()
         for batch in batch_list:
             if self.sd.is_multistage:
-                # handle multistage switching
-                if self.steps_this_boundary >= self.train_config.switch_boundary_every or self.current_boundary_index not in self.sd.trainable_multistage_boundaries:
+                # Boundary switching is handled by BaseSDTrainProcess.switch_boundary_if_needed()
+                # in the step loop (based on switch_boundary_every).
+                # Here we only ensure we are on a trainable boundary.
+                if self.current_boundary_index not in self.sd.trainable_multistage_boundaries:
                     # iterate to make sure we only train trainable_multistage_boundaries
                     while True:
-                        self.steps_this_boundary = 0
                         self.current_boundary_index += 1
                         if self.current_boundary_index >= len(self.sd.multistage_boundaries):
                             self.current_boundary_index = 0
@@ -2196,7 +2197,6 @@ class SDTrainer(BaseSDTrainProcess):
                             # if this boundary is trainable, we can stop looking
                             break
             loss = self.train_single_accumulation(batch)
-            self.steps_this_boundary += 1
             if total_loss is None:
                 total_loss = loss
             else:
@@ -2245,11 +2245,21 @@ class SDTrainer(BaseSDTrainProcess):
                 # Let's make sure we don't update any embedding weights besides the newly added token
                 self.adapter.restore_embeddings()
 
+        avg_loss = (total_loss / len(batch_list)).item()
+
         loss_dict = OrderedDict(
-            {'loss': (total_loss / len(batch_list)).item()}
+            {'loss': avg_loss}
         )
         if grad_norm_value is not None:
             loss_dict['grad_norm'] = grad_norm_value
+
+        # For MoE models training both experts, tag the loss with the active expert.
+        # When only one expert is trained, the distinction is unnecessary.
+        if hasattr(self.sd, 'model') and hasattr(self.sd.model, '_active_transformer_name'):
+            active = self.sd.model._active_transformer_name
+            if getattr(self.sd, 'train_high_noise', False) and getattr(self.sd, 'train_low_noise', False):
+                expert_label = "high" if active == "transformer_1" else "low"
+                loss_dict[f'loss_{expert_label}'] = avg_loss
 
         self.end_of_training_loop()
 

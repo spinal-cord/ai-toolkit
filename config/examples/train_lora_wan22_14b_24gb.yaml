@@ -46,6 +46,14 @@ config:
         lr: 1e-4
         optimizer_params:
           weight_decay: 1e-4
+          # For multistage LoRA training (Wan 2.2 14B), you can set different
+          # learning rates for each expert (high-noise transformer_1 and low-noise transformer_2).
+          # These are multiplicative multipliers applied to the base learning rate.
+          high_noise_lr_multiplier: 1.0  # transformer_1 (high noise)
+          low_noise_lr_multiplier: 1.0   # transformer_2 (low noise)
+          # Alternatively, you can set absolute learning rates:
+          # high_noise_lr: 1.2e-4
+          # low_noise_lr: 8.0e-5
         # uncomment this to skip the pre training sample
 #        skip_first_sample: true
         # uncomment to completely disable sampling
