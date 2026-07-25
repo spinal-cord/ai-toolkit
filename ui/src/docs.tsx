@@ -351,6 +351,135 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+
+  // --- Optimizer docs ---
+  optimizer: {
+    title: 'Optimizer',
+    description: (
+      <>
+        The optimizer controls how the model's weights are updated during training based on the computed gradients.
+        <br />
+        <br />
+        <strong>Standard Optimizers (work with LR Schedulers):</strong>
+        <ul className="list-disc pl-5 mt-2 space-y-1">
+          <li>
+            <strong>Adam / AdamW</strong> — The default choice. AdamW adds weight decay to Adam for better generalization.
+            Recommended for most training jobs. Start with lr 1e-4 to 3e-4.
+          </li>
+          <li>
+            <strong>AdamW Fused</strong> — Memory-efficient fused kernel variant of AdamW. Same behavior as AdamW but with
+            lower memory usage.
+          </li>
+          <li>
+            <strong>Adam8 / AdamW8</strong> — 8-bit versions of Adam/AdamW. Reduced memory footprint at minor precision
+            cost. Good for larger models.
+          </li>
+          <li>
+            <strong>AdamW FP8 / BF16</strong> — Custom 8-bit/BF16 AdamW implementations for specific hardware or precision
+            requirements.
+          </li>
+          <li>
+            <strong>Lion</strong> — Optimized for lower memory usage than Adam. Performs similarly to AdamW but with
+            reduced memory overhead. Recommended for memory-constrained setups.
+          </li>
+          <li>
+            <strong>Lion8Bit</strong> — 8-bit Lion variant. Same benefits as Lion with even lower memory usage.
+          </li>
+          <li>
+            <strong>Adagrad</strong> — Adaptive learning rate per parameter. Useful for sparse gradients but generally
+            less popular for diffusion training.
+          </li>
+          <li>
+            <strong>Adafactor</strong> — Memory-efficient alternative to Adam that uses factored second-moment estimates.
+            Good for large models when memory is a concern. Requires an LR scheduler.
+          </li>
+        </ul>
+        <br />
+        <strong>Adaptive Optimizers (built-in LR scheduling, no external scheduler needed):</strong>
+        <ul className="list-disc pl-5 mt-2 space-y-1">
+          <li>
+            <strong>DAdaptAdam / DAdaptLion</strong> — Automatically determines the optimal learning rate based on
+            parameter norms. No need to tune lr manually — just set lr to 1.0 and let it adapt. Excellent for
+            fine-tuning when you don't want to search for the right learning rate.
+          </li>
+          <li>
+            <strong>Prodigy / Prodigy8Bit</strong> — Combines DAdaptation with Adam/AdamW. Automatically scales the
+            learning rate while using momentum. Great out-of-the-box performance without lr tuning.
+          </li>
+          <li>
+            <strong>Automagic / Automagic v2 / Automagic v3</strong> — Self-adjusting optimizers that modify the learning
+            rate based on update direction consistency. Automagic v3 uses a polarity window approach for more stable
+            lr adaptation. No external scheduler needed.
+          </li>
+        </ul>
+        <br />
+        <strong>Recommendation:</strong> Start with <strong>AdamW8Bit</strong> for most cases. Use <strong>DAdaptAdam</strong>
+        or <strong>Prodigy</strong> if you don't want to tune the learning rate manually. Use <strong>Lion</strong> if you
+        are running low on VRAM.
+      </>
+    ),
+  },
+
+  // --- Scheduler docs ---
+  lr_scheduler: {
+    title: 'LR Scheduler',
+    description: (
+      <>
+        A learning rate scheduler adjusts the learning rate during training according to a schedule. This can help the model
+        converge better and avoid getting stuck in local minima.
+        <br />
+        <br />
+        <strong>Note:</strong> Adaptive optimizers (DAdaptAdam, Prodigy, Automagic family) do not need an external LR
+        scheduler — they handle learning rate adaptation internally. The scheduler will be locked to <em>None</em> when
+        these are selected.
+        <br />
+        <br />
+        <strong>Available Schedulers:</strong>
+        <ul className="list-disc pl-5 mt-2 space-y-1">
+          <li>
+            <strong>None</strong> — No scheduling. The learning rate stays constant throughout training. Fine for simple
+            cases or when using adaptive optimizers.
+          </li>
+          <li>
+            <strong>Cosine</strong> — Smoothly decays the learning rate following a cosine curve. The most popular and
+            generally recommended default. Works well for most training scenarios. Total Iters defaults to training steps
+            divided by gradient accumulation steps.
+          </li>
+          <li>
+            <strong>Cosine with Restarts</strong> — Like Cosine but resets the schedule periodically, allowing the model
+            to escape local minima. Useful for long training runs. T_0 is the initial period, T_mult multiplies the
+            period after each restart.
+          </li>
+          <li>
+            <strong>Step</strong> — Multiplicatively reduces the learning rate by a factor every N steps. Simple and
+            predictable. Step Size controls how often to reduce, Gamma controls the reduction factor (e.g., 0.1 means
+            lr becomes 10% after each step).
+          </li>
+          <li>
+            <strong>Polynomial</strong> — Decays the learning rate using a polynomial function. More aggressive decay
+            than cosine at the end. Power controls the curve shape.
+          </li>
+          <li>
+            <strong>Constant</strong> — Keeps the learning rate at a constant factor of the initial value. Useful when
+            you want a fixed proportional reduction.
+          </li>
+          <li>
+            <strong>Linear</strong> — Linearly decays the learning rate from start_factor to end_factor. Simple and
+            predictable.
+          </li>
+          <li>
+            <strong>Constant with Warmup</strong> — Starts with a linear warmup phase (ramping up the lr from 0 to the
+            target) then holds it constant. Recommended for large models or when training from scratch. Warmup Steps
+            defaults to 1000.
+          </li>
+        </ul>
+        <br />
+        <strong>Recommendation:</strong> <strong>Cosine</strong> is the best default for most training jobs. Use
+        <strong>Constant with Warmup</strong> for large models or training from scratch. Use <strong>Cosine with
+        Restarts</strong> for very long training runs.
+      </>
+    ),
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {

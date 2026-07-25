@@ -136,7 +136,8 @@ class ConceptReplacer(BaseSDTrainProcess):
         # apply gradients
         self.optimizer.step()
         self.optimizer.zero_grad()
-        self.lr_scheduler.step()
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
 
         if self.embedding is not None:
             # Let's make sure we don't update any embedding weights besides the newly added token

@@ -1860,8 +1860,8 @@ class SDTrainer(BaseSDTrainProcess):
                             self.adapter.last_unconditional = None
 
                 if self.adapter and isinstance(self.adapter, ReferenceAdapter):
-                    # pass in our scheduler
-                    self.adapter.noise_scheduler = self.lr_scheduler
+                    # pass in our noise scheduler
+                    self.adapter.noise_scheduler = self.sd.noise_scheduler
                     if has_clip_image or has_adapter_img:
                         img_to_use = clip_images if has_clip_image else adapter_images
                         # currently 0-1 needs to be -1 to 1
@@ -2231,7 +2231,8 @@ class SDTrainer(BaseSDTrainProcess):
             # Step LR scheduler only when optimizer steps (not during gradient accumulation)
             # Scheduler total_iters is adjusted for gradient accumulation in BaseSDTrainProcess
             with self.timer('scheduler_step'):
-                self.lr_scheduler.step()
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
         else:
             # gradient accumulation. Just a place for breakpoint
             pass

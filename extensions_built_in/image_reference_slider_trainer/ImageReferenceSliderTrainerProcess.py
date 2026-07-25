@@ -222,7 +222,8 @@ class ImageReferenceSliderTrainerProcess(BaseSDTrainProcess):
 
         # apply gradients
         optimizer.step()
-        lr_scheduler.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
 
         # reset network
         self.network.multiplier = 1.0

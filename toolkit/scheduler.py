@@ -8,6 +8,8 @@ def get_lr_scheduler(
         optimizer: torch.optim.Optimizer,
         **kwargs,
 ):
+    if name is None or name.lower() == "none":
+        return None
     if name == "cosine":
         if 'total_iters' in kwargs:
             kwargs['T_max'] = kwargs.pop('total_iters')
@@ -85,5 +87,5 @@ def get_lr_scheduler(
             print(e)
             pass
         raise ValueError(
-            "Scheduler must be cosine, cosine_with_restarts, step, linear or constant"
+            "Scheduler must be 'none', cosine, cosine_with_restarts, step, linear or constant"
         )

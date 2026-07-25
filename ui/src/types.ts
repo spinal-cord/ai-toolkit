@@ -130,6 +130,21 @@ export interface TrainConfig {
   timestep_type: string;
   content_or_style: string;
   optimizer: string;
+  lr_scheduler?: string;
+  lr_scheduler_params?: {
+    total_iters?: number;
+    power?: number;
+    lr_end?: number;
+    T_0?: number;
+    T_mult?: number;
+    eta_min?: number;
+    step_size?: number;
+    gamma?: number;
+    factor?: number;
+    end_factor?: number;
+    start_factor?: number;
+    num_warmup_steps?: number;
+  };
   lr: number;
   ema_config?: EMAConfig;
   dtype: string;

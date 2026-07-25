@@ -48,6 +48,21 @@ type Props = {
 
 const isDev = process.env.NODE_ENV === 'development';
 
+// Optimizers that have their own adaptive learning rate and don't need external LR schedulers
+const NO_SCHEDULER_OPTIMIZERS = ['prodigyopt', 'prodigy8bit', 'automagic', 'automagic2', 'automagic3', 'dadaptation', 'dadaptationlion'];
+
+// Default parameters for each scheduler type
+const SCHEDULER_DEFAULT_PARAMS: Record<string, Record<string, any>> = {
+  none: {},
+  cosine: {},
+  cosine_with_restarts: { T_mult: 2, eta_min: 0 },
+  step: { step_size: 100, gamma: 0.1 },
+  polynomial: { power: 0.8, lr_end: 0 },
+  constant: { factor: 1.0, step_size: 100, end_factor: 1.0 },
+  linear: { start_factor: 1.0, end_factor: 0.0 },
+  constant_with_warmup: { num_warmup_steps: 1000 },
+};
+
 export default function SimpleJob({
   jobConfig,
   setJobConfig,
@@ -621,18 +636,214 @@ export default function SimpleJob({
                 <SelectInput
                   label="Optimizer"
                   value={jobConfig.config.process[0].train.optimizer}
-                  onChange={value => setJobConfig(value, 'config.process[0].train.optimizer')}
+                  onChange={value => {
+                    setJobConfig(value, 'config.process[0].train.optimizer');
+                    const isNoScheduler = NO_SCHEDULER_OPTIMIZERS.includes(value);
+                    if (isNoScheduler) {
+                      // Lock to 'none' and clear params for optimizers that don't need schedulers
+                      setJobConfig('none', 'config.process[0].train.lr_scheduler');
+                      setJobConfig({}, 'config.process[0].train.lr_scheduler_params');
+                    } else {
+                      // Reset to 'none' with defaults when switching away from no-scheduler optimizer
+                      const currentScheduler = jobConfig.config.process[0].train.lr_scheduler;
+                      if (currentScheduler && currentScheduler !== 'none') {
+                        // Keep current scheduler but reset its params to defaults
+                        const defaults = SCHEDULER_DEFAULT_PARAMS[currentScheduler] || {};
+                        setJobConfig(defaults, 'config.process[0].train.lr_scheduler_params');
+                      }
+                    }
+                  }}
+                  docKey="optimizer"
                   options={[
-                    { value: 'adafactor', label: 'Adafactor' },
                     { value: 'adam', label: 'Adam' },
                     { value: 'adamw', label: 'AdamW' },
+                    { value: 'adamw_fused', label: 'AdamW Fused' },
                     { value: 'adamw8bit', label: 'AdamW8Bit' },
-                    { value: 'automagic', label: 'Automagic' },
-                    { value: 'automagic2', label: 'Automagic v2' },
+                    { value: 'adamw_fp8', label: 'AdamW FP8' },
+                    { value: 'adamw_bf16', label: 'AdamW BF16' },
+                    { value: 'adam8', label: 'Adam8Bit' },
+                    { value: 'adamw8', label: 'AdamW8Bit' },
+                    { value: 'lion', label: 'Lion' },
+                    { value: 'lion8bit', label: 'Lion8Bit' },
+                    { value: 'adagrad', label: 'Adagrad' },
+                    { value: 'adafactor', label: 'Adafactor' },
+                    { value: 'dadaptation', label: 'DAdaptAdam' },
+                    { value: 'dadaptationlion', label: 'DAdaptLion' },
                     { value: 'prodigyopt', label: 'Prodigy' },
                     { value: 'prodigy8bit', label: 'Prodigy8Bit' },
+                    { value: 'automagic', label: 'Automagic' },
+                    { value: 'automagic2', label: 'Automagic v2' },
+                    { value: 'automagic3', label: 'Automagic v3' },
                   ]}
                 />
+                <SelectInput
+                  label="LR Scheduler"
+                  value={jobConfig.config.process[0].train.lr_scheduler}
+                  onChange={value => {
+                    setJobConfig(value, 'config.process[0].train.lr_scheduler');
+                    // Reset params to defaults for the selected scheduler
+                    const defaults = SCHEDULER_DEFAULT_PARAMS[value] || {};
+                    setJobConfig(defaults, 'config.process[0].train.lr_scheduler_params');
+                  }}
+                  docKey="lr_scheduler"
+                  options={[
+                    { value: 'none', label: 'None' },
+                    { value: 'cosine', label: 'Cosine' },
+                    { value: 'cosine_with_restarts', label: 'Cosine with Restarts' },
+                    { value: 'step', label: 'Step' },
+                    { value: 'polynomial', label: 'Polynomial' },
+                    { value: 'constant', label: 'Constant' },
+                    { value: 'linear', label: 'Linear' },
+                    { value: 'constant_with_warmup', label: 'Constant with Warmup' },
+                  ]}
+                  disabled={NO_SCHEDULER_OPTIMIZERS.includes(jobConfig.config.process[0].train.optimizer)}
+                />
+                {jobConfig.config.process[0].train.lr_scheduler === 'cosine' && (
+                  <NumberInput
+                    label="Total Iters (T_max)"
+                    className="pt-2"
+                    value={jobConfig.config.process[0].train.lr_scheduler_params?.total_iters}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.lr_scheduler_params.total_iters')}
+                    placeholder="Defaults to training steps"
+                    min={1}
+                  />
+                )}
+                {jobConfig.config.process[0].train.lr_scheduler === 'cosine_with_restarts' && (
+                  <>
+                    <NumberInput
+                      label="T_0 (Initial Period)"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.lr_scheduler_params?.T_0}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.lr_scheduler_params.T_0')}
+                      placeholder="Defaults to training steps"
+                      min={1}
+                    />
+                    <NumberInput
+                      label="T_mult"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.lr_scheduler_params?.T_mult}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.lr_scheduler_params.T_mult')}
+                      placeholder="eg. 2"
+                      min={1}
+                    />
+                    <NumberInput
+                      label="Eta Min"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.lr_scheduler_params?.eta_min}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.lr_scheduler_params.eta_min')}
+                      placeholder="eg. 0.0"
+                      min={0}
+                    />
+                  </>
+                )}
+                {jobConfig.config.process[0].train.lr_scheduler === 'step' && (
+                  <>
+                    <NumberInput
+                      label="Step Size"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.lr_scheduler_params?.step_size}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.lr_scheduler_params.step_size')}
+                      placeholder="eg. 100"
+                      min={1}
+                    />
+                    <NumberInput
+                      label="Gamma"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.lr_scheduler_params?.gamma}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.lr_scheduler_params.gamma')}
+                      placeholder="eg. 0.1"
+                      min={0}
+                      max={1}
+                    />
+                  </>
+                )}
+                {jobConfig.config.process[0].train.lr_scheduler === 'polynomial' && (
+                  <>
+                    <NumberInput
+                      label="Power"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.lr_scheduler_params?.power}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.lr_scheduler_params.power')}
+                      placeholder="eg. 0.8"
+                      min={0.01}
+                      max={10}
+                    />
+                    <NumberInput
+                      label="LR End"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.lr_scheduler_params?.lr_end}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.lr_scheduler_params.lr_end')}
+                      placeholder="eg. 0.0"
+                      min={0}
+                    />
+                  </>
+                )}
+                {jobConfig.config.process[0].train.lr_scheduler === 'constant' && (
+                  <>
+                    <NumberInput
+                      label="Factor"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.lr_scheduler_params?.factor}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.lr_scheduler_params.factor')}
+                      placeholder="eg. 1.0"
+                      min={0}
+                    />
+                    <NumberInput
+                      label="Step Size"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.lr_scheduler_params?.step_size}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.lr_scheduler_params.step_size')}
+                      placeholder="eg. 100"
+                      min={1}
+                    />
+                    <NumberInput
+                      label="End Factor"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.lr_scheduler_params?.end_factor}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.lr_scheduler_params.end_factor')}
+                      placeholder="eg. 1.0"
+                      min={0}
+                    />
+                  </>
+                )}
+                {jobConfig.config.process[0].train.lr_scheduler === 'linear' && (
+                  <>
+                    <NumberInput
+                      label="Start Factor"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.lr_scheduler_params?.start_factor}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.lr_scheduler_params.start_factor')}
+                      placeholder="eg. 1.0"
+                      min={0}
+                    />
+                    <NumberInput
+                      label="End Factor"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.lr_scheduler_params?.end_factor}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.lr_scheduler_params.end_factor')}
+                      placeholder="eg. 0.0"
+                      min={0}
+                    />
+                    <NumberInput
+                      label="Total Iters"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.lr_scheduler_params?.total_iters}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.lr_scheduler_params.total_iters')}
+                      placeholder="Defaults to training steps"
+                      min={1}
+                    />
+                  </>
+                )}
+                {jobConfig.config.process[0].train.lr_scheduler === 'constant_with_warmup' && (
+                  <NumberInput
+                    label="Warmup Steps"
+                    className="pt-2"
+                    value={jobConfig.config.process[0].train.lr_scheduler_params?.num_warmup_steps}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.lr_scheduler_params.num_warmup_steps')}
+                    placeholder="Defaults to 1000"
+                    min={0}
+                  />
+                )}
                 <NumberInput
                   label="Learning Rate"
                   className="pt-2"

@@ -2115,27 +2115,46 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # set up the ema now that the optimizer (and its params) are ready
         self.setup_ema()
 
-        lr_scheduler_params = self.train_config.lr_scheduler_params
+        # Default scheduler parameters for each scheduler type
+        SCHEDULER_DEFAULT_PARAMS = {
+            'cosine': {},
+            'cosine_with_restarts': {'T_mult': 2, 'eta_min': 0},
+            'step': {'step_size': 100, 'gamma': 0.1},
+            'polynomial': {'power': 0.8, 'lr_end': 0},
+            'constant': {'factor': 1.0, 'step_size': 100, 'end_factor': 1.0},
+            'linear': {'start_factor': 1.0, 'end_factor': 0.0},
+            'constant_with_warmup': {'num_warmup_steps': 1000},
+        }
 
-        # make sure it had bare minimum
-        if 'max_iterations' not in lr_scheduler_params:
-            # Adjust total_iters to account for gradient accumulation
-            # The scheduler should step once per optimizer step, not per training iteration
-            gradient_accumulation_steps = max(1, self.train_config.gradient_accumulation_steps)
-            if gradient_accumulation_steps == -1:
-                # -1 means accumulate for entire epoch, difficult to predict step count
-                # Use total steps as fallback (will step more frequently than ideal)
-                lr_scheduler_params['total_iters'] = self.train_config.steps
-            else:
-                # Calculate actual number of optimizer steps
-                lr_scheduler_params['total_iters'] = self.train_config.steps // gradient_accumulation_steps
+        # Only set up lr scheduler if it is not 'none'
+        if self.train_config.lr_scheduler and self.train_config.lr_scheduler.lower() != 'none':
+            lr_scheduler_params = self.train_config.lr_scheduler_params or {}
 
-        lr_scheduler = get_lr_scheduler(
-            self.train_config.lr_scheduler,
-            optimizer,
-            **lr_scheduler_params
-        )
-        self.lr_scheduler = lr_scheduler
+            # Apply default parameters for the selected scheduler type
+            scheduler_defaults = SCHEDULER_DEFAULT_PARAMS.get(self.train_config.lr_scheduler, {})
+            for key, default_value in scheduler_defaults.items():
+                if key not in lr_scheduler_params:
+                    lr_scheduler_params[key] = default_value
+
+            # make sure it had bare minimum
+            if 'max_iterations' not in lr_scheduler_params:
+                # Adjust total_iters to account for gradient accumulation
+                # The scheduler should step once per optimizer step, not per training iteration
+                gradient_accumulation_steps = max(1, self.train_config.gradient_accumulation_steps)
+                if gradient_accumulation_steps == -1:
+                    # -1 means accumulate for entire epoch, difficult to predict step count
+                    # Use total steps as fallback (will step more frequently than ideal)
+                    lr_scheduler_params['total_iters'] = self.train_config.steps
+                else:
+                    # Calculate actual number of optimizer steps
+                    lr_scheduler_params['total_iters'] = self.train_config.steps // gradient_accumulation_steps
+
+            lr_scheduler = get_lr_scheduler(
+                self.train_config.lr_scheduler,
+                optimizer,
+                **lr_scheduler_params
+            )
+            self.lr_scheduler = lr_scheduler
 
         ### HOOk ###
         self.before_dataset_load()
@@ -2401,7 +2420,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # zero any gradients
         optimizer.zero_grad()
 
-        self.lr_scheduler.step(self.step_num)
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step(self.step_num)
 
         self.sd.set_device_state(self.train_device_state_preset)
         flush()
