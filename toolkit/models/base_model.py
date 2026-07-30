@@ -377,6 +377,7 @@ class BaseModel:
             sampler=None,
             pipeline: Union[None, StableDiffusionPipeline,
                             StableDiffusionXLPipeline] = None,
+            sampling_flow_shift: float = None,
     ):
         network = self.network
         merge_multiplier = 1.0
@@ -420,7 +421,7 @@ class BaseModel:
         cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
 
         if pipeline is None:
-            pipeline = self.get_generation_pipeline()
+            pipeline = self.get_generation_pipeline(sampling_flow_shift=sampling_flow_shift)
             try:
                 pipeline.set_progress_bar_config(disable=True)
             except:

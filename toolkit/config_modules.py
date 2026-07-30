@@ -96,6 +96,11 @@ class SampleConfig:
         self.extra_values = kwargs.get('extra_values', [])
         self.num_frames = kwargs.get('num_frames', 1)
         self.fps: int = kwargs.get('fps', 16)
+        # Shift value used during sampling/inference only. Does not affect training.
+        # For Wan2.2 models trained with timestep_type: sigmoid, this controls the
+        # flow matching shift applied during generation (e.g., 8.0 gives the
+        # desired 1:1 high/low noise step ratio).
+        self.sampling_flow_shift: Optional[float] = kwargs.get('sampling_flow_shift', None)
         if self.num_frames > 1 and self.ext not in ['webp']:
             print("Changing sample extention to animated webp")
             self.ext = 'webp'

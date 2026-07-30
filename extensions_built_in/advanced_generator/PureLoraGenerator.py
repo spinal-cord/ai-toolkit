@@ -94,7 +94,11 @@ class PureLoraGenerator(BaseExtensionProcess):
                 ))
 
             # send to be generated
-            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+            self.sd.generate_images(
+                gen_img_config_list,
+                sampler=sample_config.sampler,
+                sampling_flow_shift=sample_config.sampling_flow_shift,
+            )
             print("Done generating images")
             # cleanup
             del self.sd

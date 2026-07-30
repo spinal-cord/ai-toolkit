@@ -48,6 +48,8 @@ class GenerateConfig:
         self.ext = kwargs.get('ext', 'png')
         self.denoise_strength = kwargs.get('denoise_strength', 0.5)
         self.trigger_word = kwargs.get('trigger_word', None)
+        # Shift value used during sampling/inference only. Does not affect training.
+        self.sampling_flow_shift = kwargs.get('sampling_flow_shift', None)
 
 
 class Img2ImgGenerator(BaseExtensionProcess):

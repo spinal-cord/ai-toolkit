@@ -50,9 +50,20 @@ scheduler_configUniPC = {
 }
 
 # for training. I think it is right
+# Note: During training with timestep_type='sigmoid', the shift parameter is
+# ignored by the custom scheduler. This config is only used as a fallback.
 scheduler_config = {
     "num_train_timesteps": 1000,
     "shift": 5.0,
+    "use_dynamic_shifting": False,
+}
+
+# for sampling/inference. This is where the shift parameter actually matters.
+# Use a higher shift (e.g., 8.0) for better 1:1 high/low noise step ratio.
+# This value can be overridden via sampling_flow_shift in the config file.
+sampling_scheduler_config = {
+    "num_train_timesteps": 1000,
+    "shift": 8.0,
     "use_dynamic_shifting": False,
 }
 
@@ -123,10 +134,11 @@ class Wan225bModel(Wan21):
         # every downstream modulation; keep them in full precision when quantizing
         return ["condition_embedder*", "proj_out*"]
 
-    def get_generation_pipeline(self):
-        # todo unipc got broken in a diffusers update. Use euler for now.
-        # scheduler = UniPCMultistepScheduler(**self._wan_generation_scheduler_config)
-        scheduler = self.get_train_scheduler()
+    def get_generation_pipeline(self, sampling_flow_shift: float = None):
+        # Use the sampling scheduler config (with configurable shift) for inference.
+        # During training, the scheduler uses timestep_type='sigmoid' which ignores
+        # the shift parameter. During sampling, set_timesteps() reads self.config.shift.
+        scheduler = self.get_sampling_scheduler(sampling_flow_shift)
         pipeline = Wan22Pipeline(
             vae=self.vae,
             transformer=self.model,
@@ -143,10 +155,21 @@ class Wan225bModel(Wan21):
 
         return pipeline
 
-    # static method to get the scheduler
+    # static method to get the training scheduler
+    # During training with timestep_type='sigmoid', the shift is ignored.
     @staticmethod
     def get_train_scheduler():
         scheduler = CustomFlowMatchEulerDiscreteScheduler(**scheduler_config)
+        return scheduler
+
+    # static method to get the sampling/inference scheduler
+    # This uses the configurable shift value for the sigma schedule during generation.
+    @staticmethod
+    def get_sampling_scheduler(sampling_flow_shift: float = None):
+        config = dict(sampling_scheduler_config)
+        if sampling_flow_shift is not None:
+            config["shift"] = sampling_flow_shift
+        scheduler = CustomFlowMatchEulerDiscreteScheduler(**config)
         return scheduler
 
     def get_base_model_version(self):

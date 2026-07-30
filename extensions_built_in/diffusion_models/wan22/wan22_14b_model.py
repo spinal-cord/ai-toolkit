@@ -28,6 +28,7 @@ from torchvision.transforms import functional as TF
 from toolkit.models.wan21.wan21 import Wan21
 from .wan22_5b_model import (
     scheduler_config,
+    sampling_scheduler_config,
     time_text_monkeypatch,
 )
 from toolkit.memory_management import MemoryManager
@@ -1059,10 +1060,11 @@ class Wan2214bModel(Wan21):
 
         return transformer
 
-    def get_generation_pipeline(self):
-        # todo unipc got broken in a diffusers update. Use euler for now.
-        # scheduler = UniPCMultistepScheduler(**self._wan_generation_scheduler_config)
-        scheduler = self.get_train_scheduler()
+    def get_generation_pipeline(self, sampling_flow_shift: float = None):
+        # Use the sampling scheduler config (with configurable shift) for inference.
+        # During training, the scheduler uses timestep_type='sigmoid' which ignores
+        # the shift parameter. During sampling, set_timesteps() reads self.config.shift.
+        scheduler = self.get_sampling_scheduler(sampling_flow_shift)
         pipeline = Wan22Pipeline(
             vae=self.vae,
             transformer=self.model.transformer_1,
@@ -1080,10 +1082,21 @@ class Wan2214bModel(Wan21):
 
         return pipeline
 
-    # static method to get the scheduler
+    # static method to get the training scheduler
+    # During training with timestep_type='sigmoid', the shift is ignored.
     @staticmethod
     def get_train_scheduler():
         scheduler = CustomFlowMatchEulerDiscreteScheduler(**scheduler_config)
+        return scheduler
+
+    # static method to get the sampling/inference scheduler
+    # This uses the configurable shift value for the sigma schedule during generation.
+    @staticmethod
+    def get_sampling_scheduler(sampling_flow_shift: float = None):
+        config = dict(sampling_scheduler_config)
+        if sampling_flow_shift is not None:
+            config["shift"] = sampling_flow_shift
+        scheduler = CustomFlowMatchEulerDiscreteScheduler(**config)
         return scheduler
 
     def get_base_model_version(self):

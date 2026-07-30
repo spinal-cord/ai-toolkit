@@ -698,9 +698,11 @@ class Wan21(BaseModel):
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
 
-    def get_generation_pipeline(self):
-        # todo unipc got broken in a diffusers update. Use euler for now.
-        # scheduler = UniPCMultistepScheduler(**self._wan_generation_scheduler_config)
+    def get_generation_pipeline(self, sampling_flow_shift: float = None):
+        # Use the training scheduler. For Wan2.2 models (5b/14b), the subclass
+        # overrides this to use a separate sampling scheduler with configurable shift.
+        # During training with timestep_type='sigmoid', the shift is ignored.
+        # During sampling, set_timesteps() reads self.config.shift.
         scheduler = self.get_train_scheduler()
         if self.model_config.low_vram:
             pipeline = AggressiveWanUnloadPipeline(

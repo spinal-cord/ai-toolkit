@@ -52,6 +52,8 @@ class GenerateConfig:
         self.random_prompts = kwargs.get('random_prompts', False)
         self.max_random_per_prompt = kwargs.get('max_random_per_prompt', 1)
         self.max_images = kwargs.get('max_images', 10000)
+        # Shift value used during sampling/inference only. Does not affect training.
+        self.sampling_flow_shift = kwargs.get('sampling_flow_shift', None)
 
         if self.random_prompts:
             self.prompts = []
@@ -164,7 +166,11 @@ class GenerateProcess(BaseProcess):
                         add_prompt_file=self.generate_config.prompt_file
                     ))
             # generate images
-            self.sd.generate_images(prompt_image_configs, sampler=self.generate_config.sampler)
+            self.sd.generate_images(
+                prompt_image_configs,
+                sampler=self.generate_config.sampler,
+                sampling_flow_shift=self.generate_config.sampling_flow_shift,
+            )
 
             print("Done generating images")
             # cleanup

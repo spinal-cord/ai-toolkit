@@ -93,6 +93,11 @@ config:
         # set to 1 for images
         num_frames: 1
         fps: 16
+        # Sampling shift for inference only. Does not affect training.
+        # When training with timestep_type: sigmoid, the shift is ignored during
+        # training. This value controls the flow matching shift applied during
+        # generation (e.g., 8.0 gives the desired 1:1 high/low noise step ratio).
+        sampling_flow_shift: 8.0
         # samples take a long time. so use them sparingly
         # samples will be animated webp files, if you don't see them animated, open in a browser.
         prompts:

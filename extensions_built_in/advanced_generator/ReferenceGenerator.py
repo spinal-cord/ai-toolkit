@@ -45,6 +45,8 @@ class GenerateConfig:
         self.guidance_rescale = kwargs.get('guidance_rescale', 0.0)
         self.ext = kwargs.get('ext', 'png')
         self.adapter_conditioning_scale = kwargs.get('adapter_conditioning_scale', 1.0)
+        # Shift value used during sampling/inference only. Does not affect training.
+        self.sampling_flow_shift = kwargs.get('sampling_flow_shift', None)
         if kwargs.get('shuffle', False):
             # shuffle the prompts
             random.shuffle(self.prompts)

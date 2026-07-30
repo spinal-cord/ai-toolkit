@@ -1141,6 +1141,7 @@ class StableDiffusion:
             image_configs: List[GenerateImageConfig],
             sampler=None,
             pipeline: Union[None, StableDiffusionPipeline, StableDiffusionXLPipeline] = None,
+            sampling_flow_shift: float = None,
     ):
         network = unwrap_model(self.network)
         merge_multiplier = 1.0
