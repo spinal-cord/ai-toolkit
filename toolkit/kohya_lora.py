@@ -18,6 +18,74 @@ import re
 RE_UPDOWN = re.compile(r"(up|down)?_blocks_(\d+)_(resnets|upsamplers|downsamplers|attentions|attentions)_(\d+)_")
 RE_WAN22_BLOCK = re.compile(r"blocks_(\d+)_attentions_(\d+)_")
 
+def _parse_init_config(init_config):
+    """Parse initialization config which can be a string or dict with 'method' and optional 'std'."""
+    if isinstance(init_config, dict):
+        return init_config.get('method', 'kaiming_uniform'), init_config.get('std', None)
+    return init_config, None
+
+def _resolve_init_std(method: str, std: Optional[float] = None) -> Optional[float]:
+    """Resolve the actual std value for an initialization method (for display purposes).
+
+    For methods with hardcoded std (e.g. 'normal' uses 0.01), returns that value.
+    For 'gaussian_random' with std=None, returns the input std (None) since the
+    actual default depends on tensor shape and cannot be determined without it.
+
+    Args:
+        method: Initialization method name.
+        std: Input std, may be None.
+
+    Returns:
+        The resolved std value, or None if it depends on tensor shape.
+    """
+    if method == 'normal':
+        return 0.01
+    if method == 'small_noise':
+        return 0.001
+    return std
+
+def _apply_lora_init(tensor, method, std: Optional[float] = None):
+    """Apply initialization method to a tensor.
+
+    Args:
+        tensor: The weight tensor to initialize.
+        method: Initialization method name (e.g. 'zeros', 'gaussian_random', 'kaiming_uniform').
+        std: Standard deviation for Gaussian-based initializations. If None and method is
+             'gaussian_random', defaults to 1/sqrt(tensor.shape[-1]).
+
+    Returns:
+        The resolved std value used for the initialization.
+    """
+    if method == 'zeros':
+        torch.nn.init.zeros_(tensor)
+        return std
+    elif method == 'gaussian_random':
+        if std is None:
+            std = 1.0 / math.sqrt(tensor.shape[-1])
+        torch.nn.init.normal_(tensor, mean=0.0, std=std)
+        return std
+    elif method == 'kaiming_uniform':
+        torch.nn.init.kaiming_uniform_(tensor, a=math.sqrt(5))
+        return std
+    elif method == 'kaiming_normal':
+        torch.nn.init.kaiming_normal_(tensor, a=math.sqrt(5))
+        return std
+    elif method == 'xavier_uniform':
+        torch.nn.init.xavier_uniform_(tensor)
+        return std
+    elif method == 'xavier_normal':
+        torch.nn.init.xavier_normal_(tensor)
+        return std
+    elif method == 'normal':
+        torch.nn.init.normal_(tensor, mean=0.0, std=0.01)
+        return 0.01
+    elif method == 'small_noise':
+        torch.nn.init.normal_(tensor, mean=0.0, std=0.001)
+        return 0.001
+    else:
+        torch.nn.init.kaiming_uniform_(tensor, a=math.sqrt(5))
+        return std
+
 
 class LoRAModule(torch.nn.Module):
     """
@@ -908,8 +976,32 @@ class LoRANetwork(torch.nn.Module):
                                     lora.set_owner_transformer("transformer_1")
                                 elif child_name.startswith("transformer_2"):
                                     lora.set_owner_transformer("transformer_2")
-                                # If child_name doesn't start with either prefix, it's a shared module
-                                # (e.g., the DualWanTransformer3DModel wrapper itself) — leave as None.
+
+                            # Apply dynamic initialization based on network config and expert
+                            if hasattr(lora, 'lora_down'):
+                                nc = getattr(self, 'network_config', None)
+                                if nc:
+                                    init_a_config = getattr(nc, 'lora_a_init', 'kaiming_uniform')
+                                    init_b_config = getattr(nc, 'lora_b_init', 'zeros')
+                                    if getattr(lora, '_owner_transformer', None) == 'transformer_1':
+                                        init_a_config = getattr(nc, 'high_noise_lora_a_init', None) or init_a_config
+                                        init_b_config = getattr(nc, 'high_noise_lora_b_init', None) or init_b_config
+                                    elif getattr(lora, '_owner_transformer', None) == 'transformer_2':
+                                        init_a_config = getattr(nc, 'low_noise_lora_a_init', None) or init_a_config
+                                        init_b_config = getattr(nc, 'low_noise_lora_b_init', None) or init_b_config
+                                    init_a, std_a = _parse_init_config(init_a_config)
+                                    init_b, std_b = _parse_init_config(init_b_config)
+                                    std_a = _apply_lora_init(lora.lora_down.weight, init_a, std_a)
+                                    std_b = _apply_lora_init(lora.lora_up.weight, init_b, std_b)
+
+                                    # Print initialization info for this LoRA module
+                                    expert_info = ""
+                                    if getattr(lora, '_owner_transformer', None) is not None:
+                                        expert_info = f" [Expert: {lora._owner_transformer}]"
+                                    print(
+                                        f"LoRA init: '{lora_name}'{expert_info} -> "
+                                        f"Matrix A: {init_a} (std={std_a}), Matrix B: {init_b} (std={std_b})"
+                                    )
 
                             loras.append(lora)
             return loras, skipped
@@ -962,11 +1054,60 @@ class LoRANetwork(torch.nn.Module):
                 self.unet_loras_shared.append(lora)
 
         if self._is_multistage_unet:
-            print(
-                f"Multistage mode: {len(self.unet_loras_expert1)} LoRAs for transformer_1 "
-                f"(high-noise), {len(self.unet_loras_expert2)} for transformer_2 (low-noise), "
-                f"{len(self.unet_loras_shared)} shared."
-            )
+            # Determine which experts are actually being trained
+            expert1_active = len(self.unet_loras_expert1) > 0
+            expert2_active = len(self.unet_loras_expert2) > 0
+            shared_active = len(self.unet_loras_shared) > 0
+            
+            # Get init configs for each expert from network config
+            nc = getattr(self, 'network_config', None)
+            
+            # Expert 1 (high-noise) init config
+            if expert1_active and nc:
+                e1_init_a = getattr(nc, 'high_noise_lora_a_init', None) or getattr(nc, 'lora_a_init', 'kaiming_uniform')
+                e1_init_b = getattr(nc, 'high_noise_lora_b_init', None) or getattr(nc, 'lora_b_init', 'zeros')
+                e1_a_method, e1_a_std = _parse_init_config(e1_init_a)
+                e1_b_method, e1_b_std = _parse_init_config(e1_init_b)
+                e1_a_std = _resolve_init_std(e1_a_method, e1_a_std)
+                e1_b_std = _resolve_init_std(e1_b_method, e1_b_std)
+                print(
+                    f"Multistage mode: Training Expert 1 (transformer_1/high-noise) with {len(self.unet_loras_expert1)} LoRAs - "
+                    f"Matrix A: {e1_a_method} (std={e1_a_std}), Matrix B: {e1_b_method} (std={e1_b_std})"
+                )
+            
+            # Expert 2 (low-noise) init config
+            if expert2_active and nc:
+                e2_init_a = getattr(nc, 'low_noise_lora_a_init', None) or getattr(nc, 'lora_a_init', 'kaiming_uniform')
+                e2_init_b = getattr(nc, 'low_noise_lora_b_init', None) or getattr(nc, 'lora_b_init', 'zeros')
+                e2_a_method, e2_a_std = _parse_init_config(e2_init_a)
+                e2_b_method, e2_b_std = _parse_init_config(e2_init_b)
+                e2_a_std = _resolve_init_std(e2_a_method, e2_a_std)
+                e2_b_std = _resolve_init_std(e2_b_method, e2_b_std)
+                print(
+                    f"Multistage mode: Training Expert 2 (transformer_2/low-noise) with {len(self.unet_loras_expert2)} LoRAs - "
+                    f"Matrix A: {e2_a_method} (std={e2_a_std}), Matrix B: {e2_b_method} (std={e2_b_std})"
+                )
+            
+            # Shared LoRAs
+            if shared_active and nc:
+                shared_init_a = getattr(nc, 'lora_a_init', 'kaiming_uniform')
+                shared_init_b = getattr(nc, 'lora_b_init', 'zeros')
+                shared_a_method, shared_a_std = _parse_init_config(shared_init_a)
+                shared_b_method, shared_b_std = _parse_init_config(shared_init_b)
+                shared_a_std = _resolve_init_std(shared_a_method, shared_a_std)
+                shared_b_std = _resolve_init_std(shared_b_method, shared_b_std)
+                print(
+                    f"Multistage mode: Training {len(self.unet_loras_shared)} shared LoRAs - "
+                    f"Matrix A: {shared_a_method} (std={shared_a_std}), Matrix B: {shared_b_method} (std={shared_b_std})"
+                )
+            
+            # Summary of inactive experts
+            if not expert1_active and not expert2_active and not shared_active:
+                print("Multistage mode: No LoRAs being trained for any expert.")
+            elif expert1_active and not expert2_active:
+                print("Multistage mode: Only Expert 1 (transformer_1) is being trained. Expert 2 (transformer_2) is NOT being trained.")
+            elif expert2_active and not expert1_active:
+                print("Multistage mode: Only Expert 2 (transformer_2) is being trained. Expert 1 (transformer_1) is NOT being trained.")
 
     @property
     def is_multistage(self) -> bool:

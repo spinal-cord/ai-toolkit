@@ -72,6 +72,12 @@ export interface NetworkConfig {
     ignore_if_contains: string[];
   };
   transformer_only?: boolean;
+  lora_a_init?: string | { method: string; std?: number };
+  lora_b_init?: string | { method: string; std?: number };
+  high_noise_lora_a_init?: string | { method: string; std?: number };
+  high_noise_lora_b_init?: string | { method: string; std?: number };
+  low_noise_lora_a_init?: string | { method: string; std?: number };
+  low_noise_lora_b_init?: string | { method: string; std?: number };
 }
 
 export interface SaveConfig {

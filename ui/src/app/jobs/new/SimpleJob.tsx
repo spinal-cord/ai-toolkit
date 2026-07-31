@@ -48,6 +48,17 @@ type Props = {
 
 const isDev = process.env.NODE_ENV === 'development';
 
+const loraInitOptions: SelectOption[] = [
+  { value: 'gaussian_random', label: 'Gaussian Random (std=1/√rank)' },
+  { value: 'zeros', label: 'Zeros (Default B)' },
+  { value: 'kaiming_uniform', label: 'Kaiming Uniform' },
+  { value: 'kaiming_normal', label: 'Kaiming Normal' },
+  { value: 'xavier_uniform', label: 'Xavier Uniform' },
+  { value: 'xavier_normal', label: 'Xavier Normal' },
+  { value: 'normal', label: 'Normal (std=0.01)' },
+  { value: 'small_noise', label: 'Small Noise (std=0.001)' },
+];
+
 // Optimizers that have their own adaptive learning rate and don't need external LR schedulers
 const NO_SCHEDULER_OPTIMIZERS = ['prodigyopt', 'prodigy8bit', 'automagic', 'automagic2', 'automagic3', 'dadaptation', 'dadaptationlion'];
 
@@ -537,6 +548,207 @@ export default function SimpleJob({
                     max={1024}
                   />
                 )}
+                {(() => {
+                  const getInitConfig = (key: string) => {
+                    const val = jobConfig.config.process[0].network?.[key];
+                    if (!val) return { method: 'gaussian_random', std: undefined };
+                    if (typeof val === 'string') return { method: val, std: undefined };
+                    return val;
+                  };
+                  const setInitConfig = (key: string, method: string, std?: number) => {
+                    if (method === 'gaussian_random' && std !== undefined) {
+                      setJobConfig({ method, std }, key);
+                    } else if (method === 'gaussian_random') {
+                      setJobConfig({ method }, key);
+                    } else {
+                      setJobConfig(method, key);
+                    }
+                  };
+                  const getMethod = (val: any) => {
+                    if (!val) return 'gaussian_random';
+                    if (typeof val === 'string') return val;
+                    return val.method;
+                  };
+                  const getStd = (val: any) => {
+                    if (!val || typeof val === 'string') return undefined;
+                    return val.std;
+                  };
+
+                  // Hide general LoRA init selectors for multistage (per-expert) models
+                  const isPerExpert =
+                    modelArch?.additionalSections?.includes('model.multistage');
+
+                  return (
+                    <>
+                      {!isPerExpert && (
+                        <>
+                          <SelectInput
+                            label="LoRA A Matrix Init"
+                            docKey="config.process[0].network.lora_a_init"
+                            value={getMethod(jobConfig.config.process[0].network?.lora_a_init) || 'gaussian_random'}
+                            onChange={value => {
+                              const currentStd = getStd(jobConfig.config.process[0].network?.lora_a_init);
+                              setInitConfig('config.process[0].network.lora_a_init', value, value === 'gaussian_random' ? currentStd : undefined);
+                            }}
+                            options={loraInitOptions}
+                          />
+                          {getMethod(jobConfig.config.process[0].network?.lora_a_init) === 'gaussian_random' && (
+                            <NumberInput
+                              label="LoRA A Init Std"
+                              docKey="config.process[0].network.lora_a_init_std"
+                              value={getStd(jobConfig.config.process[0].network?.lora_a_init) ?? ''}
+                              onChange={value => {
+                                const method = getMethod(jobConfig.config.process[0].network?.lora_a_init);
+                                setInitConfig('config.process[0].network.lora_a_init', method, value);
+                              }}
+                              placeholder="Default: 1/√rank"
+                              min={0}
+                              max={10}
+                              step={0.01}
+                            />
+                          )}
+                          <SelectInput
+                            label="LoRA B Matrix Init"
+                            docKey="config.process[0].network.lora_b_init"
+                            value={getMethod(jobConfig.config.process[0].network?.lora_b_init) || 'zeros'}
+                            onChange={value => {
+                              const currentStd = getStd(jobConfig.config.process[0].network?.lora_b_init);
+                              setInitConfig('config.process[0].network.lora_b_init', value, value === 'gaussian_random' ? currentStd : undefined);
+                            }}
+                            options={loraInitOptions}
+                          />
+                          {getMethod(jobConfig.config.process[0].network?.lora_b_init) === 'gaussian_random' && (
+                            <NumberInput
+                              label="LoRA B Init Std"
+                              docKey="config.process[0].network.lora_b_init_std"
+                              value={getStd(jobConfig.config.process[0].network?.lora_b_init) ?? ''}
+                              onChange={value => {
+                                const method = getMethod(jobConfig.config.process[0].network?.lora_b_init);
+                                setInitConfig('config.process[0].network.lora_b_init', method, value);
+                              }}
+                              placeholder="Default: 1/√rank"
+                              min={0}
+                              max={10}
+                              step={0.01}
+                            />
+                          )}
+                        </>
+                      )}
+                      {modelArch?.additionalSections?.includes('model.multistage') && (
+                        <>
+                          {jobConfig.config.process[0].model.model_kwargs?.train_high_noise && (
+                            <>
+                              <SelectInput
+                                label="High Noise LoRA A Init"
+                                docKey="config.process[0].network.high_noise_lora_a_init"
+                                value={getMethod(jobConfig.config.process[0].network?.high_noise_lora_a_init) || getMethod(jobConfig.config.process[0].network?.lora_a_init) || 'gaussian_random'}
+                                onChange={value => {
+                                  const currentStd = getStd(jobConfig.config.process[0].network?.high_noise_lora_a_init);
+                                  setInitConfig('config.process[0].network.high_noise_lora_a_init', value, value === 'gaussian_random' ? currentStd : undefined);
+                                }}
+                                options={loraInitOptions}
+                              />
+                              {getMethod(jobConfig.config.process[0].network?.high_noise_lora_a_init) === 'gaussian_random' && (
+                                <NumberInput
+                                  label="High Noise LoRA A Init Std"
+                                  docKey="config.process[0].network.high_noise_lora_a_init_std"
+                                  value={getStd(jobConfig.config.process[0].network?.high_noise_lora_a_init) ?? ''}
+                                  onChange={value => {
+                                    const method = getMethod(jobConfig.config.process[0].network?.high_noise_lora_a_init);
+                                    setInitConfig('config.process[0].network.high_noise_lora_a_init', method, value);
+                                  }}
+                                  placeholder="Default: 1/√rank"
+                                  min={0}
+                                  max={10}
+                                  step={0.01}
+                                />
+                              )}
+                              <SelectInput
+                                label="High Noise LoRA B Init"
+                                docKey="config.process[0].network.high_noise_lora_b_init"
+                                value={getMethod(jobConfig.config.process[0].network?.high_noise_lora_b_init) || getMethod(jobConfig.config.process[0].network?.lora_b_init) || 'zeros'}
+                                onChange={value => {
+                                  const currentStd = getStd(jobConfig.config.process[0].network?.high_noise_lora_b_init);
+                                  setInitConfig('config.process[0].network.high_noise_lora_b_init', value, value === 'gaussian_random' ? currentStd : undefined);
+                                }}
+                                options={loraInitOptions}
+                              />
+                              {getMethod(jobConfig.config.process[0].network?.high_noise_lora_b_init) === 'gaussian_random' && (
+                                <NumberInput
+                                  label="High Noise LoRA B Init Std"
+                                  docKey="config.process[0].network.high_noise_lora_b_init_std"
+                                  value={getStd(jobConfig.config.process[0].network?.high_noise_lora_b_init) ?? ''}
+                                  onChange={value => {
+                                    const method = getMethod(jobConfig.config.process[0].network?.high_noise_lora_b_init);
+                                    setInitConfig('config.process[0].network.high_noise_lora_b_init', method, value);
+                                  }}
+                                  placeholder="Default: 1/√rank"
+                                  min={0}
+                                  max={10}
+                                  step={0.01}
+                                />
+                              )}
+                            </>
+                          )}
+                          {jobConfig.config.process[0].model.model_kwargs?.train_low_noise && (
+                            <>
+                              <SelectInput
+                                label="Low Noise LoRA A Init"
+                                docKey="config.process[0].network.low_noise_lora_a_init"
+                                value={getMethod(jobConfig.config.process[0].network?.low_noise_lora_a_init) || getMethod(jobConfig.config.process[0].network?.lora_a_init) || 'gaussian_random'}
+                                onChange={value => {
+                                  const currentStd = getStd(jobConfig.config.process[0].network?.low_noise_lora_a_init);
+                                  setInitConfig('config.process[0].network.low_noise_lora_a_init', value, value === 'gaussian_random' ? currentStd : undefined);
+                                }}
+                                options={loraInitOptions}
+                              />
+                              {getMethod(jobConfig.config.process[0].network?.low_noise_lora_a_init) === 'gaussian_random' && (
+                                <NumberInput
+                                  label="Low Noise LoRA A Init Std"
+                                  docKey="config.process[0].network.low_noise_lora_a_init_std"
+                                  value={getStd(jobConfig.config.process[0].network?.low_noise_lora_a_init) ?? ''}
+                                  onChange={value => {
+                                    const method = getMethod(jobConfig.config.process[0].network?.low_noise_lora_a_init);
+                                    setInitConfig('config.process[0].network.low_noise_lora_a_init', method, value);
+                                  }}
+                                  placeholder="Default: 1/√rank"
+                                  min={0}
+                                  max={10}
+                                  step={0.01}
+                                />
+                              )}
+                              <SelectInput
+                                label="Low Noise LoRA B Init"
+                                docKey="config.process[0].network.low_noise_lora_b_init"
+                                value={getMethod(jobConfig.config.process[0].network?.low_noise_lora_b_init) || getMethod(jobConfig.config.process[0].network?.lora_b_init) || 'zeros'}
+                                onChange={value => {
+                                  const currentStd = getStd(jobConfig.config.process[0].network?.low_noise_lora_b_init);
+                                  setInitConfig('config.process[0].network.low_noise_lora_b_init', value, value === 'gaussian_random' ? currentStd : undefined);
+                                }}
+                                options={loraInitOptions}
+                              />
+                              {getMethod(jobConfig.config.process[0].network?.low_noise_lora_b_init) === 'gaussian_random' && (
+                                <NumberInput
+                                  label="Low Noise LoRA B Init Std"
+                                  docKey="config.process[0].network.low_noise_lora_b_init_std"
+                                  value={getStd(jobConfig.config.process[0].network?.low_noise_lora_b_init) ?? ''}
+                                  onChange={value => {
+                                    const method = getMethod(jobConfig.config.process[0].network?.low_noise_lora_b_init);
+                                    setInitConfig('config.process[0].network.low_noise_lora_b_init', method, value);
+                                  }}
+                                  placeholder="Default: 1/√rank"
+                                  min={0}
+                                  max={10}
+                                  step={0.01}
+                                />
+                              )}
+                            </>
+                          )}
+                        </>
+                      )}
+                    </>
+                  );
+                })()}
               </>
             )}
           </Card>

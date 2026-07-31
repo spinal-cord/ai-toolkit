@@ -59,6 +59,8 @@ export const defaultJobConfig: JobConfig = {
           network_kwargs: {
             ignore_if_contains: [],
           },
+          lora_a_init: 'gaussian_random',
+          lora_b_init: 'zeros',
         },
         save: {
           dtype: 'bf16',

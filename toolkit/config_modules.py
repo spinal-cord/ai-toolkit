@@ -220,6 +220,15 @@ class NetworkConfig:
         # for multi stage models
         self.split_multistage_loras = kwargs.get('split_multistage_loras', True)
         
+        # LoRA initialization methods
+        # Can be a string (e.g. 'gaussian_random') or dict with 'method' and optional 'std'
+        self.lora_a_init = kwargs.get('lora_a_init', 'gaussian_random')
+        self.lora_b_init = kwargs.get('lora_b_init', 'zeros')
+        self.high_noise_lora_a_init = kwargs.get('high_noise_lora_a_init', None)
+        self.high_noise_lora_b_init = kwargs.get('high_noise_lora_b_init', None)
+        self.low_noise_lora_a_init = kwargs.get('low_noise_lora_a_init', None)
+        self.low_noise_lora_b_init = kwargs.get('low_noise_lora_b_init', None)
+        
         # ramtorch, doesn't work yet
         self.layer_offloading = kwargs.get('layer_offloading', False)
         

@@ -352,6 +352,192 @@ const docs: { [key: string]: ConfigDoc } = {
     ),
   },
 
+  // --- LoRA Init docs ---
+  'config.process[0].network.lora_a_init': {
+    title: 'LoRA A Matrix Init',
+    description: (
+      <>
+        Controls how the LoRA A (down projection) matrix is initialized. The A matrix projects the input to a lower-
+        dimensional space.
+        <br />
+        <br />
+        <strong>Available Methods:</strong>
+        <ul className="list-disc pl-5 mt-2 space-y-1">
+          <li>
+            <strong>Gaussian Random</strong> — Random values from a normal distribution. Default std = 1/√rank. Best
+            for most cases as it preserves the original layer's output statistics. Recommended for LoRA A.
+          </li>
+          <li>
+            <strong>Kaiming Uniform</strong> — Uniform distribution derived from the number of input features. Good for
+            ReLU-like activations. The default used by Microsoft's LoRA implementation.
+          </li>
+          <li>
+            <strong>Kaiming Normal</strong> — Normal distribution variant of Kaiming initialization. Similar to Kaiming
+            Uniform but with Gaussian distribution.
+          </li>
+          <li>
+            <strong>Xavier Uniform</strong> — Uniform distribution based on input/output fan. Good for tanh/sigmoid
+            activations.
+          </li>
+          <li>
+            <strong>Xavier Normal</strong> — Normal distribution variant of Xavier initialization.
+          </li>
+          <li>
+            <strong>Normal</strong> — Standard normal distribution with configurable std (default 0.01). Use for small
+            random perturbations.
+          </li>
+          <li>
+            <strong>Zeros</strong> — All zeros. Typically used for LoRA B (up projection) so the initial LoRA output is
+            zero, preserving the original model output before training.
+          </li>
+          <li>
+            <strong>Small Noise</strong> — Normal distribution with std=0.001. Minimal perturbation from zero.
+          </li>
+        </ul>
+        <br />
+        <strong>Recommendation:</strong> <strong>Gaussian Random</strong> (default) is generally the best choice for
+        LoRA A as it helps preserve the pre-trained weights' statistics. Use <strong>Zeros</strong> for LoRA B so the
+        LoRA starts as a no-op.
+      </>
+    ),
+  },
+  'config.process[0].network.lora_a_init_std': {
+    title: 'LoRA A Init Std',
+    description: (
+      <>
+        Standard deviation for the Gaussian Random initialization of the LoRA A matrix.
+        <br />
+        <br />
+        When left empty, the default is <code>1/√rank</code> (e.g., for rank 64, std ≈ 0.125). Lower values produce
+        smaller initial weights, while higher values produce larger initial weights. This only applies when the init
+        method is set to <strong>Gaussian Random</strong>.
+      </>
+    ),
+  },
+  'config.process[0].network.lora_b_init': {
+    title: 'LoRA B Matrix Init',
+    description: (
+      <>
+        Controls how the LoRA B (up projection) matrix is initialized. The B matrix projects back to the original
+        dimension.
+        <br />
+        <br />
+        <strong>Recommendation:</strong> <strong>Zeros</strong> is the standard choice for LoRA B. This ensures the
+        LoRA adds zero to the original layer output at the start of training, effectively making the LoRA a no-op
+        until training begins. Changing this is rarely needed.
+      </>
+    ),
+  },
+  'config.process[0].network.lora_b_init_std': {
+    title: 'LoRA B Init Std',
+    description: (
+      <>
+        Standard deviation for the Gaussian Random initialization of the LoRA B matrix.
+        <br />
+        <br />
+        When left empty, the default is <code>1/√rank</code>. This only applies when the init method is set to
+        <strong>Gaussian Random</strong>. Note: using anything other than Zeros for LoRA B will cause the LoRA to add
+        non-zero values to the original output from the start of training.
+      </>
+    ),
+  },
+  'config.process[0].network.high_noise_lora_a_init': {
+    title: 'High Noise LoRA A Init',
+    description: (
+      <>
+        Per-expert initialization for the <strong>High Noise</strong> transformer (transformer_1) in multistage models.
+        The high noise transformer handles the initial denoising steps and benefits from different initialization to
+        better learn the coarse denoising patterns.
+        <br />
+        <br />
+        If left empty, falls back to the general <strong>LoRA A Matrix Init</strong> setting above.
+      </>
+    ),
+  },
+  'config.process[0].network.high_noise_lora_a_init_std': {
+    title: 'High Noise LoRA A Init Std',
+    description: (
+      <>
+        Standard deviation for the Gaussian Random initialization of the High Noise LoRA A matrix.
+        <br />
+        <br />
+        When left empty, the default is <code>1/√rank</code>. This only appears when the init method is set to
+        <strong>Gaussian Random</strong>.
+      </>
+    ),
+  },
+  'config.process[0].network.high_noise_lora_b_init': {
+    title: 'High Noise LoRA B Init',
+    description: (
+      <>
+        Per-expert initialization for the <strong>High Noise</strong> transformer (transformer_1) in multistage models.
+        <br />
+        <br />
+        If left empty, falls back to the general <strong>LoRA B Matrix Init</strong> setting above.
+      </>
+    ),
+  },
+  'config.process[0].network.high_noise_lora_b_init_std': {
+    title: 'High Noise LoRA B Init Std',
+    description: (
+      <>
+        Standard deviation for the Gaussian Random initialization of the High Noise LoRA B matrix.
+        <br />
+        <br />
+        When left empty, the default is <code>1/√rank</code>. This only appears when the init method is set to
+        <strong>Gaussian Random</strong>.
+      </>
+    ),
+  },
+  'config.process[0].network.low_noise_lora_a_init': {
+    title: 'Low Noise LoRA A Init',
+    description: (
+      <>
+        Per-expert initialization for the <strong>Low Noise</strong> transformer (transformer_2) in multistage models.
+        The low noise transformer handles the final refinement steps and may benefit from different initialization to
+        better learn fine details.
+        <br />
+        <br />
+        If left empty, falls back to the general <strong>LoRA A Matrix Init</strong> setting above.
+      </>
+    ),
+  },
+  'config.process[0].network.low_noise_lora_a_init_std': {
+    title: 'Low Noise LoRA A Init Std',
+    description: (
+      <>
+        Standard deviation for the Gaussian Random initialization of the Low Noise LoRA A matrix.
+        <br />
+        <br />
+        When left empty, the default is <code>1/√rank</code>. This only appears when the init method is set to
+        <strong>Gaussian Random</strong>.
+      </>
+    ),
+  },
+  'config.process[0].network.low_noise_lora_b_init': {
+    title: 'Low Noise LoRA B Init',
+    description: (
+      <>
+        Per-expert initialization for the <strong>Low Noise</strong> transformer (transformer_2) in multistage models.
+        <br />
+        <br />
+        If left empty, falls back to the general <strong>LoRA B Matrix Init</strong> setting above.
+      </>
+    ),
+  },
+  'config.process[0].network.low_noise_lora_b_init_std': {
+    title: 'Low Noise LoRA B Init Std',
+    description: (
+      <>
+        Standard deviation for the Gaussian Random initialization of the Low Noise LoRA B matrix.
+        <br />
+        <br />
+        When left empty, the default is <code>1/√rank</code>. This only appears when the init method is set to
+        <strong>Gaussian Random</strong>.
+      </>
+    ),
+  },
+
   // --- Optimizer docs ---
   optimizer: {
     title: 'Optimizer',
