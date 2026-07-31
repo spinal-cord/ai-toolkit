@@ -2,7 +2,8 @@
 NOTE: This is experimental and under active development; expect breaking changes and bugs. Feedback welcome.
 """
 
-from typing import List
+import math
+from typing import List, Optional, Callable, Any
 import torch
 
 
@@ -19,8 +20,8 @@ class Automagic3(torch.optim.Optimizer):
     everything in between, which is treated as noise.
 
     Each element keeps a window of its last H (= ``polarity_history``,
-    default 4) update sign bits ("is the update positive", 1-bit packed) --
-    H/8 bytes per element (half a byte at the default), the only
+    default 8) update sign bits ("is the update positive", 1-bit packed) --
+    H/8 bytes per element (one byte at the default), the only
     per-element optimizer state. A short window suffices because verdicts
     are pooled across the whole group: millions of voters make weak
     common-mode evidence visible long before any single element is
@@ -51,128 +52,82 @@ class Automagic3(torch.optim.Optimizer):
     weight anyway. A tensor abstains entirely until its window has filled
     (the first H steps, and again after a history reset on resume).
 
-    ONE learning rate per param group -- not per tensor. Every element of
-    every tensor in the group votes into a single pool, and the group lr is
-    nudged once per step by the pooled result, applied multiplicatively
-    with NO gain knob: ``lr *= exp(vote)`` -- the lr moves at exactly the
-    rate the model votes for it. A fully unanimous pool (practically
-    unreachable) would move e ~= 2.7x per step; the silent majority dilutes
-    the pooled vote, so realistic moves are a few percent per step, and the
-    worst-case overshoot past the edge is bounded by the H-step window lag
-    before alternation votes answer. There is no
-    noise-floor estimation, no smoothing, no significance test: the polarity
-    windows are the only indicator. Pooling at group level (rather than per
-    tensor, and originally rather than per channel) is the load-bearing
-    choice: COUPLED tensors fight per-tensor lrs exactly like coupled
-    channels fight per-channel ones. A Q/K pair is the canonical case --
-    Q's weights scaling up while K's scale down preserves the attention
-    logits, so the gradients reward whichever asymmetry randomly seeded
-    first: Q votes "too slow" and climbs while K votes "too fast" and sinks,
-    self-reinforcing without bound. One shared lr makes those opposing votes
-    cancel in the pool instead of diverging, so only common-mode evidence
-    ("the whole group's step is too small / too large") moves the lr.
+    LR MODES
+    --------
+    Three pooling strategies are available via ``lr_mode``:
 
-    With ``fused=True`` (default) the step is fused into the backward pass via
-    ``register_post_accumulate_grad_hook``: each parameter is updated and its
-    grad freed as soon as autograd finishes accumulating into it. ``.step()``
-    therefore does no real work and peak VRAM stays low. Note this bypasses the
-    trainer's grad clipping / nan-skip (they run after backward) and is not
-    compatible with multi-backward gradient accumulation.
+    ``per_block`` (default, recommended):
+        Votes are pooled per *block*. A block is identified by ``block_fn``,
+        which receives ``(param, group_idx)`` and returns a hashable block
+        ID. The default ``block_fn`` maps each param group to its own block
+        (equivalent to per_group), but a custom function can subdivide a
+        group into finer blocks (e.g. per transformer layer). This preserves
+        the symmetry cancellation that makes per-group necessary (Q/K
+        coupled pairs in the same block cancel their opposing votes) while
+        allowing different blocks to learn at different rates -- the key
+        improvement over pure per-group, which over-couples unrelated
+        modules (embeddings vs. attention vs. LM-head).
 
-    With ``fused=False`` it behaves like a traditional optimizer: grads
-    accumulate across backward passes and the update happens in ``.step()``.
-    Low-precision (bf16/fp16) grads are accumulated with stochastic rounding so
-    small per-micro-batch grads aren't lost; fp32 grads accumulate normally.
+    ``per_tensor_soft``:
+        Each tensor gets its own adaptive LR, but a soft spring pulls each
+        tensor's log-LR toward the group-mean log-LR:
+            log(lr_t) <- (1 - lambda) * log(lr_t) + signal_t + lambda * mean_log_lr
+        At ``lambda=0`` this is pure per-tensor (diverges on Q/K); at
+        ``lambda -> inf`` it collapses to per-group; at ``lambda ~ 0.1`` it
+        allows per-tensor adaptation while keeping coupled pairs from
+        diverging. This is a strict generalization of per-group.
 
-    Second-moment EMA state is stored in ``p.dtype`` (math runs in fp32 when
-    the state is lower precision). Updates to low-precision (e.g. bf16/fp16)
-    parameters are applied in fp32 and stochastically rounded on write-back.
+    ``per_group``:
+        The original v3 behavior: one LR per param group, all tensors in
+        the group vote into a single pool. Safe but conservative -- it
+        sacrifices cross-block / cross-module adaptivity.
+
+    VOTE EMA SMOOTHING
+    ------------------
+    ``vote_ema_beta`` (default 0.9) applies an EMA to the pooled vote
+    signal before converting it to a multiplicative LR factor. This
+    prevents the log-space random walk that a pure integral controller
+    exhibits on long runs under noisy votes. At ``vote_ema_beta=0`` the
+    behavior is identical to the original (no smoothing).
 
     Parameters
     ----------
     lr : float
-        Starting learning rate for every group. The controller adapts away
-        from this in whichever direction the pooled vote points, so it is a
-        launch point, not a tuned target.
+        Starting learning rate for every group.
     min_lr : float
-        Lower bound on the adapted lr (default 1e-30). At the default this is
-        purely a numerical overflow guard far outside the usable range; set it
-        higher to put a hard floor under the controller.
+        Lower bound on the adapted lr (default 1e-8).
     max_lr : float
-        Upper bound on the adapted lr (default 1e3). At the default this is
-        purely a numerical overflow guard far outside the usable range; set it
-        lower to put a hard ceiling on the controller.
+        Upper bound on the adapted lr (default 1e3).
     beta2 : float
         EMA decay for the second moment, as in Adam/Adafactor.
     eps : float
-        Floor added to the second moment before the rsqrt, to avoid div-by-zero.
+        Floor added to the second moment before the rsqrt.
     clip_threshold : float
         Trust region on the update: its RMS is scaled to <= this, then every
-        element is clamped to +/- this, so no single weight takes an outsized
-        step.
+        element is clamped to +/- this.
     weight_decay : float
         Decoupled (AdamW-style) weight decay; 0 disables it.
     polarity_history : int
-        Sign-history window length H (2 to 64, default 4); H/8 bytes of
-        state per element. Longer windows make the two vote events rarer
-        and more decisive (probability 2^(1-H) each under noise -- a real
-        trend's excess grows ~(1+rho)^H), so detection sharpens, at the
-        cost of memory, an H-step reaction lag/warmup, and fewer voters
-        per step. Changing it on resume resets the histories cleanly (one
-        re-warmup of H steps).
+        Sign-history window length H (2 to 64, default 8); H/8 bytes of
+        state per element.
     fused : bool
-        If True (default), each param is updated inside the backward pass the
-        moment its grad is ready -- low peak VRAM, but it bypasses the trainer's
-        grad clipping / nan-skip and cannot be combined with multi-backward
-        gradient accumulation. If False, a normal ``.step()``-time update, with
-        low-precision grads accumulated using stochastic rounding.
-
-    Improvements over v2
-    --------------------
-    1. One adaptive lr per param group (v2 had one static lr per tensor).
-       Plain English: the group finds its learning rate automatically, and no
-       layer can run away or freeze relative to the others -- which is what
-       used to split a full finetune into over-cooked and dead layers and
-       destroy it. (Earlier v3s used a separate lr per output channel, then
-       per tensor; each level let coupled units -- channels, then Q/K-style
-       tensor pairs -- fight and split to opposite extremes, so the lr was
-       pooled one level up each time until the fighting was structurally
-       impossible.)
-
-    2. Direction-consistency lr control with a real equilibrium. v2 bumped
-       the lr from raw single-step agreement, which has no upper fixed point
-       -- a parameter that is simply still descending keeps agreeing at any
-       lr, so the lr ratchets up and eventually runs away on long runs. v3
-       votes from each element's recent sign window (see the vote rule
-       above). Plain English: the lr speeds up while the model holds a
-       trajectory, backs off hard when it overshoots, and holds steady on
-       pure noise.
-
-    3. Multiplicative (geometric) lr bump (was additive). v2 added/subtracted a
-       fixed absolute amount, so the same bump was a huge relative jump when the
-       lr was tiny and a negligible one when it was large. v3 multiplies by
-       ``exp(vote)`` -- a fixed *percentage* step. Plain
-       English: the lr moves at the same relative pace whether it is tiny or
-       large, traverses its whole range in a predictable number of steps, and a
-       full up bump is exactly cancelled by a full down bump (no drift); the
-       gain knob was removed entirely once the vote became a pooled
-       fraction with natural log-units.
-
-    4. Stochastic rounding for fp16, not just bf16. v2 only rounded bf16
-       write-backs and let fp16 fall back to round-to-nearest, silently
-       discarding updates smaller than an fp16 ULP. v3 stochastically rounds
-       both (fast bit-trick for bf16/fp16, generic fallback for other low
-       precisions). Plain English: fp16 training no longer throws away small
-       weight updates, so it actually keeps learning instead of stalling.
-
-    5. Faster hot path, identical math. eps is folded into the small reduced
-       row/col vectors instead of the full gradient-square tensor; the lr scale
-       and parameter update are fused into one ``addcmul_``; the per-element
-       direction and flip sums are recomputed from the 1-bit history planes
-       in a single batched unpack and two integer reductions, and scored
-       with three boolean compares and weighted sums. Plain English: each
-       step issues few GPU passes over the weights, so it runs fast
-       (notably in bf16/fp16).
+        If True (default), each param is updated inside the backward pass.
+    lr_mode : str
+        LR pooling strategy: 'per_block' (default), 'per_tensor_soft', or
+        'per_group'.
+    block_fn : callable, optional
+        Function ``(param, group_idx) -> block_id`` for per-block pooling.
+        If None, each param group is one block (per_block == per_group).
+    coupling_lambda : float
+        Soft coupling strength for per_tensor_soft mode (default 0.1).
+        Pulls each tensor's log-LR toward the group mean.
+    vote_ema_beta : float
+        EMA decay for the pooled vote signal (default 0.9). 0 disables
+        smoothing (original behavior).
+    state_dtype_fp32 : bool
+        If True (default), store second-moment EMA state in fp32 for
+        numerical stability on long runs. The original code stored in
+        p.dtype, which accumulated rounding error in bf16.
     """
 
     def __init__(
@@ -185,16 +140,27 @@ class Automagic3(torch.optim.Optimizer):
         eps: float = 1e-30,
         clip_threshold: float = 1.0,
         weight_decay: float = 0.0,
-        polarity_history: int = 8,  # sign-history window length (2-64)
+        polarity_history: int = 8,
         fused: bool = True,
+        lr_mode: str = 'per_block',
+        block_fn: Optional[Callable] = None,
+        coupling_lambda: float = 0.1,
+        vote_ema_beta: float = 0.9,
+        state_dtype_fp32: bool = True,
     ):
+        if lr_mode not in ('per_group', 'per_block', 'per_tensor_soft'):
+            raise ValueError(
+                f"lr_mode must be 'per_group', 'per_block', or 'per_tensor_soft', got '{lr_mode}'"
+            )
+        if coupling_lambda < 0:
+            raise ValueError(f"coupling_lambda must be >= 0, got {coupling_lambda}")
+        if not (0 <= vote_ema_beta < 1):
+            raise ValueError(f"vote_ema_beta must be in [0, 1), got {vote_ema_beta}")
         if min_lr > max_lr:
             raise ValueError(
                 f"min_lr ({min_lr}) must be <= max_lr ({max_lr})"
             )
         if lr > 1e-3:
-            # No clamping: a too-high start just oscillates immediately and
-            # the controller drives it down.
             print(
                 f"Note: start lr {lr} is high; the controller will correct it "
                 f"(the pooled vote will walk it down)."
@@ -212,6 +178,17 @@ class Automagic3(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
         self.fused = fused
+        self.lr_mode = lr_mode
+        self.coupling_lambda = coupling_lambda
+        self.vote_ema_beta = vote_ema_beta
+        self.state_dtype_fp32 = state_dtype_fp32
+
+        if block_fn is not None:
+            self._block_fn = block_fn
+        else:
+            # Default: each param group is one block (per_block == per_group)
+            self._block_fn = lambda p, gi: gi
+
         self._rebuild_group_index()
         self._hook_handles = []
         for group in self.param_groups:
@@ -219,54 +196,45 @@ class Automagic3(torch.optim.Optimizer):
                 if not p.requires_grad:
                     continue
                 if self.fused:
-                    # Fused: update each param the moment its grad is ready.
                     handle = p.register_post_accumulate_grad_hook(
                         self._make_backward_hook(group)
                     )
                     self._hook_handles.append(handle)
                 elif p.dtype != torch.float32:
-                    # Non-fused: the actual update happens in .step(); here we
-                    # only stochastically accumulate low-precision grads across
-                    # micro-batches so repeated round-to-nearest doesn't drop
-                    # small grads (fp32 grads accumulate losslessly on their own).
                     handle = p.register_post_accumulate_grad_hook(
                         self._make_accum_hook()
                     )
                     self._hook_handles.append(handle)
 
         total = sum(p.numel() for g in self.param_groups for p in g["params"])
-        print(f"Total training paramiters: {total:,}")
+        print(f"Total training parameters: {total:,}")
+        print(f"Automagic3 LR mode: {self.lr_mode}")
+        if self.lr_mode == 'per_block' and block_fn is not None:
+            num_blocks = len(set(self._block_fn(p, gi)
+                                 for gi, group in enumerate(self.param_groups)
+                                 for p in group["params"]))
+            print(f"  Custom block_fn: {num_blocks} blocks identified")
+        if self.lr_mode == 'per_tensor_soft':
+            print(f"  Coupling lambda: {self.coupling_lambda}")
+        if self.vote_ema_beta > 0:
+            print(f"  Vote EMA beta: {self.vote_ema_beta}")
+        if self.state_dtype_fp32:
+            print(f"  Second moment state in fp32")
 
     # ------------------------------------------------------------------ utils
 
     @staticmethod
     def _rms(t: torch.Tensor) -> torch.Tensor:
-        # Root-mean-square of a tensor; used to size the trust-region clip.
         return t.norm(2) / (t.numel() ** 0.5)
 
     @staticmethod
     def _approx_sq_grad(row: torch.Tensor, col: torch.Tensor) -> torch.Tensor:
-        # Adafactor's factored second moment (inherited from v2). Rather than
-        # store a full RxC tensor of running grad^2, only its per-row and
-        # per-col means are kept; this rebuilds the rank-1 approximation of
-        # 1/sqrt(v) -- the per-element update scale -- as the outer product
-        # rsqrt(row / mean(row)) (x) rsqrt(col). That is the standard HF
-        # Adafactor reconstruction and is what keeps optimizer state small.
         r = (row / row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)
         c = col.unsqueeze(-2).rsqrt()
         return torch.mul(r, c)
 
     @staticmethod
     def _sr_truncate(v_fp32: torch.Tensor, drop_bits: int) -> torch.Tensor:
-        # Fast in-place stochastic rounding for a low-precision float that is a
-        # mantissa truncation of fp32: add uniform noise into the dropped low
-        # mantissa bits of the fp32 bit pattern, then zero them, so the
-        # subsequent narrowing cast is exact and rounds up with probability
-        # equal to the truncated fractional part. bf16 drops 16 bits (it is the
-        # high half of fp32); fp16 drops 13 bits (23 - 10 mantissa) and is exact
-        # within its normal exponent range -- values past fp16's overflow /
-        # subnormal limits are rounded at fp32 granularity, which trained
-        # weights effectively never reach.
         as_int = v_fp32.view(torch.int32)
         as_int.add_(torch.randint_like(as_int, 1 << drop_bits))
         as_int.bitwise_and_(-(1 << drop_bits))
@@ -274,20 +242,12 @@ class Automagic3(torch.optim.Optimizer):
 
     @staticmethod
     def _stochastic_round(v: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        # Generic fp32 -> low-precision stochastic rounding for dtypes that are
-        # not a mantissa truncation of fp32 (the bf16/fp16 fast path in
-        # _sr_truncate does not apply). Adds uniform noise of +/- half a target
-        # ULP and rounds to nearest, so P(round up) equals the fractional
-        # distance to the next representable value -> unbiased in expectation.
-        # The ULP at |v| is 2**floor(log2|v|) * eps(dtype).
         finfo = torch.finfo(dtype)
         absv = v.abs().clamp_(min=finfo.tiny)
         ulp = torch.exp2(torch.floor(torch.log2(absv))).mul_(finfo.eps)
         noise = torch.rand_like(v).sub_(0.5).mul_(ulp)
         return v.add_(noise).to(dtype)
 
-    # Per-device cached constants for pack/unpack (avoid re-allocating a tiny
-    # tensor on every call).
     _PACK_CONSTS: dict = {}
 
     @classmethod
@@ -307,9 +267,6 @@ class Automagic3(torch.optim.Optimizer):
 
     @classmethod
     def _pack_bits(cls, bits: torch.Tensor) -> torch.Tensor:
-        # Pack sign bits (bool / {0, 1}) 8 per byte (uint8), as a base-2 dot
-        # product per group of 8 (two kernels rather than per-slice shift/or
-        # chains).
         weights, _ = cls._pack_consts(bits.device)
         flat = bits.reshape(-1).to(torch.uint8)
         pad = (-flat.numel()) % 8
@@ -319,28 +276,45 @@ class Automagic3(torch.optim.Optimizer):
 
     @classmethod
     def _unpack_bits(cls, packed: torch.Tensor, numel: int) -> torch.Tensor:
-        # Inverse of _pack_bits: uint8 -> flat uint8 {0, 1} of length numel.
         _, shifts = cls._pack_consts(packed.device)
         vals = (packed.unsqueeze(-1) >> shifts).bitwise_and_(1)
         return vals.view(-1)[:numel]
 
     def _rebuild_group_index(self) -> None:
-        # param -> index of its param group, plus per-group vote accumulators
-        # (weighted vote mass and total weight, gathered across every tensor
-        # in the group during the step and applied once in .step()). The map
-        # exists because the fused hooks cannot rely on group-dict identity:
-        # the parent's load_state_dict replaces the group dicts.
+        """Build param -> pool index based on lr_mode."""
         self._param_group_index = {
             p: gi for gi, group in enumerate(self.param_groups) for p in group["params"]
         }
-        self._group_num: List = [None] * len(self.param_groups)
-        self._group_den: List = [None] * len(self.param_groups)
+
+        if self.lr_mode == 'per_tensor_soft':
+            # Per-tensor: votes stored in per-param state, no pool accumulators
+            self._param_pool_index = None
+            self._pool_num = None
+            self._pool_den = None
+            self._pool_vote_ema = None
+        else:
+            # per_group or per_block: build pool index
+            self._param_pool_index = {}
+            pool_id_to_idx = {}
+
+            for gi, group in enumerate(self.param_groups):
+                for p in group["params"]:
+                    if self.lr_mode == 'per_block':
+                        pool_id = self._block_fn(p, gi)
+                    else:  # per_group
+                        pool_id = gi
+
+                    if pool_id not in pool_id_to_idx:
+                        pool_id_to_idx[pool_id] = len(pool_id_to_idx)
+                    self._param_pool_index[p] = pool_id_to_idx[pool_id]
+
+            num_pools = len(pool_id_to_idx)
+            self._pool_num: List = [None] * num_pools
+            self._pool_den: List = [None] * num_pools
+            self._pool_vote_ema: List = [None] * num_pools
 
     @classmethod
     def _stochastic_copy_(cls, dst: torch.Tensor, src_fp32: torch.Tensor) -> None:
-        # Stochastically round the fp32 ``src`` into the low-precision ``dst`` in
-        # place. Uses the fast mantissa-truncation path for bf16/fp16 and the
-        # generic method otherwise. ``src_fp32`` may be mutated (caller owns it).
         if dst.dtype == torch.bfloat16:
             dst.copy_(cls._sr_truncate(src_fp32, 16))
         elif dst.dtype == torch.float16:
@@ -349,10 +323,6 @@ class Automagic3(torch.optim.Optimizer):
             dst.copy_(cls._stochastic_round(src_fp32, dst.dtype))
 
     def _make_accum_hook(self):
-        # Non-fused grad accumulation for low-precision params: accumulate the
-        # running sum in fp32 then stochastically round it back into the
-        # low-precision ``_accum_grad`` buffer, so small per-micro-batch grads
-        # are not lost to repeated round-to-nearest. .step() consumes the buffer.
         def _hook(p: torch.Tensor):
             if p.grad is None:
                 return
@@ -368,38 +338,39 @@ class Automagic3(torch.optim.Optimizer):
     def _init_state(self, p: torch.Tensor, group: dict) -> None:
         state = self.state[p]
         state["step"] = 0
-        # The group lr, mirrored per param (every param in a group receives
-        # identical multiplicative nudges, so these stay equal; storing per
-        # param rides the normal state_dict machinery and tolerates
-        # multi-device groups).
         state["lr"] = torch.tensor(
             min(max(float(group["lr"]), group["min_lr"]), group["max_lr"]),
             dtype=torch.float32,
             device=p.device,
         )
-        # Ring buffer of per-element update sign bits, one 1-bit-packed
-        # plane per step (H/8 bytes per element). Sums are recomputed from
-        # the planes each step rather than stored -- the history is the
-        # ONLY per-element state.
         H = group["polarity_history"]
         width = (p.numel() + 7) // 8
         state["sign_history"] = torch.zeros(
             (H, width), dtype=torch.uint8, device=p.device
         )
-        # Index of the OLDEST plane (the one overwritten next step).
         state["hist_idx"] = 0
-        # Number of real sign planes stored so far; the controller is gated
-        # until the window is full (there is no per-element abstain state).
         state["hist_fill"] = 0
+
+        # Second moment state: fp32 by default for numerical stability on
+        # long runs (the original code stored in p.dtype, which accumulated
+        # rounding error in bf16).
+        state_dtype = torch.float32 if self.state_dtype_fp32 else p.dtype
         if p.dim() >= 2:
             state["exp_avg_sq_row"] = torch.zeros(
-                p.shape[:-1], dtype=p.dtype, device=p.device
+                p.shape[:-1], dtype=state_dtype, device=p.device
             )
             state["exp_avg_sq_col"] = torch.zeros(
-                p.shape[:-2] + p.shape[-1:], dtype=p.dtype, device=p.device
+                p.shape[:-2] + p.shape[-1:], dtype=state_dtype, device=p.device
             )
         else:
-            state["exp_avg_sq"] = torch.zeros(p.shape, dtype=p.dtype, device=p.device)
+            state["exp_avg_sq"] = torch.zeros(p.shape, dtype=state_dtype, device=p.device)
+
+        # Per-tensor vote storage for per_tensor_soft mode
+        if self.lr_mode == 'per_tensor_soft':
+            state['vote_num'] = None
+            state['vote_den'] = None
+            if self.vote_ema_beta > 0:
+                state['vote_ema'] = 0.0
 
     def _make_backward_hook(self, group):
         def _hook(p: torch.Tensor):
@@ -423,98 +394,63 @@ class Automagic3(torch.optim.Optimizer):
         if grad.dtype != torch.float32:
             grad = grad.to(torch.float32)
 
-        # In fused mode this runs inside backward, so the trainer's grad
-        # clipping and nan/inf-skip come too late to protect us. A single
-        # non-finite gradient would poison the second-moment EMA (NaN stays
-        # NaN forever) and corrupt the weights, so neutralise non-finite
-        # grads in place (we own this fp32 copy); those elements contribute
-        # nothing this step. Large but finite grads are left alone -- the
-        # second-moment normalisation already bounds their effect.
         grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
 
         beta2 = group["beta2"]
         eps = group["eps"]
-        # eps is folded into the reduced row/col (or rsqrt) instead of being
-        # added to the full-size sq tensor: mean(g^2 + eps) == mean(g^2) + eps,
-        # which saves a full-size kernel pass.
         sq = grad * grad
 
-        # Second moment: a beta2-EMA of grad^2, then update = grad / sqrt(v),
-        # exactly as Adam/Adafactor (this magnitude-normalises the step; only the
-        # *sign* of the result drives the lr controller further down). For >=2D
-        # params v is Adafactor-factored into row/col means (small state, see
-        # _approx_sq_grad); 1D params (biases, norms) keep the full per-element
-        # second moment. State lives in p.dtype; when that is low precision the
-        # math is done in an fp32 copy and written back.
+        # Second moment EMA (Adafactor-factored for >=2D, full for 1D).
+        # State is fp32 when state_dtype_fp32=True (default), so no upcast
+        # is needed on the hot path.
         if p.dim() >= 2:
             row_state = state["exp_avg_sq_row"]
             col_state = state["exp_avg_sq_col"]
             if row_state.dtype == torch.float32:
-                row, col = row_state, col_state
-                row.mul_(beta2).add_(sq.mean(dim=-1).add_(eps), alpha=1.0 - beta2)
-                col.mul_(beta2).add_(sq.mean(dim=-2).add_(eps), alpha=1.0 - beta2)
+                row_state.mul_(beta2).add_(sq.mean(dim=-1).add_(eps), alpha=1.0 - beta2)
+                col_state.mul_(beta2).add_(sq.mean(dim=-2).add_(eps), alpha=1.0 - beta2)
+                update = self._approx_sq_grad(row_state, col_state).mul_(grad)
             else:
+                # Low-precision state (state_dtype_fp32=False): upcast for math
                 row = row_state.to(torch.float32)
                 col = col_state.to(torch.float32)
                 row.mul_(beta2).add_(sq.mean(dim=-1).add_(eps), alpha=1.0 - beta2)
                 col.mul_(beta2).add_(sq.mean(dim=-2).add_(eps), alpha=1.0 - beta2)
                 row_state.copy_(row.to(row_state.dtype))
                 col_state.copy_(col.to(col_state.dtype))
-            update = self._approx_sq_grad(row, col).mul_(grad)
+                update = self._approx_sq_grad(row, col).mul_(grad)
         else:
             v_state = state["exp_avg_sq"]
             if v_state.dtype == torch.float32:
-                v = v_state
-                v.mul_(beta2).add_(sq, alpha=1.0 - beta2)
+                v_state.mul_(beta2).add_(sq, alpha=1.0 - beta2)
+                update = v_state.add(eps).rsqrt().mul_(grad)
             else:
                 v = v_state.to(torch.float32)
                 v.mul_(beta2).add_(sq, alpha=1.0 - beta2)
                 v_state.copy_(v.to(v_state.dtype))
-            update = v.add(eps).rsqrt().mul_(grad)
+                update = v.add(eps).rsqrt().mul_(grad)
 
-        # Update-RMS clip (trust region): scale so the update RMS never exceeds
-        # clip_threshold. No bias-correction warmup -- LoRA runs are short and a
-        # slow ramp wastes steps; for a soft start the user can set a low start
-        # lr and let the lr bump up on its own.
+        # Update-RMS clip (trust region)
         update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
-        # The RMS clip only bounds the aggregate, so a single outlier element can
-        # still survive at ~sqrt(numel)*clip_threshold and hit one weight hard,
-        # distorting the model. Cap each element to clip_threshold (a true
-        # max-norm trust region) so no single weight can take an outsized step.
         update.clamp_(-group["clip_threshold"], group["clip_threshold"])
 
-        # Direction-consistency lr control (the vote rule -- see the class
-        # docstring). The second-moment scale, RMS clip and clamp are all
-        # positive, so the sign bit is exactly sign(grad); an exact-zero
-        # update records as the negative bit, harmless because its |update|
-        # vote weight is zero.
+        # --- Direction-consistency vote ---
         cur_bits = update.gt(0.0)
-        hist = state["sign_history"]  # (H, numel/8) 1-bit packed uint8
-        idx = state["hist_idx"]  # oldest plane (overwritten below)
+        hist = state["sign_history"]
+        idx = state["hist_idx"]
         H = hist.shape[0]
-        lr_t = state["lr"]  # this param's mirror of the shared group lr
+        lr_t = state["lr"]
 
-        # Slide the window first so the vote sees the freshest H signs.
         hist[idx].copy_(self._pack_bits(cur_bits))
         state["hist_idx"] = (idx + 1) % H
-        # The planes hold garbage until H real signs have been stored (fresh
-        # start or a history reset on resume): gate the controller, not the
-        # parameter update, until the window is full.
         fill = min(H, state["hist_fill"] + 1)
         state["hist_fill"] = fill
 
         if fill == H:
-            # Extremes-only vote (see the class docstring): all H signs
-            # agreeing votes up, perfect alternation (all H-1 transitions
-            # flipping) votes down -- the two events have identical
-            # pure-noise probability (2 of the 2^H windows each), so equal
-            # +/-1 weights balance exactly. The planes are rolled into
-            # chronological order so adjacent rows are adjacent steps; XOR
-            # of neighbour rows marks per-bit flips. The weighted vote mass
-            # and total weight are ACCUMULATED into this tensor's group; the
-            # single group lr is nudged once per step in .step().
+            # Compute vote from the packed sign history
             _, shifts = self._pack_consts(hist.device)
-            chron = torch.roll(hist, -state["hist_idx"], dims=0)
+            # Avoid torch.roll allocation: use cat with index arithmetic
+            chron = torch.cat([hist[idx:], hist[:idx]], dim=0)
             bits = (
                 (chron.unsqueeze(-1) >> shifts)
                 .bitwise_and_(1)
@@ -527,33 +463,36 @@ class Automagic3(torch.optim.Optimizer):
             w = update.abs().view(-1)
             num = (w * up).sum().sub_((w * down).sum())
             den = w.sum()
-            gi = self._param_group_index.get(p)
-            if gi is not None:
-                if self._group_num[gi] is None:
-                    self._group_num[gi] = num
-                    self._group_den[gi] = den
-                else:
-                    acc = self._group_num[gi]
-                    if num.device != acc.device:
-                        num = num.to(acc.device)
-                        den = den.to(acc.device)
-                    acc.add_(num)
-                    self._group_den[gi].add_(den)
+
+            if self.lr_mode == 'per_tensor_soft':
+                # Store per-tensor vote; coupling applied in step()
+                state['vote_num'] = num
+                state['vote_den'] = den
+            else:
+                # Accumulate into pool (per_group or per_block)
+                pi = self._param_pool_index.get(p) if self._param_pool_index is not None else None
+                if pi is not None:
+                    if self._pool_num[pi] is None:
+                        self._pool_num[pi] = num
+                        self._pool_den[pi] = den
+                    else:
+                        acc = self._pool_num[pi]
+                        if num.device != acc.device:
+                            num = num.to(acc.device)
+                            den = den.to(acc.device)
+                        acc.add_(num)
+                        self._pool_den[pi].add_(den)
 
         state["step"] += 1
 
+        # --- Apply weight update with current LR ---
         wd = group["weight_decay"]
 
         if p.dtype == torch.float32:
-            # Decoupled weight decay folded in (update += wd*p), then a single
-            # fused p -= lr * update (lr is a scalar, broadcasts).
             if wd != 0.0:
                 update.add_(p, alpha=wd)
             p.addcmul_(update, lr_t, value=-1.0)
         else:
-            # Low precision: apply the update in fp32 then stochastically round
-            # back, so tiny updates aren't lost to round-to-nearest. Single
-            # bf16/fp16 -> fp32 conversion shared by weight decay and rounding.
             new_p_fp32 = p.to(torch.float32)
             if wd != 0.0:
                 update.add_(new_p_fp32, alpha=wd)
@@ -570,15 +509,11 @@ class Automagic3(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        # Fused mode already updated every param in the backward hook; nothing
-        # left to do. Non-fused mode does the real work here.
         if not self.fused:
             for group in self.param_groups:
                 for p in group["params"]:
                     if not p.requires_grad:
                         continue
-                    # Low-precision grads were stochastically accumulated into
-                    # _accum_grad; hand it back as the grad to update from.
                     accum = getattr(p, "_accum_grad", None)
                     if accum is not None:
                         p.grad = accum
@@ -586,39 +521,115 @@ class Automagic3(torch.optim.Optimizer):
                     if p.grad is None:
                         continue
                     self._update_param(p, group)
-        self._apply_group_votes()
+        self._apply_votes()
         return loss
 
-    def _apply_group_votes(self) -> None:
-        # ONE lr nudge per group per step, from the pooled vote of every
-        # element of every tensor in the group (see the class docstring on
-        # why pooling at group level is load-bearing). Each param's lr tensor
-        # receives the same multiplicative factor, so they stay identical --
-        # effectively a single group lr, stored per param only so it rides
-        # the normal state_dict machinery. All tensor ops: no GPU sync.
-        for gi, group in enumerate(self.param_groups):
-            num = self._group_num[gi]
+    def _apply_votes(self) -> None:
+        """Dispatch to mode-specific vote application."""
+        if self.lr_mode == 'per_tensor_soft':
+            self._apply_per_tensor_votes()
+        else:
+            self._apply_pool_votes()
+
+    def _apply_pool_votes(self) -> None:
+        """Apply pooled votes for per_group and per_block modes."""
+        for pi in range(len(self._pool_num)):
+            num = self._pool_num[pi]
             if num is None:
                 continue
-            den = self._group_den[gi]
+            den = self._pool_den[pi]
             signal = num.div_(den.clamp_(min=1e-30)).clamp_(-1.0, 1.0)
+
+            # Vote EMA smoothing: prevents log-space random walk on long runs
+            if self.vote_ema_beta > 0:
+                ema = self._pool_vote_ema[pi]
+                if ema is None or ema.device != signal.device:
+                    ema = signal.clone()
+                else:
+                    ema.mul_(self.vote_ema_beta).add_(signal, alpha=1.0 - self.vote_ema_beta)
+                self._pool_vote_ema[pi] = ema
+                signal = ema
+
             factor = torch.exp(signal)
-            for p in group["params"]:
+
+            # Apply the same factor to every param in this pool
+            for p, pool_idx in self._param_pool_index.items():
+                if pool_idx != pi:
+                    continue
                 st = self.state.get(p)
                 if st is None or "lr" not in st:
                     continue
                 lr_t = st["lr"]
                 f = factor if factor.device == lr_t.device else factor.to(lr_t.device)
-                # Keep the adapted lr inside [min_lr, max_lr]. At the defaults
-                # this is a numerical overflow guard only (decades outside the
-                # usable range); tighter user-set bounds act as hard rails on
-                # the controller.
-                lr_t.mul_(f).clamp_(min=group["min_lr"], max=group["max_lr"])
-            self._group_num[gi] = None
-            self._group_den[gi] = None
+                lr_t.mul_(f).clamp_(
+                    min=self.param_groups[self._param_group_index[p]]["min_lr"],
+                    max=self.param_groups[self._param_group_index[p]]["max_lr"],
+                )
+
+            self._pool_num[pi] = None
+            self._pool_den[pi] = None
+
+    def _apply_per_tensor_votes(self) -> None:
+        """Apply per-tensor votes with soft coupling toward group mean log-LR.
+
+        For each param group:
+          1. Compute the mean log-LR across all params (the anchor).
+          2. For each param with a vote:
+             log_lr_new = (1 - lambda) * log_lr_old + signal + lambda * mean_log_lr
+          This allows per-tensor adaptation while keeping coupled pairs
+          (e.g. Q/K) from diverging along symmetry directions.
+        """
+        for gi, group in enumerate(self.param_groups):
+            # Collect all LRs in the group for the mean
+            all_log_lrs = []
+            params_with_votes = []
+            for p in group["params"]:
+                st = self.state.get(p)
+                if st is None or "lr" not in st:
+                    continue
+                lr_val = float(st["lr"].item())
+                all_log_lrs.append(math.log(max(lr_val, 1e-30)))
+                if st.get('vote_num') is not None:
+                    params_with_votes.append(p)
+
+            if not all_log_lrs:
+                continue
+
+            mean_log_lr = sum(all_log_lrs) / len(all_log_lrs)
+
+            for p in params_with_votes:
+                st = self.state[p]
+                num = st['vote_num']
+                den = st['vote_den']
+                signal_val = float(
+                    (num / den.clamp(min=1e-30)).clamp(-1.0, 1.0).item()
+                )
+
+                # Vote EMA smoothing
+                if self.vote_ema_beta > 0:
+                    prev_ema = st.get('vote_ema', 0.0)
+                    st['vote_ema'] = (
+                        self.vote_ema_beta * prev_ema
+                        + (1.0 - self.vote_ema_beta) * signal_val
+                    )
+                    signal_val = st['vote_ema']
+
+                # Soft coupling: pull toward group mean log-LR
+                log_lr = math.log(max(float(st['lr'].item()), 1e-30))
+                log_lr = (
+                    (1.0 - self.coupling_lambda) * log_lr
+                    + signal_val
+                    + self.coupling_lambda * mean_log_lr
+                )
+                new_lr = math.exp(log_lr)
+                new_lr = max(group["min_lr"], min(group["max_lr"], new_lr))
+                st['lr'].fill_(new_lr)
+
+                # Clear consumed vote
+                st['vote_num'] = None
+                st['vote_den'] = None
 
     def get_learning_rates(self) -> List[float]:
-        # Reporting helper: the (shared) lr of each param group.
         out = []
         for group in self.param_groups:
             lrs = [
@@ -634,47 +645,85 @@ class Automagic3(torch.optim.Optimizer):
         return sum(lrs) / len(lrs) if lrs else float(self.defaults["lr"])
 
     def load_state_dict(self, state_dict):
-        # Parent casts every fp state tensor to param.dtype; force lr back to fp32
-        # so subsequent lr bumps aren't rounded away on bf16 weights.
         super().load_state_dict(state_dict)
+
         # Hyperparameters are NOT loaded from the checkpoint: constructor args
-        # always win, so any setting can be changed mid-run just by passing a
-        # different value when resuming. Only the adaptive state is restored
-        # -- the group lr and the sign history (when its geometry still
-        # matches the current config).
+        # always win, so any setting can be changed mid-run.
         for group in self.param_groups:
             for k, v in self.defaults.items():
                 group[k] = v
-            # One lr per group: unify the restored lrs to their geometric
-            # median (they are already identical for checkpoints from this
-            # version; older per-tensor checkpoints land on a sane middle).
-            lrs = [
-                st["lr"]
-                for p in group["params"]
-                if (st := self.state.get(p)) is not None
-                and isinstance(st.get("lr"), torch.Tensor)
-            ]
-            med = None
-            if lrs:
-                dev = lrs[0].device
-                med = (
-                    torch.stack([t.to(torch.float32).to(dev) for t in lrs])
-                    .log_()
-                    .median()
-                    .exp_()
-                )
+
+        # Mode-specific LR restoration
+        if self.lr_mode == 'per_tensor_soft':
+            # Preserve individual per-tensor LRs (they are meant to diverge).
+            # Just ensure fp32 and clear any stale votes.
+            for group in self.param_groups:
+                for p in group["params"]:
+                    st = self.state.get(p)
+                    if st is None:
+                        continue
+                    if isinstance(st.get("lr"), torch.Tensor):
+                        st["lr"] = st["lr"].to(torch.float32)
+                    # Clear stale votes from mid-step saves
+                    if st.get('vote_num') is not None:
+                        st['vote_num'] = None
+                    if st.get('vote_den') is not None:
+                        st['vote_den'] = None
+        elif self.lr_mode == 'per_block':
+            # Unify LRs per block (params in the same block should have
+            # identical LRs; use geometric median for robustness).
+            block_lrs = {}
+            for p, pool_idx in self._param_pool_index.items():
+                st = self.state.get(p)
+                if st is None or not isinstance(st.get("lr"), torch.Tensor):
+                    continue
+                st["lr"] = st["lr"].to(torch.float32)
+                block_lrs.setdefault(pool_idx, []).append(st["lr"])
+
+            for pool_idx, lrs in block_lrs.items():
+                if lrs:
+                    dev = lrs[0].device
+                    med = (
+                        torch.stack([t.to(torch.float32).to(dev) for t in lrs])
+                        .log_()
+                        .median()
+                        .exp_()
+                    )
+                    for t in lrs:
+                        t.copy_(med.to(t.device))
+        else:
+            # per_group: unify LRs per group (original behavior)
+            for group in self.param_groups:
+                lrs = [
+                    st["lr"]
+                    for p in group["params"]
+                    if (st := self.state.get(p)) is not None
+                    and isinstance(st.get("lr"), torch.Tensor)
+                ]
+                med = None
+                if lrs:
+                    dev = lrs[0].device
+                    med = (
+                        torch.stack([t.to(torch.float32).to(dev) for t in lrs])
+                        .log_()
+                        .median()
+                        .exp_()
+                    )
+                for p in group["params"]:
+                    st = self.state.get(p)
+                    if st is None:
+                        continue
+                    if isinstance(st.get("lr"), torch.Tensor):
+                        st["lr"] = st["lr"].to(torch.float32)
+                        if med is not None:
+                            st["lr"].copy_(med.to(st["lr"].device))
+
+        # Sign history: keep when geometry matches, reset otherwise
+        for group in self.param_groups:
             for p in group["params"]:
                 st = self.state.get(p)
                 if st is None:
                     continue
-                if isinstance(st.get("lr"), torch.Tensor):
-                    st["lr"] = st["lr"].to(torch.float32)
-                    if med is not None:
-                        st["lr"].copy_(med.to(st["lr"].device))
-                # Sign history: keep it when its geometry matches the current
-                # config (the parent cast it to param dtype; recover by shape).
-                # On any mismatch (e.g. a checkpoint from an older window
-                # layout) -- start fresh.
                 numel = p.numel()
                 H = group["polarity_history"]
                 width = (numel + 7) // 8
@@ -695,6 +744,6 @@ class Automagic3(torch.optim.Optimizer):
                     )
                     st["hist_idx"] = 0
                     st["hist_fill"] = 0
-        # The parent rebuilt the group dicts; remap params to groups and
-        # reset the vote accumulators.
+
+        # Rebuild pool index (parent replaced group dicts)
         self._rebuild_group_index()
