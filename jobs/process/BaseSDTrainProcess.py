@@ -2606,12 +2606,22 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     low_noise_lr = None
                     is_multistage = getattr(self.network, 'is_multistage', False)
                     if is_multistage:
+                        # Use optimizer's get_learning_rates() to handle all optimizer types
+                        # (Automagic3 stores LR per-parameter in state, not in group['lr'])
+                        if hasattr(optimizer, 'get_learning_rates'):
+                            all_lrs = optimizer.get_learning_rates()
+                        else:
+                            all_lrs = [g['lr'] for g in optimizer.param_groups]
+                        
+                        # Map LRs to param groups by index
+                        lr_idx = 0
                         for group in optimizer.param_groups:
                             name = group.get('name', '')
                             # Get effective learning rate (handle Prodigy/Dadaptation where lr * d = effective lr)
-                            group_lr = group['lr']
+                            group_lr = all_lrs[lr_idx] if lr_idx < len(all_lrs) else group['lr']
                             if hasattr(group, 'd'):
                                 group_lr = group['d'] * group_lr
+                            lr_idx += 1
                             
                             if name == 'high_noise_loras' or name.startswith('high_noise_loras_block_'):
                                 high_noise_lr = group_lr

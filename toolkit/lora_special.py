@@ -1024,6 +1024,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                 lr = high_noise_lr if high_noise_lr is not None else (unet_lr if unet_lr is not None else default_lr)
                 if lr is not None:
                     high_noise_params["lr"] = lr
+                high_noise_params["name"] = "high_noise_loras"
 
                 # Add per-expert optimizer params if using automagic
                 if default_lr_bump is not None:
@@ -1041,6 +1042,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                 lr = low_noise_lr if low_noise_lr is not None else (unet_lr if unet_lr is not None else default_lr)
                 if lr is not None:
                     low_noise_params["lr"] = lr
+                low_noise_params["name"] = "low_noise_loras"
 
                 # Add per-expert optimizer params if using automagic
                 if default_lr_bump is not None:
