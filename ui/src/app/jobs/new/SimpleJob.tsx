@@ -59,6 +59,17 @@ const loraInitOptions: SelectOption[] = [
   { value: 'small_noise', label: 'Small Noise (std=0.001)' },
 ];
 
+const schedulerOptions: SelectOption[] = [
+  { value: 'euler', label: 'Euler' },
+  { value: 'ddim', label: 'DDIM' },
+  { value: 'unipc', label: 'UniPC' },
+  { value: 'flowmatch', label: 'FlowMatch' },
+  { value: 'custom_flowmatch', label: 'Custom FlowMatch' },
+  { value: 'ddpm', label: 'DDPM' },
+  { value: 'pndm', label: 'PNDM' },
+  { value: 'dpm', label: 'DPM' },
+];
+
 // Optimizers that have their own adaptive learning rate and don't need external LR schedulers
 const NO_SCHEDULER_OPTIMIZERS = ['prodigyopt', 'prodigy8bit', 'automagic', 'automagic2', 'automagic3', 'dadaptation', 'dadaptationlion'];
 
@@ -842,6 +853,13 @@ export default function SimpleJob({
                   placeholder="eg. 2000"
                   min={1}
                   required
+                />
+                <SelectInput
+                  label="Noise Scheduler"
+                  className="pt-2"
+                  value={jobConfig.config.process[0].train.noise_scheduler}
+                  onChange={value => setJobConfig(value, 'config.process[0].train.noise_scheduler')}
+                  options={schedulerOptions}
                 />
               </div>
               <div>
@@ -1632,10 +1650,7 @@ export default function SimpleJob({
                   className="pt-2"
                   value={jobConfig.config.process[0].sample.sampler}
                   onChange={value => setJobConfig(value, 'config.process[0].sample.sampler')}
-                  options={[
-                    { value: 'flowmatch', label: 'FlowMatch' },
-                    { value: 'ddpm', label: 'DDPM' },
-                  ]}
+                  options={schedulerOptions}
                 />
                 <NumberInput
                   label="Guidance Scale"
