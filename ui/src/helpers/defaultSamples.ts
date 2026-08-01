@@ -47,6 +47,10 @@ export const defaultSampleConfig: SampleConfig = {
   sample_steps: 30,
   num_frames: 1,
   fps: 1,
+  // NAG (Negative Attention Guidance) parameters - default disabled (scale=1.0)
+  nag_scale: 1.0,
+  nag_alpha: 0.5,
+  nag_tau: 3.5,
 }
 
 export const defaultAudioSampleConfig: SampleConfig = {
@@ -400,6 +404,10 @@ It's Converging!
   sample_steps: 30,
   num_frames: 1,
   fps: 1,
+  // NAG (Negative Attention Guidance) parameters - default disabled (scale=1.0)
+  nag_scale: 1.0,
+  nag_alpha: 0.5,
+  nag_tau: 3.5,
 };
 
 
@@ -973,4 +981,8 @@ export const defaultIdeogramSamplesConfig: SampleConfig = {
   sample_steps: 30,
   num_frames: 1,
   fps: 1,
+  // NAG (Negative Attention Guidance) parameters - default disabled (scale=1.0)
+  nag_scale: 1.0,
+  nag_alpha: 0.5,
+  nag_tau: 3.5,
 }

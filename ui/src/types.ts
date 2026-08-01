@@ -219,6 +219,10 @@ export interface SampleItem {
   ctrl_img_1?: string | null;
   ctrl_img_2?: string | null;
   ctrl_img_3?: string | null;
+  // NAG (Negative Attention Guidance) per-sample override
+  nag_scale?: number;
+  nag_alpha?: number;
+  nag_tau?: number;
 }
 
 export interface SampleConfig {
@@ -235,6 +239,13 @@ export interface SampleConfig {
   sample_steps: number;
   num_frames: number;
   fps: number;
+  // NAG (Negative Attention Guidance) parameters - global defaults for all samples
+  // nag_scale: 1.0 disables, >1 enables (typical range 1.0–20.0)
+  // nag_alpha: blend factor between NAG-guided and original prediction (0.0–2.0)
+  // nag_tau:   threshold for similarity-based scaling (typical 1.0–5.0)
+  nag_scale?: number;
+  nag_alpha?: number;
+  nag_tau?: number;
 }
 
 export interface LoggingConfig {

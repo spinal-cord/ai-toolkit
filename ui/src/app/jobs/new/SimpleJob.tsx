@@ -1672,6 +1672,39 @@ export default function SimpleJob({
                 />
               </div>
 
+              {/* NAG (Negative Attention Guidance) Parameters */}
+              <div>
+                <div className="text-xs font-semibold text-gray-400 mb-2">NAG (Negative Attention Guidance)</div>
+                <NumberInput
+                  label="NAG Scale"
+                  value={jobConfig.config.process[0].sample.nag_scale ?? 1.0}
+                  onChange={value => setJobConfig(value, 'config.process[0].sample.nag_scale')}
+                  placeholder="1.0 (disabled)"
+                  className="pt-2"
+                  min={0}
+                  step={0.1}
+                />
+                <NumberInput
+                  label="NAG Alpha"
+                  value={jobConfig.config.process[0].sample.nag_alpha ?? 0.5}
+                  onChange={value => setJobConfig(value, 'config.process[0].sample.nag_alpha')}
+                  placeholder="0.5"
+                  className="pt-2"
+                  min={0}
+                  max={2}
+                  step={0.1}
+                />
+                <NumberInput
+                  label="NAG Tau"
+                  value={jobConfig.config.process[0].sample.nag_tau ?? 3.5}
+                  onChange={value => setJobConfig(value, 'config.process[0].sample.nag_tau')}
+                  placeholder="3.5"
+                  className="pt-2"
+                  min={0}
+                  step={0.1}
+                />
+              </div>
+
               {!isAudioModel && (
                 <div>
                   <NumberInput
@@ -2028,7 +2061,150 @@ export default function SimpleJob({
                             }}
                             placeholder={`1.0 (default)`}
                           />
+                          <TextInput
+                            label={`Negative Prompt`}
+                            value={sample.neg ?? ''}
+                            onChange={value => setJobConfig(value, `config.process[0].sample.samples[${i}].neg`)}
+                            placeholder={`${jobConfig.config.process[0].sample.neg ?? '(global)'}`}
+                          />
                         </div>
+
+                        {/* Per-Sample NAG Parameters */}
+                        <div className="grid w-full lg:grid-flow-col lg:auto-cols-fr gap-4 mt-2">
+                          <NumberInput
+                            label={`NAG Scale`}
+                            value={sample.nag_scale ?? ''}
+                            onChange={value => {
+                              if (value === '') {
+                                let newConfig = objectCopy(jobConfig);
+                                if (newConfig.config.process[0].sample.samples[i]) {
+                                  delete newConfig.config.process[0].sample.samples[i].nag_scale;
+                                  setJobConfig(
+                                    newConfig.config.process[0].sample.samples,
+                                    'config.process[0].sample.samples',
+                                  );
+                                }
+                              } else {
+                                const numValue = parseFloat(value);
+                                if (!isNaN(numValue)) {
+                                  setJobConfig(numValue, `config.process[0].sample.samples[${i}].nag_scale`);
+                                }
+                              }
+                            }}
+                            placeholder={`${jobConfig.config.process[0].sample.nag_scale ?? '(global)'} (default)`}
+                            min={0}
+                            step={0.1}
+                          />
+                          <NumberInput
+                            label={`NAG Alpha`}
+                            value={sample.nag_alpha ?? ''}
+                            onChange={value => {
+                              if (value === '') {
+                                let newConfig = objectCopy(jobConfig);
+                                if (newConfig.config.process[0].sample.samples[i]) {
+                                  delete newConfig.config.process[0].sample.samples[i].nag_alpha;
+                                  setJobConfig(
+                                    newConfig.config.process[0].sample.samples,
+                                    'config.process[0].sample.samples',
+                                  );
+                                }
+                              } else {
+                                const numValue = parseFloat(value);
+                                if (!isNaN(numValue)) {
+                                  setJobConfig(numValue, `config.process[0].sample.samples[${i}].nag_alpha`);
+                                }
+                              }
+                            }}
+                            placeholder={`${jobConfig.config.process[0].sample.nag_alpha ?? '(global)'} (default)`}
+                            min={0}
+                            max={2}
+                            step={0.1}
+                          />
+                          <NumberInput
+                            label={`NAG Tau`}
+                            value={sample.nag_tau ?? ''}
+                            onChange={value => {
+                              if (value === '') {
+                                let newConfig = objectCopy(jobConfig);
+                                if (newConfig.config.process[0].sample.samples[i]) {
+                                  delete newConfig.config.process[0].sample.samples[i].nag_tau;
+                                  setJobConfig(
+                                    newConfig.config.process[0].sample.samples,
+                                    'config.process[0].sample.samples',
+                                  );
+                                }
+                              } else {
+                                const numValue = parseFloat(value);
+                                if (!isNaN(numValue)) {
+                                  setJobConfig(numValue, `config.process[0].sample.samples[${i}].nag_tau`);
+                                }
+                              }
+                            }}
+                            placeholder={`${jobConfig.config.process[0].sample.nag_tau ?? '(global)'} (default)`}
+                            min={0}
+                            step={0.1}
+                          />
+                        </div>
+
+                        {/* Per-Sample Video Params (fps, num_frames) */}
+                        {isVideoModel && (
+                          <div className="grid w-full lg:grid-flow-col lg:auto-cols-fr gap-4 mt-2">
+                            <TextInput
+                              label={`FPS`}
+                              value={sample.fps ? `${sample.fps}` : ''}
+                              onChange={value => {
+                                // remove any non-numeric characters
+                                value = value.replace(/\D/g, '');
+                                if (value === '') {
+                                  // remove the key from the config if empty
+                                  let newConfig = objectCopy(jobConfig);
+                                  if (newConfig.config.process[0].sample.samples[i]) {
+                                    delete newConfig.config.process[0].sample.samples[i].fps;
+                                    setJobConfig(
+                                      newConfig.config.process[0].sample.samples,
+                                      'config.process[0].sample.samples',
+                                    );
+                                  }
+                                } else {
+                                  const intValue = parseInt(value);
+                                  if (!isNaN(intValue)) {
+                                    setJobConfig(intValue, `config.process[0].sample.samples[${i}].fps`);
+                                  } else {
+                                    console.warn('Invalid fps value:', value);
+                                  }
+                                }
+                              }}
+                              placeholder={`${jobConfig.config.process[0].sample.fps} (default)`}
+                            />
+                            <TextInput
+                              label={`Num Frames`}
+                              value={sample.num_frames ? `${sample.num_frames}` : ''}
+                              onChange={value => {
+                                // remove any non-numeric characters
+                                value = value.replace(/\D/g, '');
+                                if (value === '') {
+                                  // remove the key from the config if empty
+                                  let newConfig = objectCopy(jobConfig);
+                                  if (newConfig.config.process[0].sample.samples[i]) {
+                                    delete newConfig.config.process[0].sample.samples[i].num_frames;
+                                    setJobConfig(
+                                      newConfig.config.process[0].sample.samples,
+                                      'config.process[0].sample.samples',
+                                    );
+                                  }
+                                } else {
+                                  const intValue = parseInt(value);
+                                  if (!isNaN(intValue)) {
+                                    setJobConfig(intValue, `config.process[0].sample.samples[${i}].num_frames`);
+                                  } else {
+                                    console.warn('Invalid num_frames value:', value);
+                                  }
+                                }
+                              }}
+                              placeholder={`${jobConfig.config.process[0].sample.num_frames} (default)`}
+                            />
+                          </div>
+                        )}
                       </div>
                       {modelArch?.additionalSections?.includes('datasets.multi_control_paths') && (
                         <FormGroup label="Control Images" className="pt-2 ml-4">
