@@ -1064,7 +1064,7 @@ class Wan2214bModel(Wan21):
         # Use the sampling scheduler config (with configurable shift) for inference.
         # During training, the scheduler uses timestep_type='sigmoid' which ignores
         # the shift parameter. During sampling, set_timesteps() reads self.config.shift.
-        scheduler = self.get_sampling_scheduler(sampling_flow_shift)
+        scheduler = self.get_sampling_scheduler(sampling_flow_shift, self.model_config)
         pipeline = Wan22Pipeline(
             vae=self.vae,
             transformer=self.model.transformer_1,
@@ -1085,14 +1085,24 @@ class Wan2214bModel(Wan21):
     # static method to get the training scheduler
     # During training with timestep_type='sigmoid', the shift is ignored.
     @staticmethod
-    def get_train_scheduler():
+    def get_train_scheduler(model_config=None):
+        if model_config and getattr(model_config, 'train_scheduler', None):
+            from toolkit.scheduler import build_noise_scheduler
+            return build_noise_scheduler(model_config.train_scheduler)
         scheduler = CustomFlowMatchEulerDiscreteScheduler(**scheduler_config)
         return scheduler
 
     # static method to get the sampling/inference scheduler
     # This uses the configurable shift value for the sigma schedule during generation.
     @staticmethod
-    def get_sampling_scheduler(sampling_flow_shift: float = None):
+    def get_sampling_scheduler(sampling_flow_shift: float = None, model_config=None):
+        if model_config and getattr(model_config, 'sampling_scheduler', None):
+            from toolkit.scheduler import build_noise_scheduler
+            config = dict(model_config.sampling_scheduler)
+            if sampling_flow_shift is not None:
+                config["shift"] = sampling_flow_shift
+            return build_noise_scheduler(config)
+        
         config = dict(sampling_scheduler_config)
         if sampling_flow_shift is not None:
             config["shift"] = sampling_flow_shift

@@ -1,6 +1,45 @@
 import torch
 from typing import Optional
 from diffusers.optimization import SchedulerType, TYPE_TO_SCHEDULER_FUNCTION, get_constant_schedule_with_warmup
+from diffusers import (
+    EulerDiscreteScheduler,
+    DDIMScheduler,
+    UniPCMultistepScheduler,
+    FlowMatchEulerDiscreteScheduler,
+    DDPMScheduler,
+    PNDMScheduler,
+    DPMSolverMultistepScheduler,
+)
+from toolkit.samplers.custom_flowmatch_sampler import CustomFlowMatchEulerDiscreteScheduler
+
+NOISE_SCHEDULER_MAP = {
+    'euler': EulerDiscreteScheduler,
+    'ddim': DDIMScheduler,
+    'unipc': UniPCMultistepScheduler,
+    'flowmatch': FlowMatchEulerDiscreteScheduler,
+    'custom_flowmatch': CustomFlowMatchEulerDiscreteScheduler,
+    'ddpm': DDPMScheduler,
+    'pndm': PNDMScheduler,
+    'dpm': DPMSolverMultistepScheduler,
+}
+
+
+def build_noise_scheduler(config_dict, default_config=None):
+    """
+    Build a noise scheduler from a config dictionary.
+    The dictionary must contain a 'type' key specifying the scheduler type.
+    All other keys are passed as kwargs to the scheduler constructor.
+    """
+    if config_dict is None:
+        config_dict = default_config or {}
+
+    config_dict = dict(config_dict)  # copy
+    scheduler_type = config_dict.pop('type', 'custom_flowmatch')
+
+    if scheduler_type not in NOISE_SCHEDULER_MAP:
+        raise ValueError(f"Unknown noise scheduler type: {scheduler_type}. Available: {list(NOISE_SCHEDULER_MAP.keys())}")
+
+    return NOISE_SCHEDULER_MAP[scheduler_type](**config_dict)
 
 
 def get_lr_scheduler(

@@ -1645,7 +1645,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         ModelClass = get_model_class(self.model_config)
         # if the model class has get_train_scheduler static method
         if hasattr(ModelClass, 'get_train_scheduler'):
-            sampler = ModelClass.get_train_scheduler()
+            try:
+                sampler = ModelClass.get_train_scheduler(self.model_config)
+            except TypeError:
+                sampler = ModelClass.get_train_scheduler()
+        elif self.model_config.train_scheduler:
+            from toolkit.scheduler import build_noise_scheduler
+            sampler = build_noise_scheduler(self.model_config.train_scheduler)
         else:
             # get the noise scheduler
             arch = 'sd'

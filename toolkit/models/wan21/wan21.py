@@ -442,7 +442,10 @@ class Wan21(BaseModel):
 
     # static method to get the scheduler
     @staticmethod
-    def get_train_scheduler():
+    def get_train_scheduler(model_config=None):
+        if model_config and getattr(model_config, 'train_scheduler', None):
+            from toolkit.scheduler import build_noise_scheduler
+            return build_noise_scheduler(model_config.train_scheduler)
         scheduler = CustomFlowMatchEulerDiscreteScheduler(**scheduler_config)
         return scheduler
     
@@ -703,7 +706,11 @@ class Wan21(BaseModel):
         # overrides this to use a separate sampling scheduler with configurable shift.
         # During training with timestep_type='sigmoid', the shift is ignored.
         # During sampling, set_timesteps() reads self.config.shift.
-        scheduler = self.get_train_scheduler()
+        if self.model_config.sampling_scheduler:
+            from toolkit.scheduler import build_noise_scheduler
+            scheduler = build_noise_scheduler(self.model_config.sampling_scheduler)
+        else:
+            scheduler = self.get_train_scheduler(self.model_config)
         if self.model_config.low_vram:
             pipeline = AggressiveWanUnloadPipeline(
                 vae=self.vae,

@@ -745,6 +745,10 @@ class ModelConfig:
         self.compile_dynamic = kwargs.get("compile_dynamic", True)
         self.cache_size_limit = kwargs.get("cache_size_limit", None)
         
+        # Configurable noise schedulers for training and sampling
+        self.train_scheduler = kwargs.get("train_scheduler", None)
+        self.sampling_scheduler = kwargs.get("sampling_scheduler", None)
+        
         # kwargs to pass to the model
         self.model_kwargs = kwargs.get("model_kwargs", {})
         
