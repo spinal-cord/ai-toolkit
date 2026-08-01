@@ -10,7 +10,7 @@ from toolkit.audio.album_artwork import add_album_artwork
 from toolkit.prompt_utils import PromptEmbeds
 from torchao.quantization.quant_primitives import _DTYPE_TO_BIT_WIDTH
 
-ImgExt = Literal['jpg', 'png', 'webp']
+ImgExt = Literal['jpg', 'png', 'webp', 'jxl']
 
 SaveFormat = Literal['safetensors', 'diffusers']
 

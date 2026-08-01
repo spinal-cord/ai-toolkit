@@ -9,7 +9,7 @@ parser.add_argument("input_folder", type=str, help="Path to folder containing im
 
 args = parser.parse_args()
 
-img_types = ['.jpg', '.jpeg', '.png', '.webp']
+img_types = ['.jpg', '.jpeg', '.png', '.webp', '.jxl']
 
 # find all images in the input folder
 images = []

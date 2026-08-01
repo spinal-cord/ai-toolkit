@@ -26,7 +26,7 @@ def flush(garbage_collect=True):
 
 ControlTypes = Literal['depth', 'pose', 'line', 'inpaint', 'mask']
 
-img_ext_list = ['.jpg', '.jpeg', '.png', '.webp']
+img_ext_list = ['.jpg', '.jpeg', '.png', '.webp', '.jxl']
 
 
 class ControlGenerator:

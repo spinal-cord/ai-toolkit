@@ -21,6 +21,10 @@ class UnknownImageFormat(Exception):
     pass
 
 
+class JXLParseError(Exception):
+    pass
+
+
 types = collections.OrderedDict()
 BMP = types['BMP'] = 'BMP'
 GIF = types['GIF'] = 'GIF'
@@ -96,6 +100,173 @@ def get_image_metadata(file_path):
         return get_image_metadata_from_bytesio(input, size, file_path)
 
 
+def _read_bits(data: int, num_bits: int, offset: int, size: int) -> int:
+    """Read num_bits bits starting from offset bit in integer data."""
+    if offset + num_bits > size:
+        return 0
+    return (data >> (size - offset - num_bits)) & ((1 << num_bits) - 1)
+
+
+def _parse_jxl_codestream(data: bytes, data_size: int) -> tuple:
+    """
+    Parse JXL codestream header, return (width, height).
+    Reference Rust library imagesize implementation.
+    """
+    if data_size < 2 or data[0] != 0xFF or data[1] != 0x0A:
+        raise JXLParseError("Invalid JXL codestream signature")
+
+    # Pack header data into an integer for bit operations
+    # Read at most the first 16 bytes
+    header_bytes = data[:min(data_size, 16)]
+    # Pad to 16 bytes for easier processing
+    if len(header_bytes) < 16:
+        header_bytes = header_bytes + b'\x00' * (16 - len(header_bytes))
+    header = int.from_bytes(header_bytes, 'little')
+    header_size = len(header_bytes) * 8
+
+    # Check if it's a "small" image (size <= 256)
+    is_small = _read_bits(header, 1, 16, header_size) != 0
+
+    # --- Parse height ---
+    height_selector = _read_bits(header, 2, 17, header_size)
+    if is_small:
+        height_bits, height_offset, height_shift = 5, 17, 3
+    else:
+        if height_selector == 0:
+            height_bits, height_offset, height_shift = 9, 19, 0
+        elif height_selector == 1:
+            height_bits, height_offset, height_shift = 13, 19, 0
+        elif height_selector == 2:
+            height_bits, height_offset, height_shift = 18, 19, 0
+        elif height_selector == 3:
+            height_bits, height_offset, height_shift = 30, 19, 0
+        else:
+            raise JXLParseError("Invalid height selector")
+
+    height = (_read_bits(header, height_bits, height_offset, header_size) + 1) << height_shift
+
+    # --- Parse aspect ratio and width ---
+    ratio_offset = height_bits + height_offset
+    ratio = _read_bits(header, 3, ratio_offset, header_size)
+
+    if ratio == 0:
+        # No predefined aspect ratio, need to parse width
+        width_selector_offset = ratio_offset + 3
+        width_selector = _read_bits(header, 2, width_selector_offset, header_size)
+        if is_small:
+            width_bits, width_offset, width_shift = 5, 25, 3
+        else:
+            if width_selector == 0:
+                width_bits, width_offset, width_shift = 9, width_selector_offset + 2, 0
+            elif width_selector == 1:
+                width_bits, width_offset, width_shift = 13, width_selector_offset + 2, 0
+            elif width_selector == 2:
+                width_bits, width_offset, width_shift = 18, width_selector_offset + 2, 0
+            elif width_selector == 3:
+                width_bits, width_offset, width_shift = 30, width_selector_offset + 2, 0
+            else:
+                raise JXLParseError("Invalid width selector")
+        width = (_read_bits(header, width_bits, width_offset, header_size) + 1) << width_shift
+    else:
+        # Use predefined aspect ratio to calculate width
+        if ratio == 1:
+            width = height  # 1:1
+        elif ratio == 2:
+            width = (height // 10) * 12  # 12:10
+        elif ratio == 3:
+            width = (height // 3) * 4  # 4:3
+        elif ratio == 4:
+            width = (height // 2) * 3  # 3:2
+        elif ratio == 5:
+            width = (height // 16) * 9  # 16:9
+        elif ratio == 6:
+            width = (height // 9) * 16  # 9:16
+        elif ratio == 7:
+            width = (height // 2) * 1  # 1:2
+        else:
+            raise JXLParseError("Invalid ratio")
+
+    return width, height
+
+
+def _get_jxl_size_from_bytesio(input: io.IOBase, size: int) -> tuple:
+    """
+    Read JXL file from BytesIO object and return (width, height).
+    """
+    input.seek(0)
+    data = input.read(16)
+
+    if len(data) < 12:
+        raise JXLParseError("File too small to be a valid JXL")
+
+    # Check if it's a container format
+    container_signature = b'\x00\x00\x00\x0cJXL \r\n\x87\n'
+    if data[:12] == container_signature:
+        # Container format: need to find 'jxlc' or 'jxlp' box
+        input.seek(0)
+        # Skip file header (12 bytes)
+        input.seek(12)
+        while True:
+            box_header = input.read(8)
+            if len(box_header) < 8:
+                raise JXLParseError("Truncated JXL container")
+            box_size = int.from_bytes(box_header[:4], 'big')
+            box_type = box_header[4:8].decode('ascii')
+            
+            # If box_size == 1, actual size is in the next 8 bytes
+            if box_size == 1:
+                extended_size = input.read(8)
+                if len(extended_size) < 8:
+                    raise JXLParseError("Truncated JXL container")
+                box_size = int.from_bytes(extended_size, 'big')
+                box_start = input.tell()
+            else:
+                box_start = input.tell()
+            
+            # If it's a 'jxlc' box, it contains the complete codestream
+            if box_type == 'jxlc':
+                # Read box content (i.e., codestream)
+                # Limit read size to avoid reading too large files
+                read_size = min(box_size - (input.tell() - (box_start - 8 if box_size != 1 else box_start - 16)), 1024)
+                codestream_data = input.read(read_size)
+                if len(codestream_data) < 2:
+                    raise JXLParseError("Truncated JXL codestream in jxlc box")
+                return _parse_jxl_codestream(codestream_data, len(codestream_data))
+            
+            # If it's a 'jxlp' box, it's part of the codestream
+            elif box_type == 'jxlp':
+                # Read jxlp index (4 bytes)
+                idx_data = input.read(4)
+                if len(idx_data) < 4:
+                    raise JXLParseError("Truncated JXL container")
+                # Read codestream data
+                read_size = min(box_size - 8 - 4, 1024)  # 8 bytes box header + 4 bytes index
+                codestream_data = input.read(read_size)
+                if len(codestream_data) < 2:
+                    raise JXLParseError("Truncated JXL codestream in jxlp box")
+                # Check if it's the last jxlp box (MSB of index is 1)
+                is_last = (idx_data[0] & 0x80) != 0
+                # For jxlp, we need to accumulate data, but for simplicity, we only parse the first jxlp box
+                # Note: if codestream spans multiple jxlp boxes, this method may be incomplete
+                # But for most cases, size information is included in the first jxlp box
+                return _parse_jxl_codestream(codestream_data, len(codestream_data))
+            
+            # Move to next box
+            if box_size == 0:
+                # If box_size == 0, box extends to end of file
+                break
+            input.seek(box_start + box_size - 8 if box_size != 1 else box_start + box_size - 16)
+        
+        raise JXLParseError("No jxlc or jxlp box found in JXL container")
+    
+    # Raw codestream format
+    elif data[:2] == b'\xFF\x0A':
+        return _parse_jxl_codestream(data, len(data))
+    
+    else:
+        raise JXLParseError("Not a valid JXL file")
+
+
 def get_image_metadata_from_bytesio(input, size, file_path=None):
     """
     Return an `Image` object for a given img file content - no external
@@ -161,6 +332,20 @@ def get_image_metadata_from_bytesio(input, size, file_path=None):
             raise UnknownImageFormat("ValueError" + msg)
         except Exception as e:
             raise UnknownImageFormat(e.__class__.__name__ + msg)
+    # --- Add JXL detection logic ---
+    # Check JXL signature: container format (12 bytes) or raw codestream (2 bytes)
+    elif (size >= 12 and data[:12] == b'\x00\x00\x00\x0cJXL \r\n\x87\n') or \
+         (size >= 2 and data[:2] == b'\xff\x0a'):
+        imgtype = 'JXL'
+        try:
+            # Since we've already read partial data, need to reset input to beginning
+            input.seek(0)
+            w, h = _get_jxl_size_from_bytesio(input, size)
+            width = int(w)
+            height = int(h)
+        except JXLParseError as e:
+            raise UnknownImageFormat(f"JXL parsing error: {e}")
+    # --- End of JXL detection ---
     elif (size >= 26) and data.startswith(b'BM'):
         # BMP
         imgtype = 'BMP'
