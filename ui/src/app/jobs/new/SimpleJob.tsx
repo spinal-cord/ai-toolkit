@@ -1166,27 +1166,18 @@ export default function SimpleJob({
                 <FormGroup label="Text Encoder Optimizations" className="pt-2">
                   {!disableSections.includes('train.unload_text_encoder') && (
                     <Checkbox
-                      label="Unload TE"
+                      label="Unload TE to RAM"
+                      disabled={jobConfig.config.process[0].train.cache_text_embeddings}
                       checked={jobConfig.config.process[0].train.unload_text_encoder || false}
                       docKey={'train.unload_text_encoder'}
-                      onChange={value => {
-                        setJobConfig(value, 'config.process[0].train.unload_text_encoder');
-                        if (value) {
-                          setJobConfig(false, 'config.process[0].train.cache_text_embeddings');
-                        }
-                      }}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.unload_text_encoder')}
                     />
                   )}
                   <Checkbox
                     label="Cache Text Embeddings"
                     checked={jobConfig.config.process[0].train.cache_text_embeddings || false}
                     docKey={'train.cache_text_embeddings'}
-                    onChange={value => {
-                      setJobConfig(value, 'config.process[0].train.cache_text_embeddings');
-                      if (value) {
-                        setJobConfig(false, 'config.process[0].train.unload_text_encoder');
-                      }
-                    }}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.cache_text_embeddings')}
                   />
                 </FormGroup>
               </div>

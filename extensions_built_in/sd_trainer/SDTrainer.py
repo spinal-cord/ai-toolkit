@@ -1315,7 +1315,57 @@ class SDTrainer(BaseSDTrainProcess):
             batch=batch,
             **kwargs
         )
-    
+
+    def _apply_caption_dropout(
+        self,
+        embeds: PromptEmbeds,
+        dropout_rate: float,
+    ) -> PromptEmbeds:
+        """Randomly replace some samples' cached embeddings with blank embeddings.
+
+        This applies caption dropout at training time when using cached text
+        embeddings, since the text encoder is unloaded and cannot re-encode
+        dropped captions on the fly.
+        """
+        batch_size = embeds.text_embeds.shape[0]
+        drop_mask = torch.rand(batch_size, device=self.device_torch) < dropout_rate
+        if not drop_mask.any():
+            return embeds
+
+        blank = self.cached_blank_embeds.to(
+            self.device_torch, dtype=embeds.text_embeds.dtype
+        )
+        target_seq_len = embeds.text_embeds.shape[1]
+
+        # Pad or truncate blank text embeds to match batch sequence length
+        blank_text = blank.text_embeds[0]  # (src_len, dim)
+        src_len = blank_text.shape[0]
+        if src_len < target_seq_len:
+            blank_text = F.pad(blank_text, (0, 0, 0, target_seq_len - src_len))
+        elif src_len > target_seq_len:
+            blank_text = blank_text[:target_seq_len, :]
+
+        # Replace dropped samples with blank embeddings
+        drop_indices = drop_mask.nonzero(as_tuple=True)[0]
+        num_dropped = len(drop_indices)
+        embeds.text_embeds[drop_indices] = blank_text.unsqueeze(0).expand(num_dropped, -1, -1)
+
+        if embeds.pooled_embeds is not None and blank.pooled_embeds is not None:
+            embeds.pooled_embeds[drop_indices] = blank.pooled_embeds[0].unsqueeze(0).expand(num_dropped, -1)
+
+        if embeds.attention_mask is not None:
+            if blank.attention_mask is not None:
+                blank_mask = blank.attention_mask[0]
+                mask_len = len(blank_mask)
+                if mask_len < target_seq_len:
+                    blank_mask = F.pad(blank_mask, (0, target_seq_len - mask_len))
+                elif mask_len > target_seq_len:
+                    blank_mask = blank_mask[:target_seq_len]
+                embeds.attention_mask[drop_indices] = blank_mask.unsqueeze(0).expand(num_dropped, -1)
+            else:
+                embeds.attention_mask[drop_indices] = 0
+
+        return embeds
 
     def train_single_accumulation(self, batch: DataLoaderBatchDTO):
         with torch.no_grad():
@@ -1616,6 +1666,18 @@ class SDTrainer(BaseSDTrainProcess):
                                 conditional_embeds = batch.prompt_embeds.clone().detach().to(
                                     self.device_torch, dtype=dtype
                                 )
+                                # Apply caption dropout to cached embeddings.
+                                # When text embeddings are cached, the text encoder
+                                # is unloaded, so we can't re-encode dropped captions.
+                                # Instead, we randomly replace cached per-image
+                                # embeddings with blank embeddings at training time.
+                                caption_dropout_rate = 0.0
+                                if batch.dataset_config is not None:
+                                    caption_dropout_rate = batch.dataset_config.caption_dropout_rate
+                                if caption_dropout_rate > 0 and self.cached_blank_embeds is not None:
+                                    conditional_embeds = self._apply_caption_dropout(
+                                        conditional_embeds, caption_dropout_rate
+                                    )
                             else:
                                 embeds_to_use = self.cached_blank_embeds.clone().detach().to(
                                     self.device_torch, dtype=dtype

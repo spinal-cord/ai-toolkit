@@ -384,6 +384,11 @@ class CaptionProcessingDTOMixin:
         if raw_caption is None:
             raw_caption = ''
         # handle dropout
+        # Note: When cache_text_embeddings=True, caption dropout is intentionally
+        # skipped here so that the full caption is always cached to disk.
+        # Caption dropout for cached embeddings is applied at training time
+        # in SDTrainer._apply_caption_dropout() by randomly replacing cached
+        # per-image embeddings with blank embeddings.
         if self.dataset_config.caption_dropout_rate > 0 and not short_caption and not self.dataset_config.cache_text_embeddings:
             # get a random float form 0 to 1
             rand = random.random()
