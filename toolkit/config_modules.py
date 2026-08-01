@@ -76,6 +76,11 @@ class SampleItem:
         # only for models that support it, (qwen image edit 2509 for now)
         self.do_cfg_norm: bool = kwargs.get('do_cfg_norm', False)
 
+        # NAG (Negative Attention Guidance) parameters - per-sample override
+        self.nag_scale: Optional[float] = kwargs.get('nag_scale', None)
+        self.nag_alpha: Optional[float] = kwargs.get('nag_alpha', None)
+        self.nag_tau: Optional[float] = kwargs.get('nag_tau', None)
+
 class SampleConfig:
     def __init__(self, **kwargs):
         self.sampler: str = kwargs.get('sampler', 'ddpm')
@@ -116,6 +121,14 @@ class SampleConfig:
         self.samples = [SampleItem(self, **item) for item in raw_samples]
         # only for models that support it, (qwen image edit 2509 for now)
         self.do_cfg_norm: bool = kwargs.get('do_cfg_norm', False)
+
+        # NAG (Negative Attention Guidance) global defaults for all samples
+        # nag_scale: 1 disables, >1 enables (typical range 1.0–20.0)
+        # nag_tau:   threshold for similarity-based scaling (typical 1.0–5.0)
+        # nag_alpha: blend factor between NAG-guided and original prediction (0.0–2.0)
+        self.nag_scale: float = kwargs.get('nag_scale', 1.0)
+        self.nag_alpha: float = kwargs.get('nag_alpha', 0.5)
+        self.nag_tau: float = kwargs.get('nag_tau', 3.5)
         
     @property
     def prompts(self):
@@ -1132,6 +1145,9 @@ class GenerateImageConfig:
             fps: int = 15,
             ctrl_idx: int = 0,
             do_cfg_norm: bool = False,
+            nag_scale: float = 1.0,
+            nag_alpha: float = 0.5,
+            nag_tau: float = 3.5,
     ):
         self.width: int = width
         self.height: int = height
@@ -1203,6 +1219,11 @@ class GenerateImageConfig:
         self.logger = logger
         
         self.do_cfg_norm: bool = do_cfg_norm
+
+        # NAG (Negative Attention Guidance) parameters
+        self.nag_scale: float = nag_scale
+        self.nag_alpha: float = nag_alpha
+        self.nag_tau: float = nag_tau
 
     def set_gen_time(self, gen_time: int = None):
         if gen_time is not None:

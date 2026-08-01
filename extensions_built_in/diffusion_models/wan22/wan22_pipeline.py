@@ -69,6 +69,10 @@ class Wan22Pipeline(WanPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
         noise_mask: Optional[torch.Tensor] = None,
+        # NAG (Negative Attention Guidance) parameters
+        nag_scale: float = 1.0,
+        nag_alpha: float = 0.5,
+        nag_tau: float = 3.5,
     ):
 
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
@@ -169,8 +173,10 @@ class Wan22Pipeline(WanPipeline):
                 # first 16 channels are latent. other 20 are conditioning
                 conditioning = latents[:, 16:]
                 latents = latents[:, :16]
-                
-                # we need to trick the in_channls to think it is only 16 channels
+                num_channels_latents = 16
+        else:
+            # Handle T2V sampling on I2V models (in_channels == 36)
+            if num_channels_latents == 36:
                 num_channels_latents = 16
                 
         latents = self.prepare_latents(
@@ -188,6 +194,14 @@ class Wan22Pipeline(WanPipeline):
         mask = noise_mask
         if mask is None:
             mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
+
+        if conditioning is None and self.transformer.config.in_channels == 36:
+            # Create empty (zero) conditioning for T2V on I2V models
+            conditioning = torch.zeros(
+                (latents.shape[0], 20, latents.shape[2], latents.shape[3], latents.shape[4]),
+                dtype=latents.dtype,
+                device=latents.device
+            )
 
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - \
@@ -254,16 +268,60 @@ class Wan22Pipeline(WanPipeline):
                     return_dict=False,
                 )[0]
 
-                if self.do_classifier_free_guidance:
-                    noise_uncond = current_model(
+                # ── NAG (Negative Attention Guidance) ──────────────────────
+                # Applied to raw predictions BEFORE CFG.
+                # Formula (Wan2GP): x_guidance = x_neg * (1 - s) + x_pos * s
+                # Then tau-thresholded and alpha-blended back.
+                noise_uncond_raw = None
+                if nag_scale > 1 and negative_prompt_embeds is not None:
+                    noise_uncond_raw = current_model(
                         hidden_states=latent_model_input,
                         timestep=timestep,
                         encoder_hidden_states=negative_prompt_embeds,
                         attention_kwargs=attention_kwargs,
                         return_dict=False,
                     )[0]
-                    noise_pred = noise_uncond + current_guidance_scale * \
-                        (noise_pred - noise_uncond)
+
+                    # Weighted guidance combination
+                    noise_nag = noise_uncond_raw * (1 - nag_scale) + noise_pred * nag_scale
+
+                    # Cosine-similarity scale between positive and negative predictions
+                    norm_pos = torch.norm(noise_pred, p=2, dim=-1, keepdim=True)
+                    norm_neg = torch.norm(noise_uncond_raw, p=2, dim=-1, keepdim=True)
+                    scale = torch.sum(noise_pred * noise_uncond_raw, dim=-1, keepdim=True) / (
+                        norm_pos * norm_neg + 1e-8
+                    )
+                    scale = torch.nan_to_num(scale, nan=0.0, posinf=10.0, neginf=-10.0)
+
+                    # Tau-based thresholding factor
+                    factor = 1.0 / (norm_neg + 1e-7) * norm_pos * nag_tau
+
+                    # Apply factor only where similarity exceeds tau
+                    noise_nag = torch.where(
+                        scale > nag_tau,
+                        noise_nag * factor,
+                        noise_nag,
+                    )
+
+                    # Alpha-blend NAG result back with original prediction
+                    noise_pred = noise_nag * nag_alpha + noise_pred * (1 - nag_alpha)
+
+                # ── Standard CFG (after NAG) ───────────────────────────────
+                if self.do_classifier_free_guidance:
+                    if noise_uncond_raw is not None:
+                        # Reuse the unconditional prediction already computed for NAG
+                        noise_uncond = noise_uncond_raw
+                    else:
+                        noise_uncond = current_model(
+                            hidden_states=latent_model_input,
+                            timestep=timestep,
+                            encoder_hidden_states=negative_prompt_embeds,
+                            attention_kwargs=attention_kwargs,
+                            return_dict=False,
+                        )[0]
+                    noise_pred = noise_uncond + current_guidance_scale * (
+                        noise_pred - noise_uncond
+                    )
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(

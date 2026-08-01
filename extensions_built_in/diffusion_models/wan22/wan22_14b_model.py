@@ -1335,6 +1335,10 @@ class Wan2214bModel(Wan21):
             generator=generator,
             return_dict=False,
             output_type="pil",
+            # NAG (Negative Attention Guidance) parameters
+            nag_scale=gen_config.nag_scale,
+            nag_alpha=gen_config.nag_alpha,
+            nag_tau=gen_config.nag_tau,
             **extra
         )[0]
 

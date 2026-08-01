@@ -347,6 +347,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 ctrl_img_2=sample_item.ctrl_img_2,
                 ctrl_img_3=sample_item.ctrl_img_3,
                 do_cfg_norm=sample_config.do_cfg_norm,
+                # NAG params: per-sample override falls back to sample_config default
+                nag_scale=sample_item.nag_scale if sample_item.nag_scale is not None else sample_config.nag_scale,
+                nag_alpha=sample_item.nag_alpha if sample_item.nag_alpha is not None else sample_config.nag_alpha,
+                nag_tau=sample_item.nag_tau if sample_item.nag_tau is not None else sample_config.nag_tau,
                 **extra_args
             ))
 

@@ -264,6 +264,10 @@ class Wan225bModel(Wan21):
             return_dict=False,
             output_type="pil",
             noise_mask=noise_mask,
+            # NAG (Negative Attention Guidance) parameters
+            nag_scale=gen_config.nag_scale,
+            nag_alpha=gen_config.nag_alpha,
+            nag_tau=gen_config.nag_tau,
             **extra,
         )[0]
 
