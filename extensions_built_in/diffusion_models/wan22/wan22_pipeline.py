@@ -154,10 +154,16 @@ class Wan22Pipeline(WanPipeline):
             flush()
 
         transformer_dtype = self.transformer.dtype
-        prompt_embeds = prompt_embeds.to(device, transformer_dtype)
+        # Use patch_embedding bias dtype if available, as it determines the actual compute dtype
+        # This handles cases where training is in bf16 but bias remains in fp32
+        if hasattr(self.transformer.patch_embedding, 'bias') and self.transformer.patch_embedding.bias is not None:
+            model_dtype = self.transformer.patch_embedding.bias.dtype
+        else:
+            model_dtype = transformer_dtype
+        prompt_embeds = prompt_embeds.to(device, model_dtype)
         if negative_prompt_embeds is not None:
             negative_prompt_embeds = negative_prompt_embeds.to(
-                device, transformer_dtype)
+                device, model_dtype)
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -193,13 +199,13 @@ class Wan22Pipeline(WanPipeline):
         
         mask = noise_mask
         if mask is None:
-            mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
+            mask = torch.ones(latents.shape, dtype=latents.dtype, device=device)
 
         if conditioning is None and self.transformer.config.in_channels == 36:
             # Create empty (zero) conditioning for T2V on I2V models
             conditioning = torch.zeros(
                 (latents.shape[0], 20, latents.shape[2], latents.shape[3], latents.shape[4]),
-                dtype=latents.dtype,
+                dtype=model_dtype,
                 device=latents.device
             )
 
@@ -261,7 +267,7 @@ class Wan22Pipeline(WanPipeline):
                         [latent_model_input, conditioning], dim=1)
 
                 noise_pred = current_model(
-                    hidden_states=latent_model_input,
+                    hidden_states=latent_model_input.to(model_dtype),
                     timestep=timestep,
                     encoder_hidden_states=prompt_embeds,
                     attention_kwargs=attention_kwargs,
@@ -275,7 +281,7 @@ class Wan22Pipeline(WanPipeline):
                 noise_uncond_raw = None
                 if nag_scale > 1 and negative_prompt_embeds is not None:
                     noise_uncond_raw = current_model(
-                        hidden_states=latent_model_input,
+                        hidden_states=latent_model_input.to(model_dtype),
                         timestep=timestep,
                         encoder_hidden_states=negative_prompt_embeds,
                         attention_kwargs=attention_kwargs,
@@ -304,7 +310,7 @@ class Wan22Pipeline(WanPipeline):
                     )
 
                     # Alpha-blend NAG result back with original prediction
-                    noise_pred = noise_nag * nag_alpha + noise_pred * (1 - nag_alpha)
+                    noise_pred = noise_nag.to(model_dtype) * nag_alpha + noise_pred * (1 - nag_alpha)
 
                 # ── Standard CFG (after NAG) ───────────────────────────────
                 if self.do_classifier_free_guidance:
@@ -313,15 +319,15 @@ class Wan22Pipeline(WanPipeline):
                         noise_uncond = noise_uncond_raw
                     else:
                         noise_uncond = current_model(
-                            hidden_states=latent_model_input,
+                            hidden_states=latent_model_input.to(model_dtype),
                             timestep=timestep,
                             encoder_hidden_states=negative_prompt_embeds,
                             attention_kwargs=attention_kwargs,
                             return_dict=False,
                         )[0]
-                    noise_pred = noise_uncond + current_guidance_scale * (
+                    noise_pred = (noise_uncond + current_guidance_scale * (
                         noise_pred - noise_uncond
-                    )
+                    )).to(model_dtype)
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(
