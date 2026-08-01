@@ -1784,7 +1784,7 @@ class LatentCachingMixin:
                         raise e
                     # do first frame
                     is_video = self.dataset_config.auto_frame_count or self.dataset_config.num_frames > 1
-                    if is_video and self.dataset_config.do_i2v:
+                    if self.dataset_config.do_i2v:
                         frames = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
                         if len(frames.shape) == 4:
                             first_frames = frames
