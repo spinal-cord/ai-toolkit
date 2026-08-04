@@ -358,6 +358,20 @@ export default function SimpleJob({
                 placeholder=""
               />
             )}
+            {modelArch?.additionalSections?.includes('model.te_name_or_path') && (
+              <TextInput
+                label="Text Encoder Path"
+                value={jobConfig.config.process[0].model.te_name_or_path ?? ''}
+                docKey="config.process[0].model.te_name_or_path"
+                onChange={(value: string | undefined) => {
+                  if (value?.trim() === '') {
+                    value = undefined;
+                  }
+                  setJobConfig(value, 'config.process[0].model.te_name_or_path');
+                }}
+                placeholder="HF repo ID or local path"
+              />
+            )}
             {modelArch?.additionalSections?.includes('model.low_vram') && (
               <FormGroup label="Options">
                 <Checkbox

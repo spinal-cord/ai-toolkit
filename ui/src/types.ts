@@ -195,6 +195,7 @@ export interface ModelConfig {
   layer_offloading_text_encoder_percent?: number;
   assistant_lora_path?: string;
   unconditional_lora_path?: string;
+  te_name_or_path?: string; // Custom text encoder path (local or HF repo)
   compile?: boolean;
   block_compile?: boolean;
   compile_mode?: 'default' | 'max-autotune' | 'fastest';

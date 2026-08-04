@@ -518,8 +518,12 @@ class Wan21(BaseModel):
                 subfolder = None
                 transformer_path = os.path.join(transformer_path, 'transformer')
         
-        te_path = "ai-toolkit/umt5_xxl_encoder"   
-        if os.path.exists(os.path.join(model_path, 'text_encoder')):
+        te_path = "ai-toolkit/umt5_xxl_encoder"
+        if self.model_config.te_name_or_path is not None:
+            # Check if it's a custom local path or repo
+            te_path = self.model_config.te_name_or_path
+            self.print_and_status_update(f"Using custom text encoder: {te_path}")
+        elif os.path.exists(os.path.join(model_path, 'text_encoder')):
             te_path = model_path
         
         vae_path = self.model_config.extras_name_or_path

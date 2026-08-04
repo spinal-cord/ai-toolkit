@@ -33,6 +33,7 @@ type AdditionalSections =
   | 'model.qie.match_target_res'
   | 'model.assistant_lora_path'
   | 'model.unconditional_lora_path'
+  | 'model.te_name_or_path'
   | 'model.model_kwargs.kv_cache'
   | 'ideogram_4_prompt';
 
@@ -185,7 +186,7 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].datasets[x].fps': [16, undefined],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['datasets.num_frames', 'model.low_vram', 'datasets.auto_frame_count'],
+    additionalSections: ['datasets.num_frames', 'model.low_vram', 'datasets.auto_frame_count', 'model.te_name_or_path'],
   },
   {
     name: 'wan21_i2v:14b480p',
@@ -205,7 +206,7 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].datasets[x].fps': [16, undefined],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.low_vram', 'datasets.auto_frame_count'],
+    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.low_vram', 'datasets.auto_frame_count', 'model.te_name_or_path'],
   },
   {
     name: 'wan21_i2v:14b',
@@ -225,7 +226,7 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].datasets[x].fps': [16, undefined],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.low_vram', 'datasets.auto_frame_count'],
+    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.low_vram', 'datasets.auto_frame_count', 'model.te_name_or_path'],
   },
   {
     name: 'wan21:14b',
@@ -244,7 +245,7 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].datasets[x].fps': [16, undefined],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['datasets.num_frames', 'model.low_vram', 'datasets.auto_frame_count'],
+    additionalSections: ['datasets.num_frames', 'model.low_vram', 'datasets.auto_frame_count', 'model.te_name_or_path'],
   },
   {
     name: 'wan22_14b:t2v',
@@ -281,7 +282,7 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].model.vae_dtype': ['bf16', 'bf16'],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['datasets.num_frames', 'model.low_vram', 'model.multistage', 'model.layer_offloading', 'datasets.auto_frame_count'],
+    additionalSections: ['datasets.num_frames', 'model.low_vram', 'model.multistage', 'model.layer_offloading', 'datasets.auto_frame_count', 'model.te_name_or_path'],
     accuracyRecoveryAdapters: {
       // '3 bit with ARA': 'uint3|ostris/accuracy_recovery_adapters/wan22_14b_t2i_torchao_uint3.safetensors',
       '4 bit with ARA': 'uint4|ostris/accuracy_recovery_adapters/wan22_14b_t2i_torchao_uint4.safetensors',
@@ -329,6 +330,7 @@ export const modelArchs: ModelArch[] = [
       'model.multistage',
       'model.layer_offloading',
       'datasets.auto_frame_count',
+      'model.te_name_or_path',
     ],
     accuracyRecoveryAdapters: {
       '4 bit with ARA': 'uint4|ostris/accuracy_recovery_adapters/wan22_14b_i2v_torchao_uint4.safetensors',
@@ -356,7 +358,7 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].datasets[x].fps': [24, undefined],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.low_vram', 'datasets.do_i2v', 'datasets.auto_frame_count'],
+    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.low_vram', 'datasets.do_i2v', 'datasets.auto_frame_count', 'model.te_name_or_path'],
   },
   {
     name: 'lumina2',
