@@ -141,7 +141,58 @@ class SDTrainer(BaseSDTrainProcess):
             return None
 
         return total_norm_sq.sqrt()
-    
+
+    def _freeze_inactive_expert_loras(self, active_experts):
+        """
+        Freeze inactive expert LoRA params before optimizer.step().
+
+        For Wan 2.2 multistage models, only the active expert's LoRAs should
+        receive gradient updates and weight decay. This sets requires_grad=False
+        on all params of inactive experts so they are completely ignored by the
+        optimizer (AdamW, Adafactor, Automagic3, etc.).
+
+        Args:
+            active_experts: set of active expert IDs (e.g. {"transformer_1"}),
+                           or None if not a multistage model.
+
+        Returns:
+            List of (LoRA_module, frozendict_of_params) tuples for unfreezing.
+        """
+        if active_experts is None:
+            return []
+
+        network = getattr(self, 'network', None)
+        if network is None:
+            return []
+
+        frozen = []
+
+        # Check transformer_1 expert
+        e1_loras = getattr(network, 'unet_loras_expert1', [])
+        if e1_loras and "transformer_1" not in active_experts:
+            for lora in e1_loras:
+                lora.requires_grad_(False)
+                frozen.append((lora, None))
+
+        # Check transformer_2 expert
+        e2_loras = getattr(network, 'unet_loras_expert2', [])
+        if e2_loras and "transformer_2" not in active_experts:
+            for lora in e2_loras:
+                lora.requires_grad_(False)
+                frozen.append((lora, None))
+
+        return frozen
+
+    def _unfreeze_inactive_expert_loras(self, frozen_loras):
+        """
+        Unfreeze previously frozen inactive expert LoRA params after optimizer.step().
+
+        Args:
+            frozen_loras: List of (LoRA_module, ...) returned by _freeze_inactive_expert_loras.
+        """
+        for lora, _ in frozen_loras:
+            lora.requires_grad_(True)
+
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:
             return
@@ -2282,11 +2333,27 @@ class SDTrainer(BaseSDTrainProcess):
                         self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)
                 else:
                     self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
+
+            # Determine which expert is active for this batch (Wan 2.2 multistage).
+            # We'll freeze the inactive expert's LoRA params during optimizer.step()
+            # so they are completely ignored: no weight decay, no updates.
+            active_experts = None
+            if hasattr(self.sd, 'model') and hasattr(self.sd.model, '_active_transformer_name'):
+                active_t = self.sd.model._active_transformer_name  # "transformer_1" or "transformer_2"
+                active_experts = {active_t}
+
+            # Freeze inactive expert LoRAs before optimizer.step()
+            frozen_inactive_loras = self._freeze_inactive_expert_loras(active_experts)
+
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
                 self.optimizer.step()
 
                 self.optimizer.zero_grad(set_to_none=True)
+
+                # Unfreeze inactive expert LoRAs after optimizer.step()
+                self._unfreeze_inactive_expert_loras(frozen_inactive_loras)
+
                 if self.adapter and isinstance(self.adapter, CustomAdapter):
                     self.adapter.post_weight_update()
             if self.ema is not None:
@@ -2295,10 +2362,6 @@ class SDTrainer(BaseSDTrainProcess):
                     # For Wan 2.2 multistage models, only the expert that processed
                     # this batch should have its EMA updated. The other expert's EMA
                     # must remain completely frozen.
-                    active_experts = None
-                    if hasattr(self.sd, 'model') and hasattr(self.sd.model, '_active_transformer_name'):
-                        active_t = self.sd.model._active_transformer_name  # "transformer_1" or "transformer_2"
-                        active_experts = {active_t}
                     self.ema.update(active_experts=active_experts)
 
             # Step LR scheduler only when optimizer steps (not during gradient accumulation)
