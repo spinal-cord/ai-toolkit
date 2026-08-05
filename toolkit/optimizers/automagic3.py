@@ -118,6 +118,10 @@ class Automagic3(torch.optim.Optimizer):
     block_fn : callable, optional
         Function ``(param, group_idx) -> block_id`` for per-block pooling.
         If None, each param group is one block (per_block == per_group).
+    expert_aware : bool
+            If True, per-block pooling uses (group_name, param_index_within
+            group) as the pool ID, giving each layer within each expert its
+            own adaptive LR. Only effective when lr_mode == 'per_block'.
     coupling_lambda : float
         Soft coupling strength for per_tensor_soft mode (default 0.1).
         Pulls each tensor's log-LR toward the group mean.
@@ -144,6 +148,7 @@ class Automagic3(torch.optim.Optimizer):
         fused: bool = True,
         lr_mode: str = 'per_block',
         block_fn: Optional[Callable] = None,
+        expert_aware: bool = False,
         coupling_lambda: float = 0.1,
         vote_ema_beta: float = 0.9,
         state_dtype_fp32: bool = True,
@@ -188,6 +193,8 @@ class Automagic3(torch.optim.Optimizer):
         else:
             # Default: each param group is one block (per_block == per_group)
             self._block_fn = lambda p, gi: gi
+
+        self.expert_aware = expert_aware
 
         self._rebuild_group_index()
         self._hook_handles = []
@@ -298,9 +305,19 @@ class Automagic3(torch.optim.Optimizer):
             pool_id_to_idx = {}
 
             for gi, group in enumerate(self.param_groups):
-                for p in group["params"]:
+                group_name = group.get("name", "")
+                for pi, p in enumerate(group["params"]):
                     if self.lr_mode == 'per_block':
-                        pool_id = self._block_fn(p, gi)
+                        if self.expert_aware:
+                            # Create a unique pool per (expert_group,
+                            # param_index_within_group).  This gives each
+                            # layer within each expert its own adaptive LR,
+                            # which is important for MoE models where
+                            # different blocks (early vs. late layers) often
+                            # need different adaptation rates.
+                            pool_id = (group_name, pi)
+                        else:
+                            pool_id = self._block_fn(p, gi)
                     else:  # per_group
                         pool_id = gi
 
@@ -350,6 +367,11 @@ class Automagic3(torch.optim.Optimizer):
         )
         state["hist_idx"] = 0
         state["hist_fill"] = 0
+        # Track steps since this parameter was last active (had a gradient).
+        # When the inactive expert's sign history ages beyond H steps it is
+        # from a different training phase and would contaminate the vote for
+        # the current phase, so we reset it.
+        state["steps_since_active"] = 0
 
         # Second moment state: fp32 by default for numerical stability on
         # long runs (the original code stored in p.dtype, which accumulated
@@ -374,6 +396,12 @@ class Automagic3(torch.optim.Optimizer):
 
     def _make_backward_hook(self, group):
         def _hook(p: torch.Tensor):
+            # Mark this parameter as active this step so step() can detect
+            # which params did NOT receive a gradient (and increment their
+            # inactivity counter).
+            st = self.state.get(p)
+            if st and "steps_since_active" in st:
+                st["_active_this_step"] = True
             self._update_param(p, group)
 
         return _hook
@@ -433,6 +461,27 @@ class Automagic3(torch.optim.Optimizer):
         # Update-RMS clip (trust region)
         update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
         update.clamp_(-group["clip_threshold"], group["clip_threshold"])
+
+        # --- Inactivity / stale-sign-history guard ---
+        # If this parameter was inactive for >= H steps, the old sign
+        # history is from a different training phase and would contaminate
+        # the vote for the current phase. Reset it.
+        H_hist = state["sign_history"].shape[0]
+        if state["steps_since_active"] >= H_hist:
+            state["sign_history"].zero_()
+            state["hist_idx"] = 0
+            state["hist_fill"] = 0
+            # Also reset vote EMA for this parameter's pool to avoid stale
+            # momentum from the previous training phase.
+            pi = (
+                self._param_pool_index.get(p)
+                if self._param_pool_index is not None
+                else None
+            )
+            if pi is not None and self._pool_vote_ema[pi] is not None:
+                self._pool_vote_ema[pi] = None  # Re-init on next vote
+
+        state["steps_since_active"] = 0  # Reset counter since we're active now
 
         # --- Direction-consistency vote ---
         cur_bits = update.gt(0.0)
@@ -519,8 +568,30 @@ class Automagic3(torch.optim.Optimizer):
                         p.grad = accum
                         del p._accum_grad
                     if p.grad is None:
+                        # Increment inactivity counter for params without
+                        # gradients.
+                        st = self.state.get(p)
+                        if st and "steps_since_active" in st:
+                            st["steps_since_active"] += 1
                         continue
                     self._update_param(p, group)
+        else:
+            # In fused mode, backward hooks mark active params via the
+            # _active_this_step flag. Any param without that flag was not
+            # active this step.
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if not p.requires_grad:
+                        continue
+                    st = self.state.get(p)
+                    if st is None or len(st) == 0:
+                        continue
+                    if st.get("_active_this_step", False):
+                        st["_active_this_step"] = False  # Reset flag
+                    else:
+                        st["steps_since_active"] = (
+                            st.get("steps_since_active", 0) + 1
+                        )
         self._apply_votes()
         return loss
 
@@ -744,6 +815,18 @@ class Automagic3(torch.optim.Optimizer):
                     )
                     st["hist_idx"] = 0
                     st["hist_fill"] = 0
+
+        # Ensure new state fields exist for previously-saved checkpoints
+        # that predate the inactivity-tracking addition.
+        for group in self.param_groups:
+            for p in group["params"]:
+                st = self.state.get(p)
+                if st is None:
+                    continue
+                if "steps_since_active" not in st:
+                    st["steps_since_active"] = 0
+                if "_active_this_step" in st:
+                    del st["_active_this_step"]
 
         # Rebuild pool index (parent replaced group dicts)
         self._rebuild_group_index()

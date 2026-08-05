@@ -124,7 +124,21 @@ def get_optimizer(
         optimizer = Automagic2(params, lr=torch.tensor(learning_rate), **optimizer_params)
     elif lower_type == 'automagic3':
         from toolkit.optimizers.automagic3 import Automagic3
-        optimizer = Automagic3(params, lr=torch.tensor(learning_rate), **optimizer_params)
+        # Detect if this is a multistage/MoE training by checking param
+        # group names. When expert-aware mode is enabled, each layer
+        # within each expert gets its own adaptive LR, which is important
+        # for Wan 2.2 14B MoE models where different blocks (early vs.
+        # late layers) often need different adaptation rates.
+        is_moe = any(
+            isinstance(p, dict) and p.get("name", "") in ("high_noise_loras", "low_noise_loras")
+            for p in params
+        ) if isinstance(params, list) else False
+        optimizer = Automagic3(
+            params,
+            lr=torch.tensor(learning_rate),
+            expert_aware=is_moe,
+            **optimizer_params,
+        )
     else:
         raise ValueError(f'Unknown optimizer type {optimizer_type}')
     return optimizer
