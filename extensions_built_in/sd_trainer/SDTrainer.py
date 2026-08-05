@@ -2291,7 +2291,15 @@ class SDTrainer(BaseSDTrainProcess):
                     self.adapter.post_weight_update()
             if self.ema is not None:
                 with self.timer('ema_update'):
-                    self.ema.update()
+                    # Determine active experts for per-expert EMA updates.
+                    # For Wan 2.2 multistage models, only the expert that processed
+                    # this batch should have its EMA updated. The other expert's EMA
+                    # must remain completely frozen.
+                    active_experts = None
+                    if hasattr(self.sd, 'model') and hasattr(self.sd.model, '_active_transformer_name'):
+                        active_t = self.sd.model._active_transformer_name  # "transformer_1" or "transformer_2"
+                        active_experts = {active_t}
+                    self.ema.update(active_experts=active_experts)
 
             # Step LR scheduler only when optimizer steps (not during gradient accumulation)
             # Scheduler total_iters is adjusted for gradient accumulation in BaseSDTrainProcess

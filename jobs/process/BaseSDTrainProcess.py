@@ -786,14 +786,30 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.train_config.ema_config.use_ema:
             # our params are in groups. We need them as a single iterable
             params = []
+            # Build expert_map: for each param, which expert it belongs to.
+            # Used for Wan 2.2: only active expert's EMA updates.
+            expert_map = []
             for group in self.optimizer.param_groups:
+                group_name = group.get('name', '')
+                # Map group names to expert IDs based on kohya_lora.py naming:
+                # - "high_noise_loras..." -> transformer_1
+                # - "low_noise_loras..." -> transformer_2
+                # - everything else -> shared (None)
+                expert_id = None
+                if group_name.startswith('high_noise_loras'):
+                    expert_id = 'transformer_1'
+                elif group_name.startswith('low_noise_loras'):
+                    expert_id = 'transformer_2'
                 for param in group['params']:
                     params.append(param)
+                    expert_map.append(expert_id)
+
             self.ema = ExponentialMovingAverage(
                 params,
                 decay=self.train_config.ema_config.ema_decay,
                 use_feedback=self.train_config.ema_config.use_feedback,
                 param_multiplier=self.train_config.ema_config.param_multiplier,
+                expert_map=expert_map,
             )
 
     def before_dataset_load(self):

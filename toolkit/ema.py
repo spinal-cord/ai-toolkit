@@ -47,7 +47,10 @@ class ExponentialMovingAverage:
             use_num_updates: bool = False,
             # feeds back the decat to the parameter
             use_feedback: bool = False,
-            param_multiplier: float = 1.0
+            param_multiplier: float = 1.0,
+            # Optional: list[expert_id | None] mapping each param index to its expert.
+            # Used for Wan 2.2 multistage EMA isolation: only active expert's EMA updates.
+            expert_map: Optional[list] = None,
     ):
         if parameters is None:
             raise ValueError("parameters must be provided")
@@ -70,6 +73,12 @@ class ExponentialMovingAverage:
         # is kept, no references to the model or its parameters will be
         # maintained, and the model will be cleaned up.
         self._params_refs = [weakref.ref(p) for p in parameters]
+
+        # Expert membership map for per-expert EMA isolation (Wan 2.2).
+        # expert_map[i] = expert_id means param i belongs to that expert.
+        # None means shared/not tied to any expert.
+        self._expert_map: Optional[list] = expert_map
+        self._has_expert_map = (expert_map is not None) and any(e is not None for e in expert_map)
 
     def _get_parameters(
             self,
@@ -99,7 +108,10 @@ class ExponentialMovingAverage:
 
     def update(
             self,
-            parameters: Optional[Iterable[torch.nn.Parameter]] = None
+            parameters: Optional[Iterable[torch.nn.Parameter]] = None,
+            # For multistage models: only update EMA for params belonging to this expert.
+            # If None (or expert_map not present), updates all params (legacy behavior).
+            active_experts: Optional[set] = None,
     ) -> None:
         """
         Update currently maintained parameters.
@@ -112,6 +124,10 @@ class ExponentialMovingAverage:
                 parameters used to initialize this object. If `None`, the
                 parameters with which this `ExponentialMovingAverage` was
                 initialized will be used.
+            active_experts: Set of expert IDs to update EMA for. Params not belonging
+                to any of these experts are SKIPPED entirely (shadow params frozen).
+                For Wan 2.2, this ensures each expert's EMA is completely independent
+                and only tracks its own training trajectory.
         """
         parameters = self._get_parameters(parameters)
         decay = self.decay
@@ -122,8 +138,19 @@ class ExponentialMovingAverage:
                 (1 + self.num_updates) / (10 + self.num_updates)
             )
         one_minus_decay = 1.0 - decay
+
+        # Determine update mask based on active_experts
+        # If active_experts is provided and we have an expert_map, only update
+        # params that belong to active experts.
+        should_update_all = (active_experts is None) or (not self._has_expert_map)
         with torch.no_grad():
-            for s_param, param in zip(self.shadow_params, parameters):
+            for i, (s_param, param) in enumerate(zip(self.shadow_params, parameters)):
+                if not should_update_all:
+                    expert_id = self._expert_map[i]
+                    # Update if: param has no expert tag (shared), OR param's expert is active
+                    if expert_id is not None and expert_id not in active_experts:
+                        continue  # Skip inactive expert's params
+
                 s_param_float = s_param.float()
                 if s_param.dtype != torch.float32:
                     s_param_float = s_param_float.to(torch.float32)
