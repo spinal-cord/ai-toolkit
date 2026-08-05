@@ -59,6 +59,16 @@ const loraInitOptions: SelectOption[] = [
   { value: 'small_noise', label: 'Small Noise (std=0.001)' },
 ];
 
+// Wan 2.2 Tensor Types Configuration
+const WAN22_TENSOR_TYPES = {
+  self_attn: { name: 'Self Attention', maxRank: 5120, description: 'attn1 q/k/v/o projections' },
+  cross_attn: { name: 'Cross Attention', maxRank: 5120, description: 'attn2 q/k/v/o projections' },
+  ffn: { name: 'Feed Forward', maxRank: 5120, description: 'FFN projections' },
+  text_embedding: { name: 'Text Embedding', maxRank: 4096, description: 'text embedding linear layers' },
+  time_embedding: { name: 'Time Embedding', maxRank: 256, description: 'time embedding linear layers' },
+  head: { name: 'Output Head', maxRank: 64, description: 'output projection' },
+};
+
 const schedulerOptions: SelectOption[] = [
   { value: 'euler', label: 'Euler' },
   { value: 'ddim', label: 'DDIM' },
@@ -775,6 +785,134 @@ export default function SimpleJob({
                   );
                 })()}
               </>
+            )}
+            {/* Wan 2.2 Tensor-Type-Specific LoRA Configuration */}
+            {modelArch?.name?.includes('wan22') && jobConfig.config.process[0].network?.type == 'lora' && (
+              <div style={{ marginTop: '16px', paddingTop: '16px', borderTop: '1px solid var(--border)' }}>
+                <div style={{ fontWeight: 600, marginBottom: '8px', color: 'var(--accent)' }}>Wan 2.2 Tensor-Type-Specific Ranks</div>
+                <div style={{ fontSize: '11px', color: 'var(--muted)', marginBottom: '12px' }}>
+                  Control which tensor types are trained and their individual ranks. Leave a rank empty to use the Linear Rank above for that type.
+                  Set rank to null/0 or uncheck "Train" to skip that type. Check "Full" for full weight training (no LoRA).
+                </div>
+                
+                {/* Wan 2.2 Tensor Types Grid */}
+                <div style={{ display: 'grid', gap: '8px' }}>
+                  {Object.entries(WAN22_TENSOR_TYPES).map(([typeKey, typeInfo]) => {
+                    const wan22Types = jobConfig.config.process[0].network?.wan22_tensor_types || {};
+                    const typeConfig = wan22Types[typeKey] || {};
+                    const rank = typeConfig.rank !== undefined ? typeConfig.rank : '';
+                    const full = typeConfig.full || false;
+                    const maxRank = typeInfo.maxRank;
+                    
+                    return (
+                      <div key={typeKey} style={{ 
+                        display: 'flex', 
+                        alignItems: 'center', 
+                        gap: '8px',
+                        padding: '8px',
+                        background: 'var(--bg-secondary)',
+                        borderRadius: '6px'
+                      }}>
+                        <div style={{ flex: '0 0 120px', fontWeight: 500, fontSize: '13px' }}>
+                          {typeInfo.name}
+                          <div style={{ fontSize: '10px', color: 'var(--muted)' }}>{typeInfo.description}</div>
+                        </div>
+                        <div style={{ flex: '0 0 110px' }}>
+                          <NumberInput
+                            label={null}
+                            value={rank === null || rank === 0 ? '' : (rank !== undefined ? rank : '')}
+                            onChange={value => {
+                              let newRank = value;
+                              if (value === '' || value === null || value === undefined) {
+                                newRank = null;  // empty = use linear rank
+                              } else if (value === 0) {
+                                newRank = 0;  // 0 = skip this type
+                              } else {
+                                newRank = parseInt(value);
+                              }
+                              const newTypes = { ...wan22Types, [typeKey]: { ...typeConfig, rank: newRank, alpha: newRank } };
+                              setJobConfig(newTypes, 'config.process[0].network.wan22_tensor_types');
+                            }}
+                            placeholder="rank"
+                            min={0}
+                            max={maxRank}
+                            style={{ height: '28px' }}
+                          />
+                        </div>
+                        <div style={{ flex: '0 0 140px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                          <button
+                            onClick={() => {
+                              const newTypes = { ...wan22Types, [typeKey]: { ...typeConfig, rank: maxRank, alpha: maxRank, full: false } };
+                              setJobConfig(newTypes, 'config.process[0].network.wan22_tensor_types');
+                            }}
+                            style={{
+                              padding: '2px 6px',
+                              fontSize: '10px',
+                              cursor: 'pointer',
+                              background: 'var(--accent)',
+                              color: 'white',
+                              border: 'none',
+                              borderRadius: '4px'
+                            }}
+                          >
+                            Max ({maxRank})
+                          </button>
+                          <button
+                            onClick={() => {
+                              const newTypes = { ...wan22Types, [typeKey]: { ...typeConfig, rank: null, alpha: null, full: false } };
+                              setJobConfig(newTypes, 'config.process[0].network.wan22_tensor_types');
+                            }}
+                            style={{
+                              padding: '2px 6px',
+                              fontSize: '10px',
+                              cursor: 'pointer',
+                              background: 'var(--bg-tertiary)',
+                              color: 'var(--text)',
+                              border: '1px solid var(--border)',
+                              borderRadius: '4px'
+                            }}
+                          >
+                            Default
+                          </button>
+                        </div>
+                        <div style={{ flex: '0 0 50px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                          <input
+                            type="checkbox"
+                            checked={full}
+                            onChange={e => {
+                              const newTypes = { ...wan22Types, [typeKey]: { ...typeConfig, full: e.target.checked } };
+                              setJobConfig(newTypes, 'config.process[0].network.wan22_tensor_types');
+                            }}
+                            title="Full weight training (no LoRA)"
+                          />
+                          <label style={{ fontSize: '10px', color: 'var(--muted)' }}>Full</label>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                
+                {/* Clear Wan 2.2 Config Button */}
+                <button
+                  onClick={() => {
+                    setJobConfig(null, 'config.process[0].network.wan22_tensor_types');
+                    setJobConfig(null, 'config.process[0].network.wan22_enabled_types');
+                  }}
+                  style={{
+                    marginTop: '8px',
+                    padding: '4px 8px',
+                    fontSize: '10px',
+                    cursor: 'pointer',
+                    background: 'transparent',
+                    color: 'var(--muted)',
+                    border: '1px dashed var(--border)',
+                    borderRadius: '4px',
+                    width: '100%'
+                  }}
+                >
+                  Clear Wan 2.2 Tensor Type Config (use Linear Rank for all)
+                </button>
+              </div>
             )}
           </Card>
           {!disableSections.includes('slider') && (

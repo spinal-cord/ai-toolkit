@@ -1,5 +1,6 @@
 import os
 import time
+import re
 from typing import List, Optional, Literal, Tuple, Union, TYPE_CHECKING, Dict
 import random
 
@@ -10,7 +11,7 @@ from toolkit.audio.album_artwork import add_album_artwork
 from toolkit.prompt_utils import PromptEmbeds
 from torchao.quantization.quant_primitives import _DTYPE_TO_BIT_WIDTH
 
-ImgExt = Literal['jpg', 'png', 'webp', 'jxl']
+ImgExt = Literal['jpg', 'png', 'webp', 'jxl', 'mp4']
 
 SaveFormat = Literal['safetensors', 'diffusers']
 
@@ -19,6 +20,117 @@ if TYPE_CHECKING:
     from toolkit.logging_aitk import EmptyLogger
 else:
     EmptyLogger = None
+
+# =============================================================================
+# Wan 2.2 14B Tensor Type Configuration
+# =============================================================================
+# These define the tensor types in Wan 2.2 and their maximum LoRA ranks.
+# The max_rank is the minimum dimension of the weight tensor, which limits
+# the maximum effective rank of a LoRA adapter for that layer.
+#
+# Tensors are identified by their LOADED (diffusers) names, not their
+# original checkpoint names. Wan 2.2 remaps tensor names during loading:
+#   - self_attn -> attn1 with to_q, to_k, to_v, to_out.0
+#   - cross_attn -> attn2 with to_q, to_k, to_v, to_out.0
+#   - ffn.0 -> ffn.net.0.proj
+#   - ffn.2 -> ffn.net.2
+#   - text_embedding -> condition_embedder.text_embedder.linear_1/2
+#   - time_embedding -> condition_embedder.time_embedder.linear_1/2
+#   - head -> proj_out
+#   - patch_embedding stays as patch_embedding
+#
+# A rank of -1 means the layer should use full weight training (no LoRA)
+# because the tensor shape doesn't support low-rank decomposition well.
+# =============================================================================
+
+WAN22_TENSOR_TYPES: Dict[str, Dict[str, Union[int, str, List[str]]]] = {
+    'self_attn': {
+        'max_rank': 5120,
+        'description': 'Self-attention (attn1) q/k/v/o projections',
+        'name_patterns': [r'attn1\.to_q', r'attn1\.to_k', r'attn1\.to_v', r'attn1\.to_out\.0'],
+    },
+    'cross_attn': {
+        'max_rank': 5120,
+        'description': 'Cross-attention (attn2) q/k/v/o projections',
+        'name_patterns': [r'attn2\.to_q', r'attn2\.to_k', r'attn2\.to_v', r'attn2\.to_out\.0'],
+    },
+    'ffn': {
+        'max_rank': 5120,
+        'description': 'Feed-forward network projections',
+        'name_patterns': [r'ffn\.net\.0\.proj', r'ffn\.net\.2'],
+    },
+    'text_embedding': {
+        'max_rank': 4096,
+        'description': 'Text embedding projections (linear_1/linear_2)',
+        'name_patterns': [r'condition_embedder\.text_embedder\.linear_1', r'condition_embedder\.text_embedder\.linear_2'],
+    },
+    'time_embedding': {
+        'max_rank': 256,
+        'description': 'Time embedding projections (linear_1/linear_2)',
+        'name_patterns': [r'condition_embedder\.time_embedder\.linear_1', r'condition_embedder\.time_embedder\.linear_2'],
+    },
+    'head': {
+        'max_rank': 64,
+        'description': 'Output head projection',
+        'name_patterns': [r'proj_out'],
+    },
+    # Layers that typically should be full weight, not LoRA
+    'patch_embedding': {
+        'max_rank': -1,  # -1 means full weight only
+        'description': 'Patch embedding (conv-like, full weight recommended)',
+        'name_patterns': [r'patch_embedding'],
+    },
+    'modulation': {
+        'max_rank': -1,  # -1 means full weight only
+        'description': 'Modulation / scale_shift_table parameters',
+        'name_patterns': [r'scale_shift_table'],
+    },
+    'norm': {
+        'max_rank': -1,  # -1 means full weight only
+        'description': 'Normalization layer parameters',
+        'name_patterns': [r'norm\d+\.weight', r'norm\d+\.bias'],
+    },
+    'time_projection': {
+        'max_rank': -1,  # -1 means full weight only
+        'description': 'Time projection parameters',
+        'name_patterns': [r'condition_embedder\.time_proj'],
+    },
+}
+
+WAN22_LINEAR_TENSOR_TYPES = [k for k, v in WAN22_TENSOR_TYPES.items() if v['max_rank'] > 0]
+WAN22_FULL_TENSOR_TYPES = [k for k, v in WAN22_TENSOR_TYPES.items() if v['max_rank'] == -1]
+
+
+def get_wan22_tensor_type_from_name(layer_name: str) -> Optional[str]:
+    """
+    Determine the Wan 2.2 tensor type from a layer name (diffusers format).
+    Returns the tensor type key (e.g., 'self_attn', 'ffn') or None if not matched.
+    """
+    for tensor_type, config in WAN22_TENSOR_TYPES.items():
+        for pattern in config['name_patterns']:
+            if re.search(pattern, layer_name):
+                return tensor_type
+    return None
+
+
+def get_wan22_max_rank_for_type(tensor_type: str) -> int:
+    """
+    Get the maximum LoRA rank for a Wan 2.2 tensor type.
+    Returns -1 for types that should use full weight training.
+    """
+    if tensor_type in WAN22_TENSOR_TYPES:
+        return WAN22_TENSOR_TYPES[tensor_type]['max_rank']
+    return -1
+
+
+def is_wan22_tensor_type_enabled(tensor_type: str, enabled_types: Optional[List[str]]) -> bool:
+    """
+    Check if a tensor type is enabled for training.
+    If enabled_types is None or empty, all types are enabled by default.
+    """
+    if enabled_types is None or len(enabled_types) == 0:
+        return True
+    return tensor_type in enabled_types
 
 class SaveConfig:
     def __init__(self, **kwargs):
@@ -106,9 +218,9 @@ class SampleConfig:
         # flow matching shift applied during generation (e.g., 8.0 gives the
         # desired 1:1 high/low noise step ratio).
         self.sampling_flow_shift: Optional[float] = kwargs.get('sampling_flow_shift', None)
-        if self.num_frames > 1 and self.ext not in ['webp']:
-            print("Changing sample extention to animated webp")
-            self.ext = 'webp'
+        if self.num_frames > 1 and self.ext not in ['webp', 'mp4']:
+            print("Changing sample extension to mp4")
+            self.ext = 'mp4'
         
         prompts: list[str] = kwargs.get('prompts', [])
         
@@ -251,6 +363,44 @@ class NetworkConfig:
         # will create diffirential full weight modules for layers not conv/linear
         # only useful in very special cases. 
         self.all_layers = kwargs.get('all_layers', False)
+        
+        # =====================================================================
+        # Wan 2.2 Tensor-Type-Specific LoRA Configuration
+        # =====================================================================
+        # Allows fine-grained control over which tensor types are trained
+        # and what rank/alpha each type should use. This is especially useful
+        # for Wan 2.2 14B where different layer types have different optimal ranks.
+        #
+        # wan22_tensor_types:
+        #   dict mapping tensor type -> config, e.g.:
+        #     wan22_tensor_types:
+        #       self_attn:
+        #         rank: 256
+        #         alpha: 256
+        #         full: false  # use LoRA instead of full weight
+        #       cross_attn:
+        #         rank: 128
+        #         alpha: 128
+        #       ffn:
+        #         rank: null  # null means skip (no training)
+        #       text_embedding:
+        #         rank: 128
+        #         alpha: 128
+        #       patch_embedding:
+        #         rank: 128
+        #         alpha: 128
+        #
+        # If wan22_tensor_types is specified, only the types listed are trained
+        # (unless enabled_types is also used). Types not listed are skipped.
+        # If wan22_tensor_types is not specified, the legacy `linear`, `conv`,
+        # `all_layers`, and `full_if_contains` settings are used.
+        # =====================================================================
+        self.wan22_tensor_types: Optional[Dict[str, Dict]] = kwargs.get('wan22_tensor_types', None)
+        
+        # List of tensor type names to enable. If wan22_tensor_types is specified
+        # but you want to only train a subset, use this.
+        # Default: None means all types in wan22_tensor_types are enabled.
+        self.wan22_enabled_types: Optional[List[str]] = kwargs.get('wan22_enabled_types', None)
 
 
 AdapterTypes = Literal['t2i', 'ip', 'ip+', 'clip', 'ilora', 'photo_maker', 'control_net', 'control_lora', 'i2v']
@@ -1264,9 +1414,12 @@ class GenerateImageConfig:
             # video
             if self.num_frames == 1:
                 raise ValueError(f"Expected 1 img but got a list {len(image)}")
-            if self.num_frames > 1 and self.output_ext not in ['webp']:
-                self.output_ext = 'webp'
-            if self.output_ext == 'webp':
+            if self.num_frames > 1 and self.output_ext not in ['webp', 'mp4']:
+                self.output_ext = 'mp4'
+            if self.output_ext == 'mp4':
+                # save as mp4 with libx264 crf 24
+                self._save_video_mp4(image, count, max_count)
+            elif self.output_ext == 'webp':
                 # save as animated webp
                 duration = 1000 // self.fps  # Convert fps to milliseconds per frame
                 image[0].save(
@@ -1298,6 +1451,55 @@ class GenerateImageConfig:
             # do prompt file
             if self.add_prompt_file:
                 self.save_prompt_file(count, max_count)
+
+    def _save_video_mp4(self, frames, count: int = 0, max_count=0):
+        """Save frames as MP4 video using libx264 with CRF 24."""
+        try:
+            import av
+        except ImportError:
+            raise ImportError(
+                "PyAV is required for MP4 video output. Install with: pip install av"
+            )
+        import numpy as np
+        from PIL import Image
+
+        output_path = self.get_image_path(count, max_count)
+        fps = max(1, self.fps)  # Ensure fps is at least 1
+
+        # Get dimensions from first frame
+        first_frame = frames[0]
+        width, height = first_frame.size
+
+        # Ensure dimensions are divisible by 2 (required by x264)
+        width = width - (width % 2)
+        height = height - (height % 2)
+
+        # Resize frames if needed
+        if width != first_frame.size[0] or height != first_frame.size[1]:
+            frames = [f.resize((width, height), Image.Resampling.LANCZOS) for f in frames]
+
+        # Open container for writing
+        container = av.open(output_path, mode='w')
+
+        # Add video stream with libx264
+        stream = container.add_stream('libx264', rate=fps)
+        stream.width = width
+        stream.height = height
+        stream.pix_fmt = 'yuv420p'  # Required for compatibility
+        stream.options = {'crf': '24'}  # Constant Rate Factor for quality
+
+        # Encode each frame
+        for frame_pil in frames:
+            frame_np = np.array(frame_pil.convert('RGB'))
+            frame = av.VideoFrame.from_ndarray(frame_np, format='rgb24')
+            for packet in stream.encode(frame):
+                container.mux(packet)
+
+        # Flush encoder
+        for packet in stream.encode():
+            container.mux(packet)
+
+        container.close()
 
     def save_prompt_file(self, count: int = 0, max_count=0):
         # save prompt file

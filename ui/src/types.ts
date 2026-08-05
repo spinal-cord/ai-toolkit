@@ -60,6 +60,21 @@ export interface GPUApiResponse {
  * Training configuration
  */
 
+export interface Wan22TensorTypeConfig {
+  rank?: number | null;
+  alpha?: number | null;
+  full?: boolean;
+}
+
+export interface Wan22TensorTypesConfig {
+  self_attn?: Wan22TensorTypeConfig;
+  cross_attn?: Wan22TensorTypeConfig;
+  ffn?: Wan22TensorTypeConfig;
+  text_embedding?: Wan22TensorTypeConfig;
+  time_embedding?: Wan22TensorTypeConfig;
+  head?: Wan22TensorTypeConfig;
+}
+
 export interface NetworkConfig {
   type: string;
   linear: number;
@@ -78,6 +93,9 @@ export interface NetworkConfig {
   high_noise_lora_b_init?: string | { method: string; std?: number };
   low_noise_lora_a_init?: string | { method: string; std?: number };
   low_noise_lora_b_init?: string | { method: string; std?: number };
+  // Wan 2.2 tensor type specific configuration
+  wan22_tensor_types?: Wan22TensorTypesConfig;
+  wan22_enabled_types?: string[];
 }
 
 export interface SaveConfig {

@@ -11,7 +11,7 @@ from diffusers import UNet2DConditionModel, PixArtTransformer2DModel, AuraFlowTr
 from transformers import CLIPTextModel
 from toolkit.models.lokr import LokrModule
 
-from .config_modules import NetworkConfig
+from .config_modules import NetworkConfig, get_wan22_tensor_type_from_name, WAN22_TENSOR_TYPES, is_wan22_tensor_type_enabled
 from .lorm import count_parameters
 from .network_mixins import ToolkitNetworkMixin, ToolkitModuleMixin, ExtractableModuleMixin
 
@@ -551,11 +551,36 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                         else:
                             lora_name = lora_name.replace(".", "_")
 
+                        # =====================================================================
+                        # Wan 2.2 Tensor-Type-Specific Configuration (compute early)
+                        # =====================================================================
+                        wan22_config_for_layer = None
+                        wan22_skip_layer = False
+                        wan22_full_layer = False
+                        if self.network_config is not None and hasattr(self.network_config, 'wan22_tensor_types'):
+                            wan22_types_cfg = self.network_config.wan22_tensor_types
+                            if wan22_types_cfg is not None:
+                                tensor_type = get_wan22_tensor_type_from_name(clean_name)
+                                if tensor_type is not None:
+                                    # Check if this tensor type is enabled
+                                    enabled_types = getattr(self.network_config, 'wan22_enabled_types', None)
+                                    if not is_wan22_tensor_type_enabled(tensor_type, enabled_types):
+                                        wan22_skip_layer = True
+                                    elif tensor_type in wan22_types_cfg:
+                                        wan22_config_for_layer = wan22_types_cfg[tensor_type]
+                                        wan22_full = wan22_config_for_layer.get('full', False)
+                                        wan22_rank = wan22_config_for_layer.get('rank', None)
+                                        if wan22_full:
+                                            wan22_full_layer = True
+                                        elif wan22_rank is None or wan22_rank == 0:
+                                            wan22_skip_layer = True
+
                         # decide if this should be a full weight module instead of a normal lora.
                         # - all_layers: every remaining weight bearing leaf that isn't linear/conv
                         #   (norm layers, embeddings, stray biases, etc)
                         # - full_if_contains: any matching layer, INCLUDING linear/conv, overriding the
                         #   normal lora for it
+                        # - wan22_tensor_types.full: Wan 2.2 tensor type specific full weight training
                         all_layers = self.network_config is not None and getattr(self.network_config, 'all_layers', False)
                         is_leaf_with_weight = (
                             len(list(child_module.children())) == 0
@@ -565,8 +590,10 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                             any([word in clean_name for word in self.full_if_contains])
                             or any([word in lora_name for word in self.full_if_contains])
                         )
+                        # is_full_layer is now also True if Wan 2.2 config specifies full=True for this tensor type
                         is_full_layer = is_leaf_with_weight and (
                             matches_full_if_contains
+                            or wan22_full_layer
                             or (all_layers and not is_linear and not is_conv2d)
                         )
 
@@ -616,6 +643,10 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                                     if "single_blocks" not in lora_name and "double_blocks" not in lora_name:
                                         skip = True
 
+                        # If Wan 2.2 config says to skip this layer, mark it
+                        if wan22_skip_layer:
+                            skip = True
+
                         if (is_linear or is_conv2d) and not skip and not is_full_layer:
 
                             if self.only_if_contains is not None:
@@ -625,13 +656,33 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                             dim = None
                             alpha = None
 
-                            if modules_dim is not None:
-                                # モジュール指定あり
+                            # =====================================================================
+                            # Wan 2.2 Tensor-Type-Specific LoRA Rank
+                            # =====================================================================
+                            if wan22_config_for_layer is not None:
+                                wan22_rank = wan22_config_for_layer.get('rank', None)
+                                wan22_alpha = wan22_config_for_layer.get('alpha', wan22_rank)
+                                
+                                # Enforce max rank based on tensor type
+                                tensor_type = get_wan22_tensor_type_from_name(clean_name)
+                                if tensor_type in WAN22_TENSOR_TYPES:
+                                    max_rank = WAN22_TENSOR_TYPES[tensor_type]['max_rank']
+                                    if max_rank > 0 and wan22_rank is not None:
+                                        if wan22_rank > max_rank:
+                                            print(f"Warning: Wan 2.2 tensor type '{tensor_type}' rank {wan22_rank} exceeds max rank {max_rank}. Clamping to {max_rank}.")
+                                            wan22_rank = max_rank
+                                            wan22_alpha = wan22_rank if wan22_alpha > max_rank else wan22_alpha
+                                
+                                dim = wan22_rank
+                                alpha = wan22_alpha
+                            
+                            if modules_dim is not None and dim is None:
+                                # モジュール指定あり (fallback to modules_dim if not set by wan22 config)
                                 if lora_name in modules_dim:
                                     dim = modules_dim[lora_name]
                                     alpha = modules_alpha[lora_name]
-                            else:
-                                # 通常、すべて対象とする
+                            elif dim is None:
+                                # 通常、すべて対象とする (fallback to legacy behavior)
                                 if is_linear or is_conv2d_1x1:
                                     dim = self.lora_dim
                                     alpha = self.alpha

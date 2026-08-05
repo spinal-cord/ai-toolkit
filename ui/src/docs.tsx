@@ -538,6 +538,82 @@ const docs: { [key: string]: ConfigDoc } = {
     ),
   },
 
+  // --- Wan 2.2 Tensor-Type-Specific LoRA Configuration docs ---
+  'config.process[0].network.wan22_tensor_types': {
+    title: 'Wan 2.2 Tensor-Type-Specific Ranks',
+    description: (
+      <>
+        Fine-grained control over which tensor types in Wan 2.2 are trained and their individual LoRA ranks.
+        <br />
+        <br />
+        <strong>Tensor Types and Their Roles:</strong>
+        <ul className="list-disc pl-5 mt-2 space-y-1">
+          <li>
+            <strong>Self Attention (self_attn)</strong> — Internal attention within the transformer blocks. Handles
+            temporal and spatial coherence. Max rank: 5120.
+          </li>
+          <li>
+            <strong>Cross Attention (cross_attn)</strong> — Connects visual features to text prompts. Critical for
+            following instructions. Max rank: 5120.
+          </li>
+          <li>
+            <strong>Feed Forward (ffn)</strong> — Feature transformation layers. Adds representational power.
+            Max rank: 5120.
+          </li>
+          <li>
+            <strong>Text Embedding (text_embedding)</strong> — Converts text encodings to model space. Important for
+            prompt adherence. Max rank: 4096.
+          </li>
+          <li>
+            <strong>Time Embedding (time_embedding)</strong> — Encodes timestep information for the denoising process.
+            Max rank: 256.
+          </li>
+          <li>
+            <strong>Output Head (head)</strong> — Final projection layer. Usually less important for style.
+            Max rank: 64.
+          </li>
+        </ul>
+        <br />
+        <strong>Configuration Options:</strong>
+        <ul className="list-disc pl-5 mt-2 space-y-1">
+          <li>
+            <strong>Rank:</strong> Set the LoRA rank for each tensor type. Leave empty to use the global Linear Rank.
+            Setting to 0 or null skips that tensor type entirely.
+          </li>
+          <li>
+            <strong>Max Button:</strong> Quickly sets the rank to the maximum supported value for that tensor type.
+          </li>
+          <li>
+            <strong>Full Checkbox:</strong> Use full weight training (not LoRA) for this tensor type. This is useful
+            for small layers like the output head or time embedding where full training is more efficient.
+          </li>
+          <li>
+            <strong>Default Button:</strong> Resets to using the global Linear Rank for that type.
+          </li>
+        </ul>
+        <br />
+        <strong>Training Scenarios:</strong>
+        <ul className="list-disc pl-5 mt-2 space-y-1">
+          <li>
+            <em>Style LoRA:</em> Train self_attn + cross_attn with moderate rank (128-512), skip ffn.
+          </li>
+          <li>
+            <em>Character LoRA:</em> Train all main layers (self_attn, cross_attn, ffn) with equal rank.
+          </li>
+          <li>
+            <em>Prompt Enhancement:</em> Train text_embedding at full rank, skip most others.
+          </li>
+          <li>
+            <em>Minimal:</em> Train only one tensor type (e.g., text_embedding at max rank) for specialized effects.
+          </li>
+        </ul>
+        <br />
+        <em>Note: The rank is automatically clamped to the maximum supported value for each tensor type based on
+        the model's architecture (Wan 2.2 14B).</em>
+      </>
+    ),
+  },
+
   // --- Optimizer docs ---
   optimizer: {
     title: 'Optimizer',
