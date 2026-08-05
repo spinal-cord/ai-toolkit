@@ -153,6 +153,9 @@ class FileItemDTO(
         self.flip_y: bool = kwargs.get("flip_x", False)
         self.augments: List[str] = self.dataset_config.augments
         self.loss_multiplier: float = self.dataset_config.loss_multiplier
+        # Track whether this item is being used in I2V mode (with first frame conditioning)
+        # vs T2V mode (without first frame conditioning). Used when dataset has both do_i2v and do_t2v.
+        self.is_i2v_mode: bool = True  # Default to I2V mode
 
         self.network_weight: float = self.dataset_config.network_weight
         self.is_reg = self.dataset_config.is_reg
@@ -226,19 +229,20 @@ class DataLoaderBatchDTO:
                 self.latents = torch.cat(
                     [x.get_latent().unsqueeze(0) for x in self.file_items]
                 )
-                if any(
-                    [x._cached_first_frame_latent is not None for x in self.file_items]
-                ):
-                    self.first_frame_latents = torch.cat(
-                        [
-                            x._cached_first_frame_latent.unsqueeze(0)
-                            if x._cached_first_frame_latent is not None
-                            else torch.zeros_like(
-                                self.file_items[0]._cached_first_frame_latent
-                            ).unsqueeze(0)
-                            for x in self.file_items
-                        ]
-                    )
+                # For mixed I2V/T2V batches, only I2V items should have first_frame_latents
+                # T2V items have do_i2v=False so their cached first frame latents are ignored
+                has_i2v_items = any(
+                    x._cached_first_frame_latent is not None and getattr(x, 'is_i2v_mode', True)
+                    for x in self.file_items
+                )
+                if has_i2v_items:
+                    # Collect only I2V items' first frame latents
+                    i2v_first_frames = [
+                        x._cached_first_frame_latent.unsqueeze(0)
+                        for x in self.file_items
+                        if x._cached_first_frame_latent is not None and getattr(x, 'is_i2v_mode', True)
+                    ]
+                    self.first_frame_latents = torch.cat(i2v_first_frames) if i2v_first_frames else None
                 if any([x._cached_audio_latent is not None for x in self.file_items]):
                     self.audio_latents = torch.cat(
                         [
@@ -446,6 +450,16 @@ class DataLoaderBatchDTO:
 
     def get_network_weight_list(self):
         return [x.network_weight for x in self.file_items]
+
+    def get_is_i2v_mode_list(self):
+        """Returns list of booleans indicating whether each item should use I2V mode (first frame conditioning)."""
+        return [x.is_i2v_mode for x in self.file_items]
+
+    @property
+    def has_mixed_i2v_t2v_modes(self) -> bool:
+        """Returns True if the batch contains items from both I2V and T2V modes."""
+        modes = self.get_is_i2v_mode_list()
+        return len(set(modes)) > 1
 
     def get_caption_list(
         self, trigger=None, to_replace_list=None, add_if_not_present=True

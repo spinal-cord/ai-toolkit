@@ -589,6 +589,20 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             else:
                 print_acc(f"  -  Found {len(self.file_list)} images after adding flips")
 
+        # handle both do_i2v and do_t2v - double the dataset elements
+        # each element will be used twice: once with I2V conditioning, once with T2V
+        if self.is_video and self.dataset_config.do_i2v and self.dataset_config.do_t2v:
+            print_acc("  -  Both do_i2v and do_t2v are enabled, doubling dataset elements")
+            current_file_list = [x for x in self.file_list]
+            for file_item in current_file_list:
+                # create a copy for T2V mode (no first frame conditioning)
+                new_file_item = copy.deepcopy(file_item)
+                new_file_item.is_i2v_mode = False  # This copy is for T2V
+                # Original keeps is_i2v_mode = True (default) for I2V
+                self.file_list.append(new_file_item)
+            if self.is_video:
+                print_acc(f"  -  Found {len(self.file_list)} videos after adding T2V mode")
+
         self.setup_epoch()
 
     def setup_epoch(self):

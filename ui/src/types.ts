@@ -125,6 +125,7 @@ export interface DatasetConfig {
   num_frames: number;
   shrink_video_to_frames: boolean;
   do_i2v?: boolean;
+  do_t2v?: boolean;
   do_audio?: boolean;
   audio_normalize?: boolean;
   audio_preserve_pitch?: boolean;

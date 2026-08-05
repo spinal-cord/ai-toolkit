@@ -1663,6 +1663,14 @@ export default function SimpleJob({
                             docKey="datasets.do_i2v"
                           />
                         )}
+                        {modelArch?.additionalSections?.includes('datasets.do_t2v') && (
+                          <Checkbox
+                            label="Do T2V"
+                            checked={dataset.do_t2v || false}
+                            onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].do_t2v`)}
+                            docKey="datasets.do_t2v"
+                          />
+                        )}
                         {modelArch?.additionalSections?.includes('datasets.do_audio') && (
                           <Checkbox
                             label="Do Audio"

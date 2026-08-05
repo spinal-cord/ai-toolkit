@@ -1660,6 +1660,8 @@ class LatentCachingFileItemDTOMixin:
             item["fps"] = self.dataset_config.fps
         if is_video and self.dataset_config.do_i2v:
                 item["do_i2v"] = True
+        if is_video and self.dataset_config.do_t2v:
+                item["do_t2v"] = True
         if is_video and self.dataset_config.do_audio:
             item["do_audio"] = True
             if self.dataset_config.audio_normalize:

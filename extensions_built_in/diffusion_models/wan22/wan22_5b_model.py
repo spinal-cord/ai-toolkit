@@ -295,61 +295,116 @@ class Wan225bModel(Wan21):
         # videos come in (bs, num_frames, channels, height, width)
         # images come in (bs, channels, height, width)
 
+        # Get per-item I2V mode indicators
+        is_i2v_modes = batch.get_is_i2v_mode_list()
+        i2v_indices = [i for i, mode in enumerate(is_i2v_modes) if mode]
+        t2v_indices = [i for i, mode in enumerate(is_i2v_modes) if not mode]
+        
+        # Determine batch type
+        pure_i2v = len(i2v_indices) == latent_model_input.shape[0]
+        pure_t2v = not i2v_indices
+        is_mixed_batch = not pure_i2v and not pure_t2v
+
         # for wan, only do i2v for video for now. Images do normal t2i
-        conditioned_latent = latent_model_input
-        noise_mask = None
         self._i2v_loss_mask = None
 
-        if batch.dataset_config.do_i2v:
-            with torch.no_grad():
+        with torch.no_grad():
+            # Handle pure I2V (original behavior - no overhead)
+            if pure_i2v and batch.dataset_config.do_i2v:
                 # check to see if we had the first frame latent cached
                 if batch.first_frame_latents is not None:
                     conditioned_latent, noise_mask = add_first_frame_conditioning_v22(
-                        latent_model_input=latent_model_input.to(
-                            self.device_torch, self.torch_dtype
-                        ),
-                        first_frame_latents=batch.first_frame_latents.to(
-                            self.device_torch, self.torch_dtype
-                        ),
+                        latent_model_input=latent_model_input.to(self.device_torch, self.torch_dtype),
+                        first_frame_latents=batch.first_frame_latents.to(self.device_torch, self.torch_dtype),
                         vae=self.vae,
                     )
-                    # conditioned tokens are clean with timestep 0 and must not contribute to the loss
-                    self._i2v_loss_mask = noise_mask
                 else:
                     frames = batch.tensor
                     if len(frames.shape) == 4:
                         first_frames = frames
                     elif len(frames.shape) == 5:
                         first_frames = frames[:, 0]
-                        # Add conditioning using the standalone function
                         conditioned_latent, noise_mask = add_first_frame_conditioning_v22(
-                            latent_model_input=latent_model_input.to(
-                                self.device_torch, self.torch_dtype
-                            ),
+                            latent_model_input=latent_model_input.to(self.device_torch, self.torch_dtype),
                             first_frame=first_frames.to(self.device_torch, self.torch_dtype),
                             vae=self.vae,
                         )
-                        # conditioned tokens are clean with timestep 0 and must not contribute to the loss
-                        self._i2v_loss_mask = noise_mask
                     else:
                         raise ValueError(f"Unknown frame shape {frames.shape}")
-
-                # make the noise mask
-                if noise_mask is None:
-                    noise_mask = torch.ones(
-                        conditioned_latent.shape,
-                        dtype=conditioned_latent.dtype,
-                        device=conditioned_latent.device,
-                    )
-                # todo write this better
+                self._i2v_loss_mask = noise_mask
+                # Apply timestep masking
                 t_chunks = torch.chunk(timestep, timestep.shape[0])
                 out_t_chunks = []
                 for t in t_chunks:
-                    # seq_len: num_latent_frames * latent_height//2 * latent_width//2
                     temp_ts = (noise_mask[0][0][:, ::2, ::2] * t).flatten()
-                    # batch_size, seq_len
-                    temp_ts = temp_ts.unsqueeze(0)
-                    out_t_chunks.append(temp_ts)
+                    out_t_chunks.append(temp_ts.unsqueeze(0))
+                timestep = torch.cat(out_t_chunks, dim=0)
+            
+            # Handle pure T2V (no conditioning needed)
+            elif pure_t2v:
+                conditioned_latent = latent_model_input
+                self._i2v_loss_mask = None
+            
+            # Handle mixed batch (need to process items separately)
+            else:
+                # Extract and process I2V items
+                i2v_processed = []
+                i2v_noise_masks = []
+                
+                if i2v_indices and batch.dataset_config.do_i2v:
+                    # Note: indexing creates a view, but add_first_frame_conditioning_v22 clones
+                    # internally so the original latent_model_input is not modified
+                    i2v_latents = latent_model_input[i2v_indices]
+                    
+                    if batch.first_frame_latents is not None:
+                        # batch.first_frame_latents contains only I2V items (filtered at batch level)
+                        i2v_processed, i2v_noise_masks = add_first_frame_conditioning_v22(
+                            latent_model_input=i2v_latents.to(self.device_torch, self.torch_dtype),
+                            first_frame_latents=batch.first_frame_latents.to(self.device_torch, self.torch_dtype),
+                            vae=self.vae,
+                        )
+                    else:
+                        frames = batch.tensor
+                        if frames is not None and len(frames.shape) == 5:
+                            first_frames = frames[i2v_indices, 0]
+                            i2v_processed, i2v_noise_masks = add_first_frame_conditioning_v22(
+                                latent_model_input=i2v_latents.to(self.device_torch, self.torch_dtype),
+                                first_frame=first_frames.to(self.device_torch, self.torch_dtype),
+                                vae=self.vae,
+                            )
+                
+                # Build result in original order (no cloning needed)
+                # Use new_empty to create output tensor without copying
+                full_latent = latent_model_input.new_empty(latent_model_input.shape)
+                
+                if i2v_processed is not None:
+                    for idx, orig_idx in enumerate(i2v_indices):
+                        full_latent[orig_idx] = i2v_processed[idx]
+                for idx, orig_idx in enumerate(t2v_indices):
+                    full_latent[orig_idx] = latent_model_input[orig_idx]
+                conditioned_latent = full_latent
+                
+                # Build loss mask: 1s for all, then set I2V masks
+                batch_size = latent_model_input.shape[0]
+                self._i2v_loss_mask = torch.ones(
+                    batch_size, 1, latent_model_input.shape[2], 
+                    latent_model_input.shape[3], latent_model_input.shape[4],
+                    dtype=latent_model_input.dtype,
+                    device=latent_model_input.device,
+                )
+                if i2v_noise_masks is not None:
+                    for idx, orig_idx in enumerate(i2v_indices):
+                        self._i2v_loss_mask[orig_idx] = i2v_noise_masks[idx][0]
+                
+                # Handle timestep masking per item
+                t_chunks = torch.chunk(timestep, timestep.shape[0])
+                out_t_chunks = []
+                for i, t in enumerate(t_chunks):
+                    if i in i2v_indices:
+                        temp_ts = (self._i2v_loss_mask[i][0][:, ::2, ::2] * t).flatten()
+                    else:
+                        temp_ts = t.flatten()
+                    out_t_chunks.append(temp_ts.unsqueeze(0))
                 timestep = torch.cat(out_t_chunks, dim=0)
 
         noise_pred = self.model(

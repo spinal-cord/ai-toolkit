@@ -103,7 +103,18 @@ const docs: { [key: string]: ConfigDoc } = {
       <>
         For video models that can handle both I2V (Image to Video) and T2V (Text to Video), this option sets this
         dataset to be trained as an I2V dataset. This means that the first frame will be extracted from the video and
-        used as the start image for the video. If this option is not set, the dataset will be treated as a T2V dataset.
+        used as the start image for the video. Can be combined with "Do T2V" to train the model on both modes.
+      </>
+    ),
+  },
+  'datasets.do_t2v': {
+    title: 'Do T2V',
+    description: (
+      <>
+        For video models that can handle both I2V (Image to Video) and T2V (Text to Video), this option trains this
+        dataset as a T2V dataset without first frame conditioning. Can be combined with "Do I2V" to train the model
+        on both modes simultaneously - when both are enabled, each video element is effectively used twice (once
+        with I2V conditioning, once without), doubling the training steps per epoch for this dataset.
       </>
     ),
   },

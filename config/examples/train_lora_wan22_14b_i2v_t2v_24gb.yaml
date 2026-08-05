@@ -1,0 +1,71 @@
+# Wan 2.2 14B I2V+T2V LoRA Training Example
+# This config demonstrates training with both I2V and T2V modes on the same dataset
+
+processes:
+  - model:
+      # Wan 2.2 14B I2V model
+      arch: wan22_14b_i2v
+      name_or_path: Wan-AI/Wan2.2-I2V-14B-Diffusers
+      low_vram: true
+      quantize: true
+      quantize_te: true
+
+    train:
+      batch_size: 1
+      steps: 10000
+      gradient_accumulation: 1
+      learning_rate: 1e-5
+      noise_scheduler: flowmatch
+      timestep_type: weighted
+      save_every: 1000
+      sample_every: 500
+
+    network:
+      type: lora
+      linear: 128
+      alpha: 128
+
+    sample:
+      prompts:
+        - "A person walking down the street"
+      num_frames: 81
+      fps: 16
+      width: 832
+      height: 480
+      guidance_scale: 5.0
+
+    datasets:
+      # Dataset with BOTH I2V and T2V modes enabled
+      # Each video will be used twice: once with first frame conditioning (I2V)
+      # and once without (T2V), effectively doubling training steps per epoch
+      - folder_path: /path/to/dataset/i2v_t2v_videos
+        resolution: 480
+        num_frames: 81
+        fps: 16
+        buckets: true
+        cache_latents_to_disk: true
+        do_i2v: true    # Use first frame conditioning
+        do_t2v: true    # Also train without first frame conditioning
+        num_workers: 4
+
+      # Dataset with ONLY I2V mode (default behavior)
+      - folder_path: /path/to/dataset/i2v_only_videos
+        resolution: 480
+        num_frames: 81
+        fps: 16
+        buckets: true
+        cache_latents_to_disk: true
+        do_i2v: true    # First frame conditioning enabled
+        do_t2v: false   # No T2V training
+        num_workers: 4
+
+      # Dataset with ONLY T2V mode (no first frame conditioning)
+      - folder_path: /path/to/dataset/t2v_only_videos
+        resolution: 480
+        num_frames: 81
+        fps: 16
+        buckets: true
+        cache_latents_to_disk: true
+        do_i2v: false   # No first frame conditioning
+        do_t2v: true    # Text-to-video only training
+        num_workers: 4

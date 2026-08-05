@@ -866,10 +866,20 @@ class LTX2Model(BaseModel):
             video_timestep = timestep.clone()
             self._i2v_loss_mask = None
 
+            # Get per-item I2V mode indicators
+            is_i2v_modes = batch.get_is_i2v_mode_list() if hasattr(batch, 'get_is_i2v_mode_list') else [batch.dataset_config.do_i2v] * batch_size
+            i2v_mask_per_item = torch.tensor(is_i2v_modes, device=self.device_torch, dtype=torch.bool)
+            
+            # For mixed batches, clone to avoid modifying original latent_model_input
+            if batch.dataset_config.do_i2v and batch.num_frames > 1 and i2v_mask_per_item.any() and not i2v_mask_per_item.all():
+                latent_model_input = latent_model_input.clone()
+
             # i2v from first frame
             if batch.dataset_config.do_i2v and batch.num_frames > 1:
                 # check to see if we had it cached
                 if batch.first_frame_latents is not None:
+                    # batch.first_frame_latents now only contains I2V items (filtered at batch level)
+                    # For mixed batches, this is exactly the I2V items we need
                     init_latents = batch.first_frame_latents.to(
                         self.device_torch, dtype=self.torch_dtype
                     )
@@ -884,15 +894,22 @@ class LTX2Model(BaseModel):
                         first_frames = frames[:, 0]
                     else:
                         raise ValueError(f"Unknown frame shape {frames.shape}")
+                    
+                    # For mixed batches, only encode first frames for I2V items
+                    if i2v_mask_per_item.any() and not i2v_mask_per_item.all():
+                        first_frames_i2v = first_frames[i2v_mask_per_item]
+                    else:
+                        first_frames_i2v = first_frames
+                    
                     # first frame doesnt have time dim, add it back
                     init_latents = self.encode_images(
-                        first_frames, device=self.device_torch, dtype=self.torch_dtype
+                        first_frames_i2v, device=self.device_torch, dtype=self.torch_dtype
                     )
 
                 # expand the latents to match video frames
                 init_latents = init_latents.repeat(1, 1, latent_num_frames, 1, 1)
-                mask_shape = (
-                    batch_size,
+                mask_shape_i2v = (
+                    init_latents.shape[0],
                     1,
                     latent_num_frames,
                     latent_height,
@@ -900,22 +917,38 @@ class LTX2Model(BaseModel):
                 )
                 # First condition is image latents and those should be kept clean.
                 conditioning_mask = torch.zeros(
-                    mask_shape, device=self.device_torch, dtype=self.torch_dtype
+                    mask_shape_i2v, device=self.device_torch, dtype=self.torch_dtype
                 )
                 conditioning_mask[:, :, 0] = 1.0
 
-                # use conditioning mask to replace latents
-                latent_model_input = (
-                    init_latents * conditioning_mask
-                    + latent_model_input * (1 - conditioning_mask)
+                # Create combined conditioning mask for all items
+                mask_shape = (
+                    batch_size,
+                    1,
+                    latent_num_frames,
+                    latent_height,
+                    latent_width,
                 )
+                full_conditioning_mask = torch.zeros(
+                    mask_shape, device=self.device_torch, dtype=self.torch_dtype
+                )
+                
+                # Apply conditioning only to I2V items
+                if i2v_mask_per_item.any():
+                    i2v_indices = torch.where(i2v_mask_per_item)[0]
+                    for i, idx in enumerate(i2v_indices):
+                        full_conditioning_mask[idx] = conditioning_mask[i]
+                        latent_model_input[idx] = (
+                            init_latents[i] * conditioning_mask[i]
+                            + latent_model_input[idx] * (1 - conditioning_mask[i])
+                        )
 
                 # conditioned tokens are clean with timestep 0 and their prediction is
                 # discarded at inference, so they must not contribute to the loss
-                self._i2v_loss_mask = 1.0 - conditioning_mask
+                self._i2v_loss_mask = 1.0 - full_conditioning_mask
 
                 packed_conditioning_mask = self.pipeline._pack_latents(
-                    conditioning_mask,
+                    full_conditioning_mask,
                     patch_size=self.pipeline.transformer_spatial_patch_size,
                     patch_size_t=self.pipeline.transformer_temporal_patch_size,
                 ).squeeze(-1)

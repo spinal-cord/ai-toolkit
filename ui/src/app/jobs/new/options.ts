@@ -19,6 +19,7 @@ type AdditionalSections =
   | 'datasets.control_path'
   | 'datasets.multi_control_paths'
   | 'datasets.do_i2v'
+  | 'datasets.do_t2v'
   | 'datasets.do_audio'
   | 'datasets.audio_normalize'
   | 'datasets.audio_preserve_pitch'
@@ -321,6 +322,8 @@ export const modelArchs: ModelArch[] = [
       // Set to "float32" to use an fp32 VAE (may improve first-frame encoding
       // quality for I2V at the cost of more VRAM).
       'config.process[0].model.vae_dtype': ['bf16', 'bf16'],
+      'config.process[0].datasets[x].do_i2v': [true, undefined],
+      'config.process[0].datasets[x].do_t2v': [false, undefined],
     },
     disableSections: ['network.conv'],
     additionalSections: [
@@ -329,6 +332,8 @@ export const modelArchs: ModelArch[] = [
       'model.low_vram',
       'model.multistage',
       'model.layer_offloading',
+      'datasets.do_i2v',
+      'datasets.do_t2v',
       'datasets.auto_frame_count',
       'model.te_name_or_path',
     ],
@@ -355,10 +360,11 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].sample.height': [768, 1024],
       'config.process[0].train.timestep_type': ['weighted', 'sigmoid'],
       'config.process[0].datasets[x].do_i2v': [true, undefined],
+      'config.process[0].datasets[x].do_t2v': [false, undefined],
       'config.process[0].datasets[x].fps': [24, undefined],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.low_vram', 'datasets.do_i2v', 'datasets.auto_frame_count', 'model.te_name_or_path'],
+    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.low_vram', 'datasets.do_i2v', 'datasets.do_t2v', 'datasets.auto_frame_count', 'model.te_name_or_path'],
   },
   {
     name: 'lumina2',
@@ -709,12 +715,13 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].train.audio_loss_multiplier': [1.0, undefined],
       'config.process[0].train.timestep_type': ['weighted', 'sigmoid'],
       'config.process[0].datasets[x].do_i2v': [false, undefined],
+      'config.process[0].datasets[x].do_t2v': [false, undefined],
       'config.process[0].datasets[x].do_audio': [true, undefined],
       'config.process[0].datasets[x].fps': [24, undefined],
       'config.process[0].datasets[x].auto_frame_count': [false, undefined],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.layer_offloading', 'model.low_vram', 'datasets.do_audio', 'datasets.audio_normalize', 'datasets.audio_preserve_pitch', 'datasets.do_i2v', 'train.audio_loss_multiplier', 'datasets.auto_frame_count'],
+    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.layer_offloading', 'model.low_vram', 'datasets.do_audio', 'datasets.audio_normalize', 'datasets.audio_preserve_pitch', 'datasets.do_i2v', 'datasets.do_t2v', 'train.audio_loss_multiplier', 'datasets.auto_frame_count'],
   },
   {
     name: 'ltx2.3',
@@ -738,12 +745,13 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].datasets[x].cache_latents_to_disk': [true, false],
       'config.process[0].datasets[x].cache_latents': [true, false],
       'config.process[0].datasets[x].do_i2v': [false, undefined],
+      'config.process[0].datasets[x].do_t2v': [false, undefined],
       'config.process[0].datasets[x].do_audio': [true, undefined],
       'config.process[0].datasets[x].fps': [24, undefined],
       'config.process[0].datasets[x].auto_frame_count': [false, undefined],
     },
     disableSections: ['network.conv'],
-    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.layer_offloading', 'model.low_vram', 'datasets.do_audio', 'datasets.audio_normalize', 'datasets.audio_preserve_pitch', 'datasets.do_i2v', 'train.audio_loss_multiplier', 'datasets.auto_frame_count'],
+    additionalSections: ['sample.ctrl_img', 'datasets.num_frames', 'model.layer_offloading', 'model.low_vram', 'datasets.do_audio', 'datasets.audio_normalize', 'datasets.audio_preserve_pitch', 'datasets.do_i2v', 'datasets.do_t2v', 'train.audio_loss_multiplier', 'datasets.auto_frame_count'],
   },
   {
     name: 'flux2_klein_4b',
