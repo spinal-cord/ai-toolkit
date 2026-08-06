@@ -1281,6 +1281,8 @@ export default function SimpleJob({
                     { value: 'mae', label: 'Mean Absolute Error' },
                     { value: 'wavelet', label: 'Wavelet' },
                     { value: 'stepped', label: 'Stepped Recovery' },
+                    { value: 'pseudo_huber', label: 'Pseudo Huber (Smooth L1)' },
+                    { value: 'mean_flow', label: 'Mean Flow (Experimental)' },
                   ]}
                 />
                 {modelArch?.additionalSections?.includes('train.audio_loss_multiplier') && (
@@ -1413,6 +1415,39 @@ export default function SimpleJob({
                     )}
                   </>
                 )}
+                <FormGroup label="Other" className="pt-2">
+                  <>
+                    <Checkbox
+                      label="Contrastive Guidance Loss"
+                      docKey={'train.do_guidance_loss'}
+                      className="pt-1"
+                      checked={jobConfig.config.process[0].train.do_guidance_loss || false}
+                      onChange={value => {
+                        if (value) {
+                          setJobConfig(true, 'config.process[0].train.do_guidance_loss');
+                          if (!jobConfig.config.process[0].train.guidance_loss_target) {
+                            setJobConfig(4.0, 'config.process[0].train.guidance_loss_target');
+                          }
+                        } else {
+                          setJobConfig(undefined, 'config.process[0].train.do_guidance_loss');
+                          setJobConfig(undefined, 'config.process[0].train.guidance_loss_target');
+                        }
+                      }}
+                    />
+                    {jobConfig.config.process[0].train.do_guidance_loss && (
+                      <>
+                        <NumberInput
+                          label="Guidance Loss Target"
+                          docKey={'train.guidance_loss_target'}
+                          value={(jobConfig.config.process[0].train.guidance_loss_target as number) || 4.0}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.guidance_loss_target')}
+                          placeholder="eg. 3.0"
+                          min={0}
+                        />
+                      </>
+                    )}
+                  </>
+                </FormGroup>
               </div>
             </div>
           </Card>
