@@ -1285,6 +1285,18 @@ export default function SimpleJob({
                     { value: 'mean_flow', label: 'Mean Flow (Experimental)' },
                   ]}
                 />
+                {jobConfig.config.process[0].train.loss_type === 'pseudo_huber' && (
+                  <NumberInput
+                    label="Pseudo Huber C Value"
+                    className="pt-2"
+                    value={jobConfig.config.process[0].train.pseudo_huber_c ?? 0.01}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.pseudo_huber_c')}
+                    placeholder="0.01"
+                    docKey={'train.pseudo_huber_c'}
+                    min={0}
+                    step={0.001}
+                  />
+                )}
                 {modelArch?.additionalSections?.includes('train.audio_loss_multiplier') && (
                   <NumberInput
                     label="Audio Loss Multiplier"

@@ -190,6 +190,7 @@ export interface TrainConfig {
   blank_prompt_preservation_multiplier?: number;
   switch_boundary_every: number;
   loss_type: 'mse' | 'mae' | 'wavelet' | 'stepped' | 'mean_flow' | 'pseudo_huber';
+  pseudo_huber_c?: number;
   do_differential_guidance?: boolean;
   differential_guidance_scale?: number;
   audio_loss_multiplier?: number;
