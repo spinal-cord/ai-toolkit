@@ -161,6 +161,10 @@ def lora_key_to_model_key(lora_key: str) -> str:
     - cross_attn -> attn2 (replacement, NOT nesting)
     - self_attn -> attn1 (replacement, NOT nesting)
     - ffn.0/ffn.2 -> ffn.net.0.proj / ffn.net.2
+    - head.head -> proj_out
+    - text_embedding.{0,2} -> condition_embedder.text_embedder.linear_{1,2}
+    - time_embedding.{0,2} -> condition_embedder.time_embedder.linear_{1,2}
+    - time_projection.1 -> condition_embedder.time_proj
     """
     # Remove transformer_N. prefix if present (per-expert format from lora_special.py)
     lora_key = re.sub(r'^diffusion_model\.transformer_\d+\.', 'diffusion_model.', lora_key)
@@ -205,16 +209,49 @@ def lora_key_to_model_key(lora_key: str) -> str:
                 elif sub == "q": return f"blocks.{block_idx}.attn2.to_q"
                 elif sub == "v": return f"blocks.{block_idx}.attn2.to_v"
                 elif sub == "o": return f"blocks.{block_idx}.attn2.to_out.0"
+                # Handle .diff tensors for norm_k/norm_q (additive adjustments)
+                elif sub == "norm_k": return f"blocks.{block_idx}.attn2.norm_k"
+                elif sub == "norm_q": return f"blocks.{block_idx}.attn2.norm_q"
             elif remainder.startswith("self_attn."):
                 sub = remainder[len("self_attn."):]
                 if sub == "k": return f"blocks.{block_idx}.attn1.to_k"
                 elif sub == "q": return f"blocks.{block_idx}.attn1.to_q"
                 elif sub == "v": return f"blocks.{block_idx}.attn1.to_v"
                 elif sub == "o": return f"blocks.{block_idx}.attn1.to_out.0"
+                # Handle .diff tensors for norm_k/norm_q (additive adjustments)
+                elif sub == "norm_k": return f"blocks.{block_idx}.attn1.norm_k"
+                elif sub == "norm_q": return f"blocks.{block_idx}.attn1.norm_q"
             elif remainder.startswith("ffn."):
                 sub = remainder[len("ffn."):]
                 if sub == "0": return f"blocks.{block_idx}.ffn.net.0.proj"
                 elif sub == "2": return f"blocks.{block_idx}.ffn.net.2"
+            # Handle .diff/.diff_b for norm2
+            elif remainder.startswith("norm2"):
+                return f"blocks.{block_idx}.norm2"
+    
+    # New format: diffusion_model.condition_embedder.text_embedder.linear_{idx}
+    match = re.match(r"diffusion_model\.condition_embedder\.text_embedder\.linear_(\d+)", lora_key)
+    if match:
+        idx = match.group(1)
+        return f"condition_embedder.text_embedder.linear_{idx}"
+    
+    # New format: diffusion_model.condition_embedder.time_embedder.linear_{idx}
+    match = re.match(r"diffusion_model\.condition_embedder\.time_embedder\.linear_(\d+)", lora_key)
+    if match:
+        idx = match.group(1)
+        return f"condition_embedder.time_embedder.linear_{idx}"
+    
+    # New format: diffusion_model.condition_embedder.time_proj
+    if lora_key.startswith("diffusion_model.condition_embedder.time_proj"):
+        return "condition_embedder.time_proj"
+    
+    # New format: diffusion_model.proj_out
+    if lora_key.startswith("diffusion_model.proj_out"):
+        return "proj_out"
+    
+    # New format: diffusion_model.patch_embedding (for .diff and .diff_b)
+    if lora_key.startswith("diffusion_model.patch_embedding"):
+        return "patch_embedding"
     
     # Legacy kohya format for head
     if lora_key == "lora_unet_head_head":
@@ -248,6 +285,31 @@ def lora_key_to_model_key(lora_key: str) -> str:
     return lora_key
 
 
+def _find_base_param_key(model_key: str, base_state_dict: dict, suffix: str = ".weight") -> str:
+    """
+    Find the base parameter key in the model state dict for a given model key.
+    
+    Args:
+        model_key: The mapped model key (e.g., "blocks.0.attn2.norm_k")
+        base_state_dict: The base model's state dict
+        suffix: The expected parameter suffix (".weight" or ".bias")
+    
+    Returns:
+        The matching key in base_state_dict, or None if not found.
+    """
+    # Try exact match first
+    candidate = model_key + suffix
+    if candidate in base_state_dict and "lora" not in candidate:
+        return candidate
+    
+    # Try to find a key that starts with model_key and ends with suffix
+    for key in base_state_dict:
+        if key.startswith(model_key) and key.endswith(suffix) and "lora" not in key:
+            return key
+    
+    return None
+
+
 def merge_lora_into_state_dict(
     base_state_dict: dict,
     lora_state_dict: dict,
@@ -255,9 +317,14 @@ def merge_lora_into_state_dict(
 ) -> dict:
     """
     Merge LoRA weights into the base model state dict.
+    
+    Handles:
+    - Standard LoRA pairs (lora_A/lora_B or lora_down/lora_up)
+    - Additive adjustment tensors (.diff for weights, .diff_b for biases)
     """
     merged = {}
 
+    # --- Collect LoRA pairs (standard lora_A/lora_B format) ---
     lora_pairs = {}
     for key in lora_state_dict:
         if ".lora_A.weight" in key:
@@ -273,6 +340,7 @@ def merge_lora_into_state_dict(
             base_key = key.replace(".lora_up.weight", "")
             lora_pairs.setdefault(base_key, {})["B"] = key
 
+    # --- Collect alpha values ---
     alphas = {}
     for key in lora_state_dict:
         if ".alpha" in key:
@@ -280,28 +348,15 @@ def merge_lora_into_state_dict(
             alphas[base_key] = lora_state_dict[key]
 
     merged_keys = set()
+
+    # --- Process standard LoRA pairs ---
     for base_key, pairs in lora_pairs.items():
         if "A" not in pairs or "B" not in pairs:
             continue
 
         model_key = lora_key_to_model_key(base_key)
         
-        candidate_keys = [
-            model_key + ".weight",
-            model_key + ".bias",
-        ]
-
-        base_weight_key = None
-        for ck in candidate_keys:
-            if ck in base_state_dict and "lora" not in ck:
-                base_weight_key = ck
-                break
-
-        if base_weight_key is None:
-            for key in base_state_dict:
-                if key.startswith(model_key) and "lora" not in key and key.endswith(".weight"):
-                    base_weight_key = key
-                    break
+        base_weight_key = _find_base_param_key(model_key, base_state_dict, ".weight")
 
         if base_weight_key is None:
             print(f"  Warning: Could not find base weight for key: {base_key}")
@@ -328,11 +383,71 @@ def merge_lora_into_state_dict(
         merged[base_weight_key] = merged_weight.to(base_state_dict[base_weight_key].dtype)
         merged_keys.add(base_weight_key)
 
+        # Also copy the bias if it exists (will be updated later if .diff_b is present)
         bias_key = base_weight_key.replace(".weight", ".bias")
         if bias_key in base_state_dict:
             merged[bias_key] = base_state_dict[bias_key]
             merged_keys.add(bias_key)
 
+    # --- Process .diff tensors (additive adjustments to weights) ---
+    for key in lora_state_dict:
+        if not key.endswith(".diff"):
+            continue
+        
+        # Extract base key by removing .diff suffix
+        base_key = key[:-len(".diff")]
+        model_key = lora_key_to_model_key(base_key)
+        
+        # Find the target weight parameter in base_state_dict
+        target_key = _find_base_param_key(model_key, base_state_dict, ".weight")
+        
+        if target_key is None:
+            print(f"  Warning: Could not find base weight for .diff key: {key}")
+            print(f"    (Mapped to model key: {model_key})")
+            continue
+        
+        diff_tensor = lora_state_dict[key]
+        
+        # If the base weight hasn't been processed yet, copy it first
+        if target_key not in merged:
+            merged[target_key] = base_state_dict[target_key]
+            merged_keys.add(target_key)
+        
+        # Apply the additive adjustment
+        base_weight = merged[target_key].to(torch.float32)
+        adjusted_weight = base_weight + diff_tensor.to(torch.float32)
+        merged[target_key] = adjusted_weight.to(base_state_dict[target_key].dtype)
+
+    # --- Process .diff_b tensors (additive adjustments to biases) ---
+    for key in lora_state_dict:
+        if not key.endswith(".diff_b"):
+            continue
+        
+        # Extract base key by removing .diff_b suffix
+        base_key = key[:-len(".diff_b")]
+        model_key = lora_key_to_model_key(base_key)
+        
+        # Find the target bias parameter in base_state_dict
+        target_key = _find_base_param_key(model_key, base_state_dict, ".bias")
+        
+        if target_key is None:
+            print(f"  Warning: Could not find base bias for .diff_b key: {key}")
+            print(f"    (Mapped to model key: {model_key})")
+            continue
+        
+        diff_tensor = lora_state_dict[key]
+        
+        # If the base bias hasn't been processed yet, copy it first
+        if target_key not in merged:
+            merged[target_key] = base_state_dict[target_key]
+            merged_keys.add(target_key)
+        
+        # Apply the additive adjustment
+        base_bias = merged[target_key].to(torch.float32)
+        adjusted_bias = base_bias + diff_tensor.to(torch.float32)
+        merged[target_key] = adjusted_bias.to(base_state_dict[target_key].dtype)
+
+    # --- Copy all remaining base parameters ---
     for key, value in base_state_dict.items():
         if key not in merged_keys and "lora" not in key:
             merged[key] = value
