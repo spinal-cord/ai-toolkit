@@ -1371,15 +1371,29 @@ class SDTrainer(BaseSDTrainProcess):
         self,
         embeds: PromptEmbeds,
         dropout_rate: float,
+        is_i2v_modes: List[bool] = None,
+        dropout_rate_t2v: float = 0.0,
     ) -> PromptEmbeds:
         """Randomly replace some samples' cached embeddings with blank embeddings.
 
         This applies caption dropout at training time when using cached text
         embeddings, since the text encoder is unloaded and cannot re-encode
         dropped captions on the fly.
+        
+        For mixed I2V/T2V batches, use is_i2v_modes to determine which dropout rate
+        to apply to each sample. By default, T2V mode uses dropout_rate_t2v (0.0)
+        while I2V mode uses dropout_rate.
         """
         batch_size = embeds.text_embeds.shape[0]
-        drop_mask = torch.rand(batch_size, device=self.device_torch) < dropout_rate
+        
+        # Determine effective dropout rate per sample
+        if is_i2v_modes is not None and len(is_i2v_modes) == batch_size:
+            # Per-sample dropout based on I2V/T2V mode
+            rates = [dropout_rate if m else dropout_rate_t2v for m in is_i2v_modes]
+            drop_mask = torch.rand(batch_size, device=self.device_torch) < torch.tensor(rates, device=self.device_torch)
+        else:
+            drop_mask = torch.rand(batch_size, device=self.device_torch) < dropout_rate
+        
         if not drop_mask.any():
             return embeds
 
@@ -1722,12 +1736,21 @@ class SDTrainer(BaseSDTrainProcess):
                                 # is unloaded, so we can't re-encode dropped captions.
                                 # Instead, we randomly replace cached per-image
                                 # embeddings with blank embeddings at training time.
+                                # For mixed I2V/T2V batches, use per-mode dropout rates.
                                 caption_dropout_rate = 0.0
+                                caption_dropout_rate_t2v = 0.0
+                                is_i2v_modes = None
                                 if batch.dataset_config is not None:
                                     caption_dropout_rate = batch.dataset_config.caption_dropout_rate
-                                if caption_dropout_rate > 0 and self.cached_blank_embeds is not None:
+                                    caption_dropout_rate_t2v = batch.dataset_config.caption_dropout_rate_t2v
+                                if hasattr(batch, 'get_is_i2v_mode_list'):
+                                    is_i2v_modes = batch.get_is_i2v_mode_list()
+                                # Apply dropout if either rate is > 0
+                                if (caption_dropout_rate > 0 or caption_dropout_rate_t2v > 0) and self.cached_blank_embeds is not None:
                                     conditional_embeds = self._apply_caption_dropout(
-                                        conditional_embeds, caption_dropout_rate
+                                        conditional_embeds, caption_dropout_rate,
+                                        is_i2v_modes=is_i2v_modes,
+                                        dropout_rate_t2v=caption_dropout_rate_t2v
                                     )
                             else:
                                 embeds_to_use = self.cached_blank_embeds.clone().detach().to(

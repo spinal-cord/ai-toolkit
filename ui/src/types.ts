@@ -113,6 +113,7 @@ export interface DatasetConfig {
   default_caption: string;
   caption_ext: string;
   caption_dropout_rate: number;
+  caption_dropout_rate_t2v?: number;
   shuffle_tokens?: boolean;
   is_reg: boolean;
   network_weight: number;

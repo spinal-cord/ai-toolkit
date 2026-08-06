@@ -389,10 +389,13 @@ class CaptionProcessingDTOMixin:
         # Caption dropout for cached embeddings is applied at training time
         # in SDTrainer._apply_caption_dropout() by randomly replacing cached
         # per-image embeddings with blank embeddings.
-        if self.dataset_config.caption_dropout_rate > 0 and not short_caption and not self.dataset_config.cache_text_embeddings:
+        # For mixed I2V/T2V datasets, use the appropriate dropout rate based on mode.
+        is_t2v_mode = getattr(self, 'is_i2v_mode', True) == False
+        caption_dropout_rate = self.dataset_config.caption_dropout_rate_t2v if is_t2v_mode else self.dataset_config.caption_dropout_rate
+        if caption_dropout_rate > 0 and not short_caption and not self.dataset_config.cache_text_embeddings:
             # get a random float form 0 to 1
             rand = random.random()
-            if rand < self.dataset_config.caption_dropout_rate:
+            if rand < caption_dropout_rate:
                 # drop the caption
                 return ''
 

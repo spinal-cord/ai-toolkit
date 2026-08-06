@@ -1699,12 +1699,25 @@ export default function SimpleJob({
                           />
                         )}
                         {modelArch?.additionalSections?.includes('datasets.do_t2v') && (
-                          <Checkbox
-                            label="Do T2V"
-                            checked={dataset.do_t2v || false}
-                            onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].do_t2v`)}
-                            docKey="datasets.do_t2v"
-                          />
+                          <>
+                            <Checkbox
+                              label="Do T2V"
+                              checked={dataset.do_t2v || false}
+                              onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].do_t2v`)}
+                              docKey="datasets.do_t2v"
+                            />
+                            <NumberInput
+                              label="Caption Dropout Rate for T2V"
+                              className="pt-2"
+                              value={dataset.caption_dropout_rate_t2v ?? 0}
+                              onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].caption_dropout_rate_t2v`)}
+                              placeholder="eg. 0.05 (0 = no dropout for T2V)"
+                              min={0}
+                              max={1}
+                              step={0.01}
+                              docKey="datasets.caption_dropout_rate_t2v"
+                            />
+                          </>
                         )}
                         {modelArch?.additionalSections?.includes('datasets.do_audio') && (
                           <Checkbox

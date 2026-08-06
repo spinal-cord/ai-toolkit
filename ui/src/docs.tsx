@@ -118,6 +118,17 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'datasets.caption_dropout_rate_t2v': {
+    title: 'Caption Dropout Rate for T2V',
+    description: (
+      <>
+        Caption dropout rate specifically for T2V (Text to Video) mode items in mixed I2V/T2V training.
+        This allows you to control caption dropout independently for T2V vs I2V items.
+        By default, this is 0 (no dropout for T2V), as T2V training typically requires captions.
+        The main "Caption Dropout Rate" setting applies to I2V items when both modes are enabled.
+      </>
+    ),
+  },
   'datasets.do_audio': {
     title: 'Do Audio',
     description: (
