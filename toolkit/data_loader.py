@@ -309,6 +309,33 @@ class PairedImageDataset(Dataset):
             path_no_ext = os.path.splitext(img_path)[0]
             prompt_path = path_no_ext + '.txt'
 
+        # Check for JSON caption file first (automatic detection)
+        json_caption_path = self._detect_json_caption(path_no_ext)
+        
+        if json_caption_path:
+            # Parse JSON captions and select one
+            try:
+                from toolkit.dataloader_mixins import parse_json_captions, select_prompt_weighted, _filter_prompts_by_mode, get_mode_from_config
+                prompts = parse_json_captions(json_caption_path)
+                if prompts:
+                    # Determine training mode from dataset config
+                    # Note: self is PairedImageDataset, not FileItemDTO
+                    # For legacy paths, we use dataset_config.do_i2v/do_t2v to determine mode
+                    mode = get_mode_from_config(self.dataset_config)
+                    # When both I2V and T2V are enabled in legacy path, treat as I2V
+                    # (legacy path doesn't support doubling, so we default to I2V mode)
+                    is_i2v = (mode in ('i2v', 'both'))
+                    filtered = _filter_prompts_by_mode(prompts, is_i2v_mode=is_i2v)
+                    if filtered:
+                        selected = select_prompt_weighted(filtered)
+                        return selected['prompt']
+            except Exception as e:
+                # Fall back to txt if JSON parsing fails
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Failed to process JSON caption: {e.__class__.__name__}: {e}")
+                pass
+
         if os.path.exists(prompt_path):
             with open(prompt_path, 'r', encoding='utf-8') as f:
                 prompt = f.read()
@@ -324,6 +351,20 @@ class PairedImageDataset(Dataset):
         else:
             prompt = self.default_prompt
         return prompt
+    
+    def _detect_json_caption(self, path_no_ext: str) -> str:
+        """Check if a JSON caption file exists alongside the image/video file."""
+        json_path = path_no_ext + '.json'
+        if os.path.exists(json_path):
+            return json_path
+        return None
+    
+    def _filter_prompts_for_legacy(self, prompts):
+        """Filter prompts based on dataset config for legacy compatibility."""
+        from toolkit.dataloader_mixins import _filter_prompts_by_mode, get_mode_from_config
+        mode = get_mode_from_config(self.dataset_config)
+        is_i2v = (mode == 'i2v')
+        return _filter_prompts_by_mode(prompts, is_i2v_mode=is_i2v)
 
     def __getitem__(self, index):
         img_path_or_tuple = self.file_list[index]
@@ -602,6 +643,22 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 self.file_list.append(new_file_item)
             if self.is_video:
                 print_acc(f"  -  Found {len(self.file_list)} videos after adding T2V mode")
+        
+        # BUG FIX: Initialize is_i2v_mode for T2V-only datasets based on dataset config.
+        # This was a bug introduced in commit fb730aa ("feat: add per-dataset T2V/I2V mode support").
+        # FileItemDTO.__init__ always sets is_i2v_mode=True by default. For T2V-only datasets
+        # (do_i2v=False, do_t2v=True), no doubling occurs, so is_i2v_mode remains True.
+        # This caused incorrect prompt filtering for JSON captions: prompts with do_t2v=True
+        # were filtered OUT and prompts with do_i2v=True were filtered IN, even though the
+        # dataset was T2V-only.
+        #
+        # Logic:
+        # - I2V-only (do_i2v=True, do_t2v=False): default True is correct, nothing to do
+        # - Both (do_i2v=True, do_t2v=True): doubling above already sets T2V copies to False
+        # - T2V-only (do_i2v=False, do_t2v=True): must explicitly set to False here
+        if self.is_video and self.dataset_config.do_t2v and not self.dataset_config.do_i2v:
+            for file_item in self.file_list:
+                file_item.is_i2v_mode = False
 
         self.setup_epoch()
 

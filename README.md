@@ -235,10 +235,121 @@ pip install --upgrade accelerate transformers diffusers huggingface_hub #Optiona
 ## Dataset Preparation
 
 Datasets generally need to be a folder containing images and associated text files. Currently, the only supported
-formats are jpg, jpeg, and png. Webp currently has issues. The text files should be named the same as the images
-but with a `.txt` extension. For example `image2.jpg` and `image2.txt`. The text file should contain only the caption.
-You can add the word `[trigger]` in the caption file and if you have `trigger_word` in your config, it will be automatically
-replaced. 
+formats are jpg, jpeg, and png. Webp currently has issues.
+
+### Caption Files
+
+You have two options for providing captions:
+
+#### Option 1: Text Files (`.txt`)
+The text files should be named the same as the images but with a `.txt` extension. For example `image2.jpg` and `image2.txt`.
+The text file should contain only the caption. You can add the word `[trigger]` in the caption file and if you have `trigger_word` in your config, it will be automatically replaced.
+
+#### Option 2: JSON Files (`.json`) - Recommended for Advanced Use
+
+You can also use JSON caption files for more advanced features like multiple prompts per image, weighted sampling, and mode-specific captions. The JSON file should be named the same as the image but with a `.json` extension. For example `image2.jpg` and `image2.json`.
+
+**JSON Structure:**
+
+The JSON file should contain either a single prompt object or a list of prompt objects:
+
+```json
+[
+    {
+        "prompt": "your caption here",
+        "weight": 1.0,
+        "do_i2v": true,
+        "do_t2v": false
+    },
+    {
+        "prompt": "another caption",
+        "weight": 0.5,
+        "do_i2v": false,
+        "do_t2v": true
+    }
+]
+```
+
+Or a single object (will be wrapped in a list):
+
+```json
+{
+    "prompt": "your caption here",
+    "weight": 1.0,
+    "do_i2v": true,
+    "do_t2v": false
+}
+```
+
+**Fields:**
+
+- `prompt` (required): The caption text
+- `weight` (optional): Weight for random selection. If missing, None, or negative, it will be computed automatically (uniform distribution if all prompts lack weights). If explicitly set to `0`, the prompt will be excluded from selection. For a single prompt, weight is automatically set to 1.0 unless explicitly set to 0.
+- `do_i2v` (optional, default: `true`): If `true`, this prompt can be used for image-to-video training. Set to `false` to exclude this prompt when `do_i2v` is disabled in dataset config.
+- `do_t2v` (optional, default: `true`): If `true`, this prompt can be used for text-to-video training. Set to `false` to exclude this prompt when `do_t2v` is disabled in dataset config.
+
+**Weighted Random Selection:**
+
+When multiple prompts are provided, one will be randomly selected for each training step based on their weights. Prompts with higher weights have a higher chance of being selected. If all prompts lack valid weights, they get equal chance.
+
+**IMPORTANT: Non-Deterministic Selection (Intentional)**
+
+Prompt selection is intentionally **non-deterministic**. The same image/video may get different prompts across training steps and epochs. This is **by design** to provide caption augmentation, helping the model learn from multiple descriptions of the same media. If you need deterministic training (e.g., for exact reproducibility), use `.txt` caption files with a single caption instead of JSON with multiple prompts.
+
+**Special Weight Behavior:**
+
+- If **all prompts have weight `0`**, the item will use an **empty caption** (equivalent to caption dropout). This allows you to intentionally disable prompts.
+- If some prompts have weight `0`, they will never be selected (not a fallback).
+
+**Empty Prompts:**
+
+Empty prompts (e.g., `"prompt": ""`) are **respected as valid prompts**. They are:
+- Cached separately (as an empty caption embedding)
+- Selected according to their assigned weight
+- Useful for intentionally mixing empty captions with text captions
+
+Example:
+
+```json
+[
+    {
+        "prompt": "A detailed description of the video",
+        "weight": 2.0,
+        "do_i2v": true,
+        "do_t2v": true
+    },
+    {
+        "prompt": "",
+        "weight": 1.0,
+        "do_i2v": true,
+        "do_t2v": false
+    }
+]
+```
+
+In this example, for I2V training, the model will see the detailed caption 2x more often than an empty caption.
+
+**Mode Filtering:**
+
+The `do_i2v` and `do_t2v` flags allow you to control which prompts are used based on the dataset's training mode configuration. This is useful when you have a mixed dataset with both I2V and T2V samples.
+
+**Text Embedding Caching with JSON:**
+
+When `cache_text_embeddings: true` is enabled:
+- All prompts from a JSON file are cached as **separate** `.safetensors` files (one per prompt)
+- During training, a random prompt is selected and its cached embedding is loaded
+- If the JSON file is modified, the system detects the change (via file hash) and automatically creates new caches for updated prompts
+- Old caches are automatically cleaned up
+
+**Warning on Mode Filtering:**
+
+If all prompts are filtered out for a training mode (e.g., all have `do_i2v: false` while training I2V), a warning is logged. No file paths or caption content are exposed in the warning for privacy. The item will use an empty caption.
+
+**Note:** JSON caption files are automatically detected and preferred over `.txt` files when both exist. If no `.json` file is found, the system falls back to `.txt` files as before.
+
+**Intended Use:** JSON caption files with weighted sampling and mode filtering are intended for use with **Wan 2.2 14B** training (which uses the modern DTO-based dataset loader). They are **not** intended for the legacy `PairedImageDataset` path used by older image trainers.
+
+**Empty Caption Behavior:** When a `.json` file exists but no prompts match the current training mode (e.g., all prompts have `do_i2v: false` while training in I2V mode), the resulting caption will be **empty** (equivalent to a black prompt). The system does **not** fall back to a `.txt` file in this case — the JSON file is treated as the explicit source of truth, and the user controls what happens when no prompts match.
 
 Images are never upscaled but they are downscaled and placed in buckets for batching. **You do not need to crop/resize your images**.
 The loader will automatically resize them and can handle varying aspect ratios. 

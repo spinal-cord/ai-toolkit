@@ -1,0 +1,29 @@
+[
+    {
+        "prompt": "a beautiful sunset over the ocean, golden hour, serene atmosphere",
+        "weight": 2.0,
+        "do_i2v": true,
+        "do_t2v": false
+    },
+    {
+        "prompt": "ocean waves crashing on rocks, dynamic motion, powerful energy",
+        "weight": 1.5,
+        "do_i2v": true,
+        "do_t2v": true
+    },
+    {
+        "prompt": "calm sea at dusk, still water, peaceful mood",
+        "weight": 1.0,
+        "do_i2v": false,
+        "do_t2v": true
+    },
+    {
+        "prompt": "a cat sitting on a windowsill, looking outside, cozy indoor scene"
+    },
+    {
+        "prompt": "close-up of cat eyes, detailed fur texture, shallow depth of field",
+        "weight": 0.8,
+        "do_i2v": true,
+        "do_t2v": false
+    }
+]

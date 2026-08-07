@@ -405,7 +405,7 @@ class DataLoaderBatchDTO:
                         )
 
             if any([x.prompt_embeds is not None for x in self.file_items]):
-                # find one to use as a base
+                # find one to use as a base (for shape/dtype reference)
                 base_prompt_embeds = None
                 for x in self.file_items:
                     if x.prompt_embeds is not None:
@@ -414,7 +414,19 @@ class DataLoaderBatchDTO:
                 prompt_embeds_list = []
                 for x in self.file_items:
                     if x.prompt_embeds is None:
-                        y = base_prompt_embeds
+                        # BUG FIX: Create empty prompt_embeds instead of borrowing another item's.
+                        # When a JSON caption has no prompts matching the current training mode
+                        # (e.g., all prompts have do_i2v=False while in I2V mode), prompt_embeds
+                        # is None and should train with an empty caption - not another item's caption.
+                        if isinstance(base_prompt_embeds.text_embeds, list):
+                            empty_text_embeds = [
+                                torch.zeros_like(t) for t in base_prompt_embeds.text_embeds
+                            ]
+                        else:
+                            empty_text_embeds = torch.zeros_like(base_prompt_embeds.text_embeds)
+                        y = PromptEmbeds(empty_text_embeds)
+                        if base_prompt_embeds.pooled_embeds is not None:
+                            y.pooled_embeds = torch.zeros_like(base_prompt_embeds.pooled_embeds)
                     else:
                         y = x.prompt_embeds
                     if x.text_embedding_space_version == "zimage":

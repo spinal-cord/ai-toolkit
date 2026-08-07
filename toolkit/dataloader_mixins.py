@@ -6,7 +6,7 @@ import math
 import os
 import random
 from collections import OrderedDict
-from typing import TYPE_CHECKING, List, Dict, Union
+from typing import TYPE_CHECKING, List, Dict, Union, Any
 import traceback
 
 import cv2
@@ -106,6 +106,249 @@ def clean_caption(caption):
     # caption = ', '.join(caption_split)
     return caption
 
+
+def _filter_prompts_by_mode(prompts: List[Dict[str, Any]], is_i2v_mode: bool = True, log_warning: bool = True) -> List[Dict[str, Any]]:
+    """
+    Filter prompts based on the current training mode (is_i2v_mode).
+
+    - If is_i2v_mode is True (I2V training), include prompts where do_i2v is True
+    - If is_i2v_mode is False (T2V training), include prompts where do_t2v is True
+    - A prompt is included if it matches the current training mode
+
+    This ensures that when dataset is doubled (both I2V and T2V enabled),
+    each copy only receives prompts appropriate for its mode.
+
+    Args:
+        prompts: List of prompt objects with do_i2v/do_t2v flags
+        is_i2v_mode: True for I2V training, False for T2V training
+        log_warning: If True, log a generic warning when all prompts are filtered out
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    filtered = []
+    for prompt in prompts:
+        prompt_do_i2v = prompt.get('do_i2v', True)
+        prompt_do_t2v = prompt.get('do_t2v', True)
+
+        if is_i2v_mode:
+            if prompt_do_i2v:
+                filtered.append(prompt)
+        else:
+            if prompt_do_t2v:
+                filtered.append(prompt)
+
+    # Warn if all prompts were filtered out (generic warning, no file/content details)
+    if log_warning and len(prompts) > 0 and len(filtered) == 0:
+        mode_name = 'I2V' if is_i2v_mode else 'T2V'
+        logger.warning(
+            f"All prompts filtered out for {mode_name} mode on a JSON-captions dataset item. "
+            f"This will result in an empty caption. Check do_i2v/do_t2v flags in your JSON captions."
+        )
+
+    return filtered
+
+
+def get_mode_from_config(dataset_config) -> str:
+    """
+    Determine the training mode from dataset config.
+
+    Returns:
+        'i2v' if do_i2v=True and do_t2v=False
+        't2v' if do_i2v=False and do_t2v=True
+        'both' if both are True (should only happen in doubled DTO path)
+        'i2v' as default if neither is explicitly set
+    """
+    do_i2v = getattr(dataset_config, 'do_i2v', True)
+    do_t2v = getattr(dataset_config, 'do_t2v', False)
+
+    if do_i2v and not do_t2v:
+        return 'i2v'
+    elif not do_i2v and do_t2v:
+        return 't2v'
+    elif do_i2v and do_t2v:
+        return 'both'
+    else:
+        # Default to I2V if config is ambiguous
+        return 'i2v'
+
+
+def is_i2v_mode_from_config(dataset_config) -> bool:
+    """
+    Check if we're in I2V mode based on dataset config.
+    Returns True if do_i2v=True and do_t2v=False (or default).
+    """
+    return get_mode_from_config(dataset_config) == 'i2v'
+
+
+def detect_json_caption(path_no_ext: str) -> str:
+    """
+    Check if a JSON caption file exists alongside the image/video file.
+    Returns the path to the JSON file if it exists, else None.
+    """
+    json_path = path_no_ext + '.json'
+    if os.path.exists(json_path):
+        return json_path
+    return None
+
+
+def compute_json_file_hash(json_path: str) -> str:
+    """
+    Compute MD5 hash of JSON file contents for cache invalidation.
+    Returns a base64-encoded, URL-safe hash string.
+    """
+    with open(json_path, 'rb') as f:
+        file_hash = hashlib.md5(f.read()).hexdigest()
+    return file_hash
+
+
+def parse_json_captions(json_path: str) -> List[Dict[str, Any]]:
+    """
+    Parse a JSON caption file and return a list of prompt objects.
+    
+    Expected JSON structure:
+    [
+        {
+            "prompt": "string",
+            "weight": float (optional),
+            "do_i2v": bool (optional),
+            "do_t2v": bool (optional)
+        },
+        ...
+    ]
+    
+    Or a single object (will be wrapped in a list):
+    {
+        "prompt": "string",
+        "weight": float (optional),
+        ...
+    }
+    
+    Field defaults (applied when missing, None, wrong type, or invalid value):
+    - prompt: ''
+    - do_i2v: True
+    - do_t2v: True
+    - weight: None (auto-computed if missing/invalid)
+    
+    Weight normalization:
+    - If weight is missing, None, or negative, it will be computed automatically
+    - If all prompts lack weights, they get equal chance
+    - If only one prompt exists, weight is set to 1.0
+    """
+    with open(json_path, 'r', encoding='utf-8') as f:
+        raw_content = f.read()
+        data = json.loads(raw_content)
+    
+    # Handle single object (not in a list)
+    if isinstance(data, dict):
+        data = [data]
+    
+    # Ensure it's a list
+    if not isinstance(data, list):
+        raise ValueError(f"Expected JSON to be a list or object, got {type(data)}")
+    
+    prompts = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        
+        # Safely extract prompt, default to '' if missing, None, or not a string
+        raw_prompt = item.get('prompt')
+        prompt_text = raw_prompt if isinstance(raw_prompt, str) else ''
+        
+        # Safely extract do_i2v, default to True if missing, None, wrong type, or invalid
+        raw_i2v = item.get('do_i2v')
+        is_i2v = raw_i2v is True if isinstance(raw_i2v, bool) else True
+        
+        # Safely extract do_t2v, default to True if missing, None, wrong type, or invalid
+        raw_t2v = item.get('do_t2v')
+        is_t2v = raw_t2v is True if isinstance(raw_t2v, bool) else True
+        
+        # Safely extract weight
+        raw_weight = item.get('weight')
+        # Respect explicit 0 weight, treat missing/invalid as None (auto)
+        weight = raw_weight if isinstance(raw_weight, (int, float)) and raw_weight >= 0 else None
+        
+        prompts.append({
+            'prompt': prompt_text,
+            'weight': weight,
+            'do_i2v': is_i2v,
+            'do_t2v': is_t2v,
+        })
+    
+    # Empty prompts are kept as valid prompts.
+    # They are cached separately and selected according to their weight.
+    # This allows intentional use of empty captions (equivalent to caption dropout)
+    # by specifying an empty prompt with a non-zero weight.
+    
+    if not prompts:
+        return []
+    
+    # Normalize weights
+    has_positive_weight = any(p['weight'] is not None and p['weight'] > 0 for p in prompts)
+    
+    if len(prompts) == 1:
+        # Single prompt: default to 1.0 unless explicitly set to 0
+        if prompts[0]['weight'] is None or prompts[0]['weight'] > 0:
+            prompts[0]['weight'] = 1.0
+        # If explicitly 0, keep it as is
+    elif not has_positive_weight:
+        # No positive weights found
+        for p in prompts:
+            if p['weight'] is None:
+                p['weight'] = 1.0  # Auto-compute for missing weights
+            # Explicit 0 weights are preserved
+    else:
+        # Some positive weights exist
+        for p in prompts:
+            if p['weight'] is None:
+                p['weight'] = 1.0  # Default for missing weights
+            # Explicit 0 weights are preserved
+    
+    return prompts
+
+
+def select_prompt_weighted(prompts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Select a prompt from the list using weighted random selection.
+    Returns the selected prompt object.
+
+    IMPORTANT: This selection is intentionally NON-DETERMINISTIC. The same image/video
+    may get different prompts across training steps/epochs. This is by design to provide
+    caption augmentation and help the model learn from multiple descriptions of the same
+    media. If you need deterministic training, use .txt caption files instead of JSON
+    with multiple prompts.
+
+    Behavior when all weights are 0:
+        Returns an empty caption (equivalent to caption dropout). This allows you to
+        intentionally "disable" prompts by setting their weight to 0.
+    """
+    if not prompts:
+        return {'prompt': '', 'weight': 0.0, 'do_i2v': True, 'do_t2v': True}
+    
+    if len(prompts) == 1:
+        return prompts[0]
+    
+    # Extract weights for selection
+    weights = [p['weight'] for p in prompts]
+    total_weight = sum(weights)
+    
+    # If all weights are 0 (or negative), return empty caption.
+    # This is intentional: setting all weights to 0 means "use empty caption".
+    if total_weight <= 0:
+        return {'prompt': '', 'weight': 0.0, 'do_i2v': True, 'do_t2v': True}
+    
+    # Weighted random selection
+    rand = random.random() * total_weight
+    cumulative = 0
+    for prompt in prompts:
+        cumulative += prompt['weight']
+        if rand <= cumulative:
+            return prompt
+    
+    # Fallback to last prompt
+    return prompts[-1]
+
 def waveform_to_stereo(waveform):
     c = waveform.shape[0]
     if c == 2:
@@ -147,7 +390,40 @@ class CaptionMixin:
         default_prompt_path = os.path.join(os.path.dirname(img_path), 'default.txt')
         default_prompt_path_with_ext = os.path.join(os.path.dirname(img_path), 'default' + ext)
 
-        if os.path.exists(prompt_path):
+        # Check for JSON caption file first (automatic detection, independent of caption_ext)
+        json_caption_path = detect_json_caption(path_no_ext)
+        
+        if json_caption_path:
+            # Parse JSON captions
+            raw_prompts = parse_json_captions(json_caption_path)
+            
+            if raw_prompts:
+                # Determine training mode from dataset config
+                # Note: self is the dataset instance here, not FileItemDTO
+                # For legacy paths, we use dataset_config.do_i2v/do_t2v to determine mode
+                # For doubled datasets, this path is not used (DTO path handles it)
+                mode = get_mode_from_config(self.dataset_config)
+                # When both I2V and T2V are enabled in legacy path, treat as I2V
+                # (legacy path doesn't support doubling, so we default to I2V mode)
+                is_i2v = (mode in ('i2v', 'both'))
+                
+                filtered_prompts = _filter_prompts_by_mode(raw_prompts, is_i2v_mode=is_i2v)
+                
+                if filtered_prompts:
+                    # Select a prompt using weighted random selection and apply clean_caption
+                    selected = select_prompt_weighted(filtered_prompts)
+                    prompt = clean_caption(selected['prompt'])
+                else:
+                    # Intentionally empty: JSON caption files provide their own
+                    # caption logic (mode filtering, weighted selection, empty
+                    # results when no prompts match). No default_prompt fallback
+                    # is applied because the JSON file is the explicit source of
+                    # truth and the user controls what happens when no prompts
+                    # match the current mode.
+                    prompt = ''
+            else:
+                prompt = ''
+        elif os.path.exists(prompt_path):
             with open(prompt_path, 'r', encoding='utf-8') as f:
                 prompt = f.read()
                 prompt = clean_caption(prompt)
@@ -316,6 +592,12 @@ class CaptionProcessingDTOMixin:
             self.raw_caption_short: str = None
             self.caption: str = None
             self.caption_short: str = None
+            
+            # New fields for JSON caption support
+            self.raw_prompts: List[Dict[str, Any]] = []  # List of prompt objects from JSON
+            self.selected_prompt: Dict[str, Any] = None  # The currently selected prompt object
+            self.json_caption_path: str = None  # Path to JSON caption file if used
+            self.json_file_hash: str = None  # MD5 hash of JSON file for cache invalidation
 
             dataset_config: DatasetConfig = kwargs.get('dataset_config', None)
             self.extra_values: List[float] = dataset_config.extra_values
@@ -335,33 +617,135 @@ class CaptionProcessingDTOMixin:
         else:
             # see if prompt file exists
             path_no_ext = os.path.splitext(self.path)[0]
-            prompt_ext = self.dataset_config.caption_ext
-            prompt_path = path_no_ext + prompt_ext
-            short_caption = None
-
-            if os.path.exists(prompt_path):
-                with open(prompt_path, 'r', encoding='utf-8') as f:
-                    prompt = f.read()
-                    short_caption = None
-                    prompt = clean_caption(prompt)
-                    if short_caption is not None:
-                        short_caption = clean_caption(short_caption)
+            
+            # Check for JSON caption file first (automatic detection, independent of caption_ext)
+            json_caption_path = detect_json_caption(path_no_ext)
+            
+            if json_caption_path:
+                # Store JSON caption path and compute hash for cache invalidation
+                self.json_caption_path = json_caption_path
+                self.json_file_hash = compute_json_file_hash(json_caption_path)
+                
+                # Parse JSON captions
+                self.raw_prompts = parse_json_captions(json_caption_path)
+                
+                if self.raw_prompts:
+                    # Filter prompts based on training mode (is_i2v_mode)
+                    is_i2v = getattr(self, 'is_i2v_mode', True)
+                    filtered_prompts = _filter_prompts_by_mode(self.raw_prompts, is_i2v_mode=is_i2v)
                     
-                    if prompt.strip() == '' and self.dataset_config.default_caption is not None:
-                        prompt = self.dataset_config.default_caption
+                    if filtered_prompts:
+                        # Select a prompt using weighted random selection and apply clean_caption
+                        # NOTE: This selection is intentionally NON-DETERMINISTIC for caption augmentation.
+                        # With text embedding caching, a random prompt is selected at training time
+                        # and its cached embedding is loaded.
+                        self.selected_prompt = select_prompt_weighted(filtered_prompts)
+                        self.raw_caption = clean_caption(self.selected_prompt['prompt'])
+                    else:
+                        # No prompts match the current mode, use empty caption
+                        # Intentionally no default_prompt fallback: the JSON file
+                        # is the explicit source of truth and the user controls
+                        # what happens when no prompts match the current mode.
+                        self.raw_caption = ''
+                        self.selected_prompt = {'prompt': '', 'weight': 0.0, 'do_i2v': True, 'do_t2v': True}
+                else:
+                    self.raw_caption = ''
+                    self.selected_prompt = {'prompt': '', 'weight': 0.0, 'do_i2v': True, 'do_t2v': True}
+                
+                # Set short caption to the same as main caption for JSON mode
+                self.raw_caption_short = self.raw_caption
             else:
-                prompt = ''
-                if self.dataset_config.default_caption is not None:
-                    prompt = self.dataset_config.default_caption
+                # Fall back to existing .txt behavior
+                prompt_ext = self.dataset_config.caption_ext
+                prompt_path = path_no_ext + prompt_ext
+                short_caption = None
 
-            if short_caption is None:
-                short_caption = self.dataset_config.default_caption
-            self.raw_caption = prompt
-            self.raw_caption_short = short_caption
+                if os.path.exists(prompt_path):
+                    with open(prompt_path, 'r', encoding='utf-8') as f:
+                        prompt = f.read()
+                        short_caption = None
+                        prompt = clean_caption(prompt)
+                        if short_caption is not None:
+                            short_caption = clean_caption(short_caption)
+                        # JSON mode does not apply default_caption fallback;
+                        # this branch only runs for .txt fallback, which does.
+                        
+                        if prompt.strip() == '' and self.dataset_config.default_caption is not None:
+                            prompt = self.dataset_config.default_caption
+                else:
+                    prompt = ''
+                    if self.dataset_config.default_caption is not None:
+                        prompt = self.dataset_config.default_caption
+
+                if short_caption is None:
+                    short_caption = self.dataset_config.default_caption
+                self.raw_caption = prompt
+                self.raw_caption_short = short_caption
+                # Initialize JSON-specific fields for non-JSON captions
+                self.raw_prompts = []
+                self.selected_prompt = None
 
         self.caption = self.get_caption()
         if self.raw_caption_short is not None:
             self.caption_short = self.get_caption(short_caption=True)
+        
+        # Clean up orphaned JSON caches if the JSON file has changed.
+        # This removes old .safetensors files that were cached for previous
+        # versions of the JSON file (different hash) to save disk space.
+        if self.json_caption_path is not None:
+            self.cleanup_orphaned_json_caches()
+    
+    def _filter_prompts_by_mode(self, prompts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Filter prompts based on the current training mode (is_i2v_mode).
+        Delegates to the module-level _filter_prompts_by_mode helper.
+        """
+        return _filter_prompts_by_mode(prompts, is_i2v_mode=getattr(self, 'is_i2v_mode', True))
+    
+    def cleanup_orphaned_json_caches(self: 'FileItemDTO'):
+        """
+        Clean up old text embedding caches for JSON captions when the JSON file has changed.
+        Old caches (with different JSON hash) are deleted to save disk space.
+        """
+        if self.json_caption_path is None:
+            return
+        
+        img_dir = os.path.dirname(self.path)
+        te_dir = os.path.join(img_dir, '_t_e_cache')
+        
+        if not os.path.exists(te_dir):
+            return
+        
+        filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
+        current_hash = self.json_file_hash
+        
+        # Compute the base hash strings for current prompts
+        current_hashes = set()
+        for prompt_idx in range(len(self.raw_prompts)):
+            hash_dict = self.get_text_embedding_info_dict(prompt_index=prompt_idx)
+            hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
+            hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
+            hash_str = hash_str.replace('=', '')
+            current_hashes.add(hash_str)
+        
+        # Find and delete orphaned cache files
+        deleted_count = 0
+        for cache_file in os.listdir(te_dir):
+            if cache_file.startswith(f'{filename_no_ext}_') and cache_file.endswith('.safetensors'):
+                # Extract the hash from filename
+                # Format: {filename_no_ext}_{hash}.safetensors
+                hash_part = cache_file[len(filename_no_ext) + 1:-len('.safetensors')]
+                if hash_part not in current_hashes:
+                    try:
+                        os.remove(os.path.join(te_dir, cache_file))
+                        deleted_count += 1
+                    except OSError:
+                        pass  # Ignore errors deleting old files
+        
+        if deleted_count > 0:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(f"Cleaned up {deleted_count} orphaned text embedding caches for {filename_no_ext}")
 
     def get_caption(
             self: 'FileItemDTO',
@@ -1852,29 +2236,95 @@ class TextEmbeddingFileItemDTOMixin:
         self.text_embedding_load_device = 'cpu'
         self.text_embedding_version = 1
 
-    def get_text_embedding_info_dict(self: 'FileItemDTO'):
+    def get_text_embedding_info_dict(self: 'FileItemDTO', prompt_index: int = None):
+        """
+        Get info dict used for text embedding cache path generation.
+        
+        For JSON captions:
+            - Uses JSON file hash instead of caption text for cache invalidation
+            - prompt_index parameter identifies which prompt from the JSON file
+            - This allows caching all prompts separately
+        
+        For .txt captions:
+            - Uses caption text in hash (existing behavior)
+        """
         # make sure the caption is loaded here
-        # TODO: we need a way to cache all the other features like trigger words, DOP, etc. For now, we need to throw an error if not compatible.
         if self.caption is None:
             self.load_caption()
-        item = OrderedDict([
-            ("caption", self.caption),
-            ("text_embedding_space_version", self.text_embedding_space_version),
-            ("text_embedding_version", self.text_embedding_version),
-        ])
+        
+        # For JSON captions, use JSON file hash instead of caption text
+        # This allows caching all prompts from the same JSON file
+        if self.json_caption_path is not None and self.json_file_hash is not None:
+            item = OrderedDict([
+                ("json_hash", self.json_file_hash),
+                ("text_embedding_space_version", self.text_embedding_space_version),
+                ("text_embedding_version", self.text_embedding_version),
+            ])
+            # Include prompt index for multi-prompt JSON files
+            if prompt_index is not None:
+                item["prompt_index"] = prompt_index
+        else:
+            # Standard behavior for .txt captions
+            item = OrderedDict([
+                ("caption", self.caption),
+                ("text_embedding_space_version", self.text_embedding_space_version),
+                ("text_embedding_version", self.text_embedding_version),
+            ])
+        
         # if we have a control image, cache the path
         if self.encode_control_in_text_embeddings and self.control_path is not None:
             item["control_path"] = self.control_path
         return item
-
-    def get_text_embedding_path(self: 'FileItemDTO', recalculate=False):
-        if self._text_embedding_path is not None and not recalculate:
-            return self._text_embedding_path
+    
+    def get_json_prompt_cache_paths(self: 'FileItemDTO') -> List[str]:
+        """
+        Get cache paths for all prompts in a JSON caption file.
+        Returns a list of paths, one per prompt.
+        """
+        if self.json_caption_path is None or not self.raw_prompts:
+            return []
+        
+        paths = []
+        img_dir = os.path.dirname(self.path)
+        te_dir = os.path.join(img_dir, '_t_e_cache')
+        filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
+        
+        for idx, prompt in enumerate(self.raw_prompts):
+            hash_dict = self.get_text_embedding_info_dict(prompt_index=idx)
+            hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
+            hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
+            hash_str = hash_str.replace('=', '')
+            paths.append(os.path.join(te_dir, f'{filename_no_ext}_{hash_str}.safetensors'))
+        
+        return paths
+    
+    def get_captions_for_caching(self: 'FileItemDTO') -> List[str]:
+        """
+        Get all captions that need to be cached.
+        For JSON captions: returns all prompts.
+        For .txt captions: returns the single caption.
+        """
+        if self.json_caption_path is not None and self.raw_prompts:
+            return [clean_caption(p['prompt']) for p in self.raw_prompts]
         else:
+            return [self.caption] if self.caption else []
+
+    def get_text_embedding_path(self: 'FileItemDTO', recalculate=False, prompt_index: int = None):
+        """
+        Get the text embedding cache path.
+        
+        For JSON captions:
+            - prompt_index identifies which prompt's cache to load
+            - If prompt_index is None, returns None (must be specified for JSON)
+        
+        For .txt captions:
+            - prompt_index is ignored
+        """
+        if recalculate or self._text_embedding_path is None:
             # we store text embeddings in a folder in same path as image called _text_embedding_cache
             img_dir = os.path.dirname(self.path)
             te_dir = os.path.join(img_dir, '_t_e_cache')
-            hash_dict = self.get_text_embedding_info_dict()
+            hash_dict = self.get_text_embedding_info_dict(prompt_index=prompt_index)
             filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
             # get base64 hash of md5 checksum of hash_dict
             hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
@@ -1893,8 +2343,60 @@ class TextEmbeddingFileItemDTOMixin:
         if not self.is_text_embedding_cached:
             return
         if self.prompt_embeds is None:
-            # load it from disk
-            self.prompt_embeds = PromptEmbeds.load(self.get_text_embedding_path())
+            # For JSON captions with multiple prompts, randomly select one at training time
+            # This provides caption augmentation while still using cached embeddings
+            if self.json_caption_path is not None and len(self.raw_prompts) > 0:
+                # Filter prompts by training mode
+                is_i2v = getattr(self, 'is_i2v_mode', True)
+                filtered_prompts = _filter_prompts_by_mode(self.raw_prompts, is_i2v_mode=is_i2v, log_warning=False)
+                
+                if filtered_prompts:
+                    # Select a prompt using weighted random selection
+                    selected = select_prompt_weighted(filtered_prompts)
+                    # Find the index of the selected prompt in the original list
+                    selected_index = None
+                    for idx, p in enumerate(self.raw_prompts):
+                        if p is selected:
+                            selected_index = idx
+                            break
+                    
+                    if selected_index is not None:
+                        # Load the cached embedding for this specific prompt
+                        cache_path = self.get_text_embedding_path(recalculate=True, prompt_index=selected_index)
+                        if os.path.exists(cache_path):
+                            self.prompt_embeds = PromptEmbeds.load(cache_path)
+                            # Update caption to match loaded embedding
+                            self.selected_prompt = selected
+                            self.raw_caption = selected['prompt']
+                            self.raw_caption_short = self.raw_caption
+                            # Recompute caption with trigger word etc.
+                            self.caption = self.get_caption()
+                            if self.raw_caption_short is not None:
+                                self.caption_short = self.get_caption(short_caption=True)
+                            return
+                
+                # No prompts matched the current training mode - use empty prompt.
+                # Intentionally do NOT fallback to prompt_index=0, as that could
+                # silently train on wrong-mode prompts (e.g., T2V-only dataset
+                # getting I2V-only captions). This respects the JSON file as the
+                # explicit source of truth.
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(
+                    f"Did not find matching prompt - fallback to empty prompt "
+                    f"(JSON captions: {self.json_caption_path}, "
+                    f"mode={'I2V' if is_i2v else 'T2V'})"
+                )
+                return
+            
+            # Standard behavior for .txt captions only.
+            # If json_caption_path is set but raw_prompts is empty, don't try to load
+            # from a cache path that was never created (would cause FileNotFoundError).
+            # This can happen when a JSON file is modified to have no valid prompts
+            # after caches were created for the previous valid prompts.
+            if self.json_caption_path is None:
+                self.prompt_embeds = PromptEmbeds.load(self.get_text_embedding_path())
+            # else: JSON with no valid prompts - leave prompt_embeds as None (uses empty caption)
 
 class TextEmbeddingCachingMixin:
     def __init__(self: 'AiToolkitDataset', **kwargs):
@@ -1909,54 +2411,116 @@ class TextEmbeddingCachingMixin:
             print_acc(" - Saving text embeddings to disk")
             
             did_move = False
+            total_cached = 0
 
             # use tqdm to show progress
             i = 0
             for file_item in tqdm(self.file_list, desc='Caching text embeddings to disk'):
                 file_item.latent_load_device = self.sd.device
+                # Load caption first so JSON captions are parsed (json_caption_path and raw_prompts set)
+                file_item.load_caption()
 
-                text_embedding_path = file_item.get_text_embedding_path(recalculate=True)
-                # only process if not saved to disk
-                if not os.path.exists(text_embedding_path):
-                    # load if not loaded
-                    if not did_move:
-                        self.sd.set_device_state_preset('cache_text_encoder')
-                        did_move = True
+                # For JSON captions, cache ALL prompts separately
+                # For .txt captions, use existing single-caption behavior
+                if file_item.json_caption_path is not None and file_item.raw_prompts:
+                    # Cache each prompt from the JSON file
+                    captions_to_cache = file_item.get_captions_for_caching()
+                    
+                    for prompt_idx, caption_text in enumerate(captions_to_cache):
+                        text_embedding_path = file_item.get_text_embedding_path(recalculate=True, prompt_index=prompt_idx)
                         
-                    if file_item.encode_control_in_text_embeddings and file_item.control_path is not None:
-                        ctrl_img_list = []
-                        control_path_list = file_item.control_path
-                        if not isinstance(file_item.control_path, list):
-                            control_path_list = [control_path_list]
-                        for i in range(len(control_path_list)):
-                            try:
-                                img = Image.open(control_path_list[i]).convert("RGB")
-                                img = exif_transpose(img)
-                                # convert to 0 to 1 tensor
-                                img = (
-                                    TF.to_tensor(img)
-                                    .unsqueeze(0)
-                                    .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
-                                )
-                                ctrl_img_list.append(img)
-                            except Exception as e:
-                                print_acc(f"Error: {e}")
-                                print_acc(f"Error loading control image: {control_path_list[i]}")
+                        # Skip if already cached
+                        if os.path.exists(text_embedding_path):
+                            continue
                         
-                        if len(ctrl_img_list) == 0:
-                            ctrl_img = None
-                        elif not self.sd.has_multiple_control_images:
-                            ctrl_img = ctrl_img_list[0]
+                        # load if not loaded
+                        if not did_move:
+                            self.sd.set_device_state_preset('cache_text_encoder')
+                            did_move = True
+                            
+                        # Encode prompt (control images are per-file, not per-prompt)
+                        if file_item.encode_control_in_text_embeddings and file_item.control_path is not None:
+                            ctrl_img_list = []
+                            control_path_list = file_item.control_path
+                            if not isinstance(file_item.control_path, list):
+                                control_path_list = [control_path_list]
+                            for ctrl_idx in range(len(control_path_list)):
+                                try:
+                                    img = Image.open(control_path_list[ctrl_idx]).convert("RGB")
+                                    img = exif_transpose(img)
+                                    # convert to 0 to 1 tensor
+                                    img = (
+                                        TF.to_tensor(img)
+                                        .unsqueeze(0)
+                                        .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                                    )
+                                    ctrl_img_list.append(img)
+                                except Exception as e:
+                                    print_acc(f"Error: {e}")
+                                    print_acc(f"Error loading control image: {control_path_list[ctrl_idx]}")
+                            
+                            if len(ctrl_img_list) == 0:
+                                ctrl_img = None
+                            elif not self.sd.has_multiple_control_images:
+                                ctrl_img = ctrl_img_list[0]
+                            else:
+                                ctrl_img = ctrl_img_list
+                            prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption_text, control_images=ctrl_img)
                         else:
-                            ctrl_img = ctrl_img_list
-                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption, control_images=ctrl_img)
-                    else:
-                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption)
-                    # save it
-                    prompt_embeds.save(text_embedding_path)
-                    del prompt_embeds
+                            prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption_text)
+                        
+                        # save it
+                        prompt_embeds.save(text_embedding_path)
+                        del prompt_embeds
+                        total_cached += 1
+                else:
+                    # Standard behavior for .txt captions
+                    text_embedding_path = file_item.get_text_embedding_path(recalculate=True)
+                    # only process if not saved to disk
+                    if not os.path.exists(text_embedding_path):
+                        # load if not loaded
+                        if not did_move:
+                            self.sd.set_device_state_preset('cache_text_encoder')
+                            did_move = True
+                            
+                        if file_item.encode_control_in_text_embeddings and file_item.control_path is not None:
+                            ctrl_img_list = []
+                            control_path_list = file_item.control_path
+                            if not isinstance(file_item.control_path, list):
+                                control_path_list = [control_path_list]
+                            for ctrl_idx in range(len(control_path_list)):
+                                try:
+                                    img = Image.open(control_path_list[ctrl_idx]).convert("RGB")
+                                    img = exif_transpose(img)
+                                    # convert to 0 to 1 tensor
+                                    img = (
+                                        TF.to_tensor(img)
+                                        .unsqueeze(0)
+                                        .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                                    )
+                                    ctrl_img_list.append(img)
+                                except Exception as e:
+                                    print_acc(f"Error: {e}")
+                                    print_acc(f"Error loading control image: {control_path_list[ctrl_idx]}")
+                            
+                            if len(ctrl_img_list) == 0:
+                                ctrl_img = None
+                            elif not self.sd.has_multiple_control_images:
+                                ctrl_img = ctrl_img_list[0]
+                            else:
+                                ctrl_img = ctrl_img_list
+                            prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption, control_images=ctrl_img)
+                        else:
+                            prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption)
+                        # save it
+                        prompt_embeds.save(text_embedding_path)
+                        del prompt_embeds
+                        total_cached += 1
+                
                 file_item.is_text_embedding_cached = True
                 i += 1
+            
+            print_acc(f"Cached {total_cached} text embeddings to disk")
             # restore device state
             # if did_move:
             #     self.sd.restore_device_state()
