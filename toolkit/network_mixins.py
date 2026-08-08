@@ -540,6 +540,12 @@ class ToolkitNetworkMixin:
         return keymap
     
     def get_state_dict(self: Network, extra_state_dict=None, dtype=torch.float16):
+        from toolkit.print import print_acc
+        import time
+        
+        print_acc("[SAVE LOG] Starting get_state_dict...")
+        start_time = time.time()
+        
         keymap = self.get_keymap()
 
         save_keymap = {}
@@ -548,22 +554,58 @@ class ToolkitNetworkMixin:
                 #  invert them
                 save_keymap[diffusers_key] = ldm_key
 
+        print_acc("[SAVE LOG] Calling self.state_dict()...")
+        state_dict_start = time.time()
         state_dict = self.state_dict()
-        save_dict = OrderedDict()
+        state_dict_time = time.time() - state_dict_start
+        print_acc(f"[SAVE LOG] state_dict() completed in {state_dict_time:.2f}s. Keys: {len(state_dict)}")
+        
+        # Log total parameters and tensor sizes
+        total_params = 0
+        total_bytes = 0
+        largest_tensor = (None, 0)
+        for key, v in state_dict.items():
+            params = v.numel()
+            bytes_size = v.element_size() * params
+            total_params += params
+            total_bytes += bytes_size
+            if bytes_size > largest_tensor[1]:
+                largest_tensor = (key, bytes_size)
+        print_acc(f"[SAVE LOG] Total params: {total_params:,}, Total size: {total_bytes / 1024**3:.2f} GB")
+        print_acc(f"[SAVE LOG] Largest tensor: {largest_tensor[0]} ({largest_tensor[1] / 1024**2:.2f} MB)")
 
-        for key in list(state_dict.keys()):
+        save_dict = OrderedDict()
+        print_acc("[SAVE LOG] Starting tensor processing (detach/clone/to_cpu/to_dtype)...")
+        tensor_proc_start = time.time()
+
+        for i, key in enumerate(list(state_dict.keys())):
             v = state_dict[key]
+            # Ensure tensor is contiguous (required by safetensors)
+            if not v.is_contiguous():
+                print_acc(f"[SAVE LOG] WARNING: Tensor {key} is not contiguous, making contiguous...")
+                v = v.contiguous()
             v = v.detach().clone().to("cpu").to(dtype)
             save_key = save_keymap[key] if key in save_keymap else key
             save_dict[save_key] = v
             del state_dict[key]
+            # Log progress every 100 tensors
+            if (i + 1) % 100 == 0:
+                elapsed = time.time() - tensor_proc_start
+                print_acc(f"[SAVE LOG] Processed {i + 1}/{len(state_dict)} tensors in {elapsed:.2f}s")
+        
+        tensor_proc_time = time.time() - tensor_proc_start
+        print_acc(f"[SAVE LOG] Tensor processing completed in {tensor_proc_time:.2f}s")
 
         if extra_state_dict is not None:
             # add extra items to state dict
+            print_acc(f"[SAVE LOG] Processing extra_state_dict with {len(extra_state_dict)} keys...")
             for key in list(extra_state_dict.keys()):
                 v = extra_state_dict[key]
                 v = v.detach().clone().to("cpu").to(dtype)
                 save_dict[key] = v
+
+        total_time = time.time() - start_time
+        print_acc(f"[SAVE LOG] get_state_dict completed in {total_time:.2f}s. Final keys: {len(save_dict)}")
 
         if self.peft_format:
             # lora_down = lora_A
@@ -605,6 +647,30 @@ class ToolkitNetworkMixin:
             metadata=None,
             extra_state_dict: Optional[OrderedDict] = None
     ):
+        from toolkit.print import print_acc
+        import time
+        
+        print_acc(f"[SAVE LOG] save_weights called. File: {file}")
+        start_time = time.time()
+        
+        # Set up a simple watchdog to detect hangs
+        import threading
+        hang_detected = threading.Event()
+        
+        def watchdog():
+            timeout = 600  # 10 minutes
+            elapsed = 0
+            while elapsed < timeout and not hang_detected.is_set():
+                time.sleep(30)
+                elapsed += 30
+                if elapsed >= 120:  # Start warning after 2 minutes
+                    print_acc(f"[SAVE LOG] WARNING: save_weights has been running for {elapsed}s...")
+            if elapsed >= timeout:
+                print_acc(f"[SAVE LOG] ERROR: save_weights appears to be hung (ran for {timeout}s)")
+        
+        watchdog_thread = threading.Thread(target=watchdog, daemon=True)
+        watchdog_thread.start()
+        
         save_dict = self.get_state_dict(extra_state_dict=extra_state_dict, dtype=dtype)
         
         if metadata is not None and len(metadata) == 0:
@@ -612,19 +678,56 @@ class ToolkitNetworkMixin:
 
         if metadata is None:
             metadata = OrderedDict()
-        metadata = add_model_hash_to_meta(save_dict, metadata)
+        
+        # Model hash computation is disabled by default because it can cause long pauses
+        # or apparent hangs on very large state dicts (e.g., Wan 2.2 14B with high-rank LoRA).
+        # Set AITK_COMPUTE_MODEL_HASH=true to re-enable for compatibility with
+        # sd-webui-additional-networks pre-indexing.
+        skip_hash = os.environ.get("AITK_COMPUTE_MODEL_HASH", "false").lower() != "true"
+        if skip_hash:
+            print_acc("[SAVE LOG] Skipping model hash computation (disabled by default). "
+                      "Set AITK_COMPUTE_MODEL_HASH=true to enable for additional-networks compatibility.")
+        else:
+            print_acc("[SAVE LOG] Computing model hash...")
+            hash_start = time.time()
+            metadata = add_model_hash_to_meta(save_dict, metadata)
+            hash_time = time.time() - hash_start
+            hash_status = metadata.get("ss_hash_status", "ok")
+            if hash_status == "ok":
+                print_acc(f"[SAVE LOG] Model hash computed in {hash_time:.2f}s")
+            else:
+                print_acc(
+                    f"[SAVE LOG] Model hash NOT computed (status={hash_status}) in {hash_time:.2f}s."
+                )
+        
         # let the model handle the saving
         
         if self.base_model_ref is not None and hasattr(self.base_model_ref(), 'save_lora'):
             # call the base model save lora method
+            print_acc("[SAVE LOG] Delegating to base_model_ref().save_lora()...")
             self.base_model_ref().save_lora(save_dict, file, metadata)
+            total_time = time.time() - start_time
+            hang_detected.set()  # Stop the watchdog
+            print_acc(f"[SAVE LOG] save_weights completed (via base_model_ref) in {total_time:.2f}s")
             return
         
+        print_acc(f"[SAVE LOG] Saving directly to {file}...")
+        save_start = time.time()
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import save_file
+            print_acc("[SAVE LOG] Calling safetensors.save_file()...")
             save_file(save_dict, file, metadata)
+            save_time = time.time() - save_start
+            print_acc(f"[SAVE LOG] safetensors.save_file() completed in {save_time:.2f}s")
         else:
+            print_acc("[SAVE LOG] Calling torch.save()...")
             torch.save(save_dict, file)
+            save_time = time.time() - save_start
+            print_acc(f"[SAVE LOG] torch.save() completed in {save_time:.2f}s")
+        
+        total_time = time.time() - start_time
+        hang_detected.set()  # Stop the watchdog
+        print_acc(f"[SAVE LOG] save_weights completed in {total_time:.2f}s")
 
     def load_weights(self: Network, file, force_weight_mapping=False):
         # allows us to save and load to and from ldm weights

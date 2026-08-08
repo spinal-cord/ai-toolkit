@@ -1156,21 +1156,50 @@ class Wan2214bModel(Wan21):
         output_path: str,
         metadata: Optional[Dict[str, Any]] = None,
     ):
+        from toolkit.print import print_acc
+        import time
+        
+        print_acc(f"[WAN22 SAVE LOG] save_lora called. Output: {output_path}")
+        print_acc(f"[WAN22 SAVE LOG] split_multistage_loras: {self.network.network_config.split_multistage_loras}")
+        print_acc(f"[WAN22 SAVE LOG] train_high_noise: {self.train_high_noise}, train_low_noise: {self.train_low_noise}")
+        print_acc(f"[WAN22 SAVE LOG] Input state_dict keys: {len(state_dict)}")
+        
+        start_time = time.time()
+        
+        # Log tensor sizes
+        total_bytes = 0
+        for key, v in state_dict.items():
+            total_bytes += v.element_size() * v.numel()
+        print_acc(f"[WAN22 SAVE LOG] Input state_dict size: {total_bytes / 1024**3:.2f} GB")
+        
         if not self.network.network_config.split_multistage_loras:
             # just save as a combo lora
+            print_acc(f"[WAN22 SAVE LOG] Saving as single combo LoRA to {output_path}...")
+            # Ensure all tensors are contiguous
+            print_acc("[WAN22 SAVE LOG] Ensuring tensors are contiguous...")
+            for key, v in state_dict.items():
+                if not v.is_contiguous():
+                    print_acc(f"[WAN22 SAVE LOG] Making tensor {key} contiguous")
+                    state_dict[key] = v.contiguous()
+            save_start = time.time()
             save_file(state_dict, output_path, metadata=metadata)
+            save_time = time.time() - save_start
+            print_acc(f"[WAN22 SAVE LOG] Single save completed in {save_time:.2f}s")
             return
 
         # we need to build out both dictionaries for high and low noise LoRAs.
         # LoRA keys contain "transformer_1" or "transformer_2" in the module name
         # (with underscores, e.g. lora_unet_transformer_1_blocks_0_attn1_to_q.lora_down.weight).
+        print_acc("[WAN22 SAVE LOG] Splitting LoRAs by transformer expert...")
+        split_start = time.time()
+        
         high_noise_lora = {}
         low_noise_lora = {}
         
         only_train_high_noise = self.train_high_noise and not self.train_low_noise
         only_train_low_noise = self.train_low_noise and not self.train_high_noise
 
-        for key in state_dict:
+        for i, key in enumerate(state_dict):
             if "transformer_1" in key or only_train_high_noise:
                 # this is a high noise LoRA — strip the transformer_1/2 substring
                 # from the module-name portion so the saved key matches standard LoRA format.
@@ -1200,6 +1229,24 @@ class Wan2214bModel(Wan21):
                 while "__" in new_key:
                     new_key = new_key.replace("__", "_")
                 low_noise_lora[new_key] = state_dict[key]
+            # Log progress at 4 evenly-spaced points across the range
+            total = len(state_dict)
+            num_steps = 4
+            step_interval = total // num_steps
+            if step_interval > 0 and (i + 1) % step_interval == 0:
+                elapsed = time.time() - split_start
+                print_acc(f"[WAN22 SAVE LOG] Split progress: {i + 1}/{total} in {elapsed:.2f}s")
+        
+        split_time = time.time() - split_start
+        print_acc(f"[WAN22 SAVE LOG] Split completed in {split_time:.2f}s")
+        print_acc(f"[WAN22 SAVE LOG] high_noise_lora keys: {len(high_noise_lora)}")
+        print_acc(f"[WAN22 SAVE LOG] low_noise_lora keys: {len(low_noise_lora)}")
+        
+        # Log sizes
+        high_bytes = sum(v.element_size() * v.numel() for v in high_noise_lora.values())
+        low_bytes = sum(v.element_size() * v.numel() for v in low_noise_lora.values())
+        print_acc(f"[WAN22 SAVE LOG] high_noise_lora size: {high_bytes / 1024**3:.2f} GB")
+        print_acc(f"[WAN22 SAVE LOG] low_noise_lora size: {low_bytes / 1024**3:.2f} GB")
 
         # loras have either LORA_MODEL_NAME_000005000.safetensors or LORA_MODEL_NAME.safetensors
         if len(high_noise_lora.keys()) > 0:
@@ -1207,14 +1254,37 @@ class Wan2214bModel(Wan21):
             high_noise_lora_path = output_path.replace(
                 ".safetensors", "_high_noise.safetensors"
             )
+            print_acc(f"[WAN22 SAVE LOG] Saving high_noise LoRA to {high_noise_lora_path}...")
+            # Ensure all tensors are contiguous
+            print_acc("[WAN22 SAVE LOG] Ensuring high_noise tensors are contiguous...")
+            for key, v in high_noise_lora.items():
+                if not v.is_contiguous():
+                    print_acc(f"[WAN22 SAVE LOG] Making high_noise tensor {key} contiguous")
+                    high_noise_lora[key] = v.contiguous()
+            high_save_start = time.time()
             save_file(high_noise_lora, high_noise_lora_path, metadata=metadata)
+            high_save_time = time.time() - high_save_start
+            print_acc(f"[WAN22 SAVE LOG] high_noise save completed in {high_save_time:.2f}s")
 
         if len(low_noise_lora.keys()) > 0:
             # save the low noise LoRA
             low_noise_lora_path = output_path.replace(
                 ".safetensors", "_low_noise.safetensors"
             )
+            print_acc(f"[WAN22 SAVE LOG] Saving low_noise LoRA to {low_noise_lora_path}...")
+            # Ensure all tensors are contiguous
+            print_acc("[WAN22 SAVE LOG] Ensuring low_noise tensors are contiguous...")
+            for key, v in low_noise_lora.items():
+                if not v.is_contiguous():
+                    print_acc(f"[WAN22 SAVE LOG] Making low_noise tensor {key} contiguous")
+                    low_noise_lora[key] = v.contiguous()
+            low_save_start = time.time()
             save_file(low_noise_lora, low_noise_lora_path, metadata=metadata)
+            low_save_time = time.time() - low_save_start
+            print_acc(f"[WAN22 SAVE LOG] low_noise save completed in {low_save_time:.2f}s")
+        
+        total_time = time.time() - start_time
+        print_acc(f"[WAN22 SAVE LOG] save_lora completed in {total_time:.2f}s")
 
     def load_lora(self, file: str):
         # if it doesnt have high_noise or low_noise, it is a combo LoRA

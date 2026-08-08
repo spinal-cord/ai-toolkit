@@ -128,15 +128,20 @@ class UITrainer(SDTrainer):
         return _check_return_to_queue()
 
     def maybe_stop(self):
+        from toolkit.print import print_acc
         if self.should_stop():
+            print_acc("[UITRAINER] maybe_stop() detected stop signal")
             self._run_async_operation(
                 self._update_status("stopped", "Job stopped"))
             self.is_stopping = True
+            print_acc("[UITRAINER] Raising Exception('Job stopped')")
             raise Exception("Job stopped")
         if self.should_return_to_queue():
+            print_acc("[UITRAINER] maybe_stop() detected return to queue signal")
             self._run_async_operation(
                 self._update_status("queued", "Job queued"))
             self.is_stopping = True
+            print_acc("[UITRAINER] Raising Exception('Job returning to queue')")
             raise Exception("Job returning to queue")
 
     async def _update_key(self, key, value):
@@ -288,8 +293,23 @@ class UITrainer(SDTrainer):
         self.update_status("running", "Training")
 
     def save(self, step=None):
+        import time
+        from toolkit.print import print_acc
+        
+        print_acc(f"[UITRAINER SAVE] save() called at step {step}")
+        start_time = time.time()
+        
         self.maybe_stop()
         self.update_status("running", "Saving model")
+        
+        print_acc("[UITRAINER SAVE] Calling super().save()...")
+        super_save_start = time.time()
         super().save(step)
+        super_save_time = time.time() - super_save_start
+        print_acc(f"[UITRAINER SAVE] super().save() completed in {super_save_time:.2f}s")
+        
         self.maybe_stop()
         self.update_status("running", "Training")
+        
+        total_time = time.time() - start_time
+        print_acc(f"[UITRAINER SAVE] save() completed in {total_time:.2f}s")

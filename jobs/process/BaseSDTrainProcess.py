@@ -497,11 +497,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
         pass
 
     def save(self, step=None):
+        import time
+        from toolkit.print import print_acc
+        
         if not self.accelerator.is_main_process:
             return
+        
+        print_acc(f"[BASE SAVE] save() called at step {step}")
+        start_time = time.time()
+        
+        print_acc("[BASE SAVE] Flushing caches...")
+        flush_start = time.time()
         flush()
+        flush_time = time.time() - flush_start
+        print_acc(f"[BASE SAVE] Flush completed in {flush_time:.2f}s")
+        
         if self.ema is not None:
             # always save params as ema
+            print_acc("[BASE SAVE] Setting EMA to eval mode...")
             self.ema.eval()
 
         if not os.path.exists(self.save_root):
@@ -541,12 +554,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 # if we are doing embedding training as well, add that
                 embedding_dict = self.embedding.state_dict() if self.embedding else None
+                
+                print_acc(f"[BASE SAVE] Calling network.save_weights() for {file_path}...")
+                net_save_start = time.time()
                 self.network.save_weights(
                     file_path,
                     dtype=get_torch_dtype(self.save_config.dtype),
                     metadata=save_meta,
                     extra_state_dict=embedding_dict
                 )
+                net_save_time = time.time() - net_save_start
+                print_acc(f"[BASE SAVE] network.save_weights() completed in {net_save_time:.2f}s")
+                
                 self.network.multiplier = prev_multiplier
                 # if we have an embedding as well, pair it with the network
 
@@ -711,8 +730,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.post_save_hook(file_path)
 
         if self.ema is not None:
+            print_acc("[BASE SAVE] Setting EMA back to train mode...")
             self.ema.train()
         flush()
+        
+        total_time = time.time() - start_time
+        print_acc(f"[BASE SAVE] save() completed in {total_time:.2f}s")
 
     # Called before the model is loaded
     def hook_before_model_load(self):
