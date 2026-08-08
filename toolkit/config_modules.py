@@ -295,6 +295,67 @@ class LoRMConfig:
 NetworkType = Literal['lora', 'locon', 'lorm', 'lokr']
 
 
+class RankGateConfig:
+    """
+    Configuration for SparseForge-inspired rank gate annealing.
+    
+    Implements soft, curvature-aware rank gating for LoRA adapters,
+    allowing gradual elimination of redundant ranks during training.
+    
+    Based on SparseForge (2026) with adaptations for diffusion training.
+    Default values tuned for Wan 2.2 14B I2V LoRA training.
+    """
+    def __init__(self, **kwargs):
+        # Enable/disable rank gating. Default: True (enabled by default for
+        # curvature-aware pruning to prevent rank collapse).
+        self.enabled: bool = kwargs.get('enabled', True)
+        
+        # Annealing timing (can be absolute steps or ratios of total_steps)
+        # start_step: when to begin annealing
+        self.start_step: Optional[int] = kwargs.get('start_step', None)  # auto: 5% of total
+        # end_step: when to complete annealing (before hardening window)
+        self.end_step: Optional[int] = kwargs.get('end_step', None)  # auto: 75% of total
+        
+        # Target rank ratio: final active rank fraction
+        # 0.3 = keep 30% of ranks, kill 70% (aggressive pruning)
+        self.target_rank_ratio: float = kwargs.get('target_rank_ratio', 0.3)
+        
+        # Temperature for sigmoid gating
+        # Higher = softer decisions, lower = more decisive
+        self.temperature: float = kwargs.get('temperature', 1.0)
+        
+        # Temperature decay per update: T ← γT
+        # 0.95 = faster decay, sharpens sigmoid decisions more quickly
+        self.gamma: float = kwargs.get('gamma', 0.95)
+        
+        # EMA update rate for gates: m ← (1-α)m + αG
+        # 0.1 = faster gate updates, more responsive to curvature changes
+        self.alpha: float = kwargs.get('alpha', 0.1)
+        
+        # Binary preference penalty max: L_mid = Σ m(1-m)
+        # 0.01 = stronger penalty, pushes gates toward 0 or 1 more aggressively
+        self.lambda_mid_max: float = kwargs.get('lambda_mid_max', 0.01)
+        
+        # Update gates every N steps
+        # 15 = more frequent updates (67 updates per 1000 steps vs 40)
+        self.update_every: int = kwargs.get('update_every', 15)
+        
+        # Fisher EMA decay
+        self.fisher_decay: float = kwargs.get('fisher_decay', 0.999)
+        
+        # Include first-order term |g·w| in scoring (recommended for diffusion)
+        self.use_first_order: bool = kwargs.get('use_first_order', True)
+        
+        # Final hardening window size
+        self.hardening_window: int = kwargs.get('hardening_window', 500)
+        
+        # Penalty coefficient for mid-preference nudge
+        self.eta_pen: float = kwargs.get('eta_pen', 0.01)
+        
+        # Enable final hardening (binarize gates at end)
+        self.final_hardening: bool = kwargs.get('final_hardening', True)
+
+
 class NetworkConfig:
     def __init__(self, **kwargs):
         self.type: NetworkType = kwargs.get('type', 'lora')
@@ -401,6 +462,26 @@ class NetworkConfig:
         # but you want to only train a subset, use this.
         # Default: None means all types in wan22_tensor_types are enabled.
         self.wan22_enabled_types: Optional[List[str]] = kwargs.get('wan22_enabled_types', None)
+        
+        # =====================================================================
+        # Rank Gate Annealing (SparseForge-inspired)
+        # =====================================================================
+        # Enables soft, curvature-aware rank gating for LoRA adapters.
+        # ENABLED BY DEFAULT for better training quality.
+        # Set rank_gates.enabled: false to disable.
+        # =====================================================================
+        rank_gates_input = kwargs.get('rank_gates', None)
+        if rank_gates_input is not None:
+            # Accept dict or bool
+            if isinstance(rank_gates_input, bool):
+                self.rank_gates: Optional[RankGateConfig] = RankGateConfig(enabled=rank_gates_input)
+            elif isinstance(rank_gates_input, dict):
+                self.rank_gates: Optional[RankGateConfig] = RankGateConfig(**rank_gates_input)
+            else:
+                self.rank_gates: Optional[RankGateConfig] = None
+        else:
+            # Default: ENABLED with sensible defaults
+            self.rank_gates: Optional[RankGateConfig] = RankGateConfig(enabled=True)
 
 
 AdapterTypes = Literal['t2i', 'ip', 'ip+', 'clip', 'ilora', 'photo_maker', 'control_net', 'control_lora', 'i2v']

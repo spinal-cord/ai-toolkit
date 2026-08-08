@@ -561,7 +561,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     file_path,
                     dtype=get_torch_dtype(self.save_config.dtype),
                     metadata=save_meta,
-                    extra_state_dict=embedding_dict
+                    extra_state_dict=embedding_dict,
+                    step=step
                 )
                 net_save_time = time.time() - net_save_start
                 print_acc(f"[BASE SAVE] network.save_weights() completed in {net_save_time:.2f}s")

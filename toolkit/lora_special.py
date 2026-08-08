@@ -14,6 +14,7 @@ from toolkit.models.lokr import LokrModule
 from .config_modules import NetworkConfig, get_wan22_tensor_type_from_name, WAN22_TENSOR_TYPES, is_wan22_tensor_type_enabled
 from .lorm import count_parameters
 from .network_mixins import ToolkitNetworkMixin, ToolkitModuleMixin, ExtractableModuleMixin
+from .rank_gates import GatedLoRA
 
 from toolkit.kohya_lora import LoRANetwork
 from toolkit.models.DoRA import DoRAModule
@@ -178,6 +179,8 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         # Track which transformer expert this LoRA belongs to (for multistage models).
         # None means it's a shared/legacy LoRA not tied to a specific expert.
         self._owner_transformer: Optional[str] = None
+        # Rank gate for SparseForge-style annealing (optional)
+        self.rank_gate: Optional[GatedLoRA] = None
 
     def set_owner_transformer(self, name: str):
         """Mark this LoRA as belonging to a specific transformer expert."""
@@ -448,6 +451,9 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             self.module_class = LokrModule
             module_class = LokrModule
         self.network_config: NetworkConfig = kwargs.get("network_config", None)
+        
+        # List of all GatedLoRA instances for rank gate annealing
+        self.gated_loras: List[GatedLoRA] = []
 
         self.peft_format = peft_format
         self.is_transformer = is_transformer
@@ -771,6 +777,32 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                                     lora_shape_dict[lora_name] = [list(lora.lora_down.weight.shape)]
                                 else:
                                     lora_shape_dict[lora_name] = [list(lora.lora_down.weight.shape), list(lora.lora_up.weight.shape)]
+                            
+                            # Create GatedLoRA for rank gate annealing if enabled
+                            if (self.network_config is not None and 
+                                self.network_config.rank_gates is not None and 
+                                self.network_config.rank_gates.enabled and
+                                not self.full_rank and
+                                hasattr(lora, 'lora_down') and
+                                hasattr(lora, 'lora_up')):
+                                
+                                device = lora.lora_down.weight.device
+                                dtype = lora.lora_down.weight.dtype
+                                owner = getattr(lora, '_owner_transformer', None)
+                                
+                                rank_gate = GatedLoRA(
+                                    lora_name=lora_name,
+                                    lora_dim=lora.lora_dim,
+                                    device=device,
+                                    dtype=dtype,
+                                    owner_transformer=owner,
+                                )
+                                # Link to LoRA weight matrices for OBD scoring via plain list
+                                # (NOT as nn.Module attributes to avoid registering duplicates in state_dict)
+                                # A = lora_down.weight (r, in_dim), B = lora_up.weight (out_dim, r)
+                                rank_gate._lora_refs = [lora.lora_down.weight, lora.lora_up.weight]
+                                lora.rank_gate = rank_gate
+                                self.gated_loras.append(rank_gate)
 
                         elif is_full_layer and not skip:
                             if self.only_if_contains is not None:
@@ -932,6 +964,32 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         for lora in self.text_encoder_loras + self.unet_loras:
             assert lora.lora_name not in names, f"duplicated lora name: {lora.lora_name}"
             names.add(lora.lora_name)
+        
+        # Log rank gate configuration
+        if self.gated_loras:
+            from .rank_gates import get_gated_loras_by_expert
+            by_expert = get_gated_loras_by_expert(self.gated_loras)
+            total_ranks = sum(gl.r for gl in self.gated_loras)
+            rg = self.network_config.rank_gates
+            print(f"\n[RankGates] ENABLED with {len(self.gated_loras)} gated LoRA modules, {total_ranks} total ranks")
+            print(f"  Target rank ratio: {rg.target_rank_ratio} (keep {int(100*rg.target_rank_ratio)}% of ranks)")
+            print(f"  Start step: {rg.start_step}, End step: {rg.end_step}, Update every: {rg.update_every}")
+            print(f"  Temperature: {rg.temperature}, Gamma: {rg.gamma}, Alpha: {rg.alpha}")
+            print(f"  Lambda mid max: {rg.lambda_mid_max}")
+            for owner, glist in by_expert.items():
+                if not glist:
+                    continue
+                label = owner or "shared"
+                t = sum(gl.r for gl in glist)
+                print(f"  Expert {label}: {len(glist)} modules, {t} ranks")
+        else:
+            rg_enabled = (self.network_config is not None and 
+                         self.network_config.rank_gates is not None and 
+                         self.network_config.rank_gates.enabled)
+            if rg_enabled:
+                print("\n[RankGates] Enabled but no LoRA modules to gate (all full-rank or lokr)")
+            else:
+                print("\n[RankGates] Disabled")
 
         if self.full_train_in_out:
             print("full train in out")
@@ -1036,9 +1094,18 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         all_params = []
 
         def enumerate_params(loras):
+            """
+            Collect parameters for optimizer, excluding rank gate parameters.
+            
+            Rank gates must NOT be in the optimizer - they are updated by the
+            dedicated SparseForge rule, not by the optimizer.
+            """
+            from .rank_gates import is_gate_parameter
             params = []
             for lora in loras:
-                params.extend(lora.parameters())
+                for name, p in lora.named_parameters():
+                    if not is_gate_parameter(p):
+                        params.append(p)
             return params
 
         # Handle text encoder loras (standard, no splitting)

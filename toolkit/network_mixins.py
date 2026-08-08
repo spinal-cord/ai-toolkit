@@ -194,6 +194,25 @@ class ToolkitModuleMixin:
                 print(f"Error in {self.__class__.__name__} lora_down")
                 raise e
 
+        # Apply rank gates (SparseForge-style annealing)
+        # Gates are applied to the rank dimension after lora_down
+        if hasattr(self, 'rank_gate') and self.rank_gate is not None:
+            gates = self.rank_gate.gates  # (r,)
+            # Reshape gates to broadcast with lx
+            # lx shape: (batch, r) for linear, (batch, r, H, W) for conv
+            if lx.dim() == 2:
+                # Linear: (batch, r)
+                gates_broadcast = gates.unsqueeze(0)  # (1, r)
+            elif lx.dim() == 3:
+                # Text Encoder: (batch, seq, r)
+                gates_broadcast = gates.unsqueeze(0).unsqueeze(0)  # (1, 1, r)
+            elif lx.dim() >= 4:
+                # Conv2d: (batch, r, H, W)
+                gates_broadcast = gates.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)  # (1, r, 1, 1)
+            else:
+                gates_broadcast = gates
+            lx = lx * gates_broadcast
+
         if isinstance(self.dropout, nn.Dropout) or isinstance(self.dropout, nn.Identity):
             lx = self.dropout(lx)
         # normal dropout
@@ -316,7 +335,13 @@ class ToolkitModuleMixin:
                 lx = torch.nn.functional.dropout(x, p=self.dropout)
             else:
                 lx = x
-            lora_weight = self.lora_up.weight @ self.lora_down.weight
+            # Apply rank gates if present: W_eff = B @ diag(m) @ A
+            down_w = self.lora_down.weight
+            rg = getattr(self, 'rank_gate', None)
+            if rg is not None:
+                m = rg.gates.to(down_w.dtype)  # cast from float32 to compute dtype
+                down_w = down_w * m.unsqueeze(1)  # scale rows of A by gates
+            lora_weight = self.lora_up.weight @ down_w
             # scale it here
             # todo handle our batch split scalers for slider training. For now take the mean of them
             scale = multiplier.mean()
@@ -362,6 +387,13 @@ class ToolkitModuleMixin:
         else:
             up_weight = self.lora_up.weight.clone().float()
         down_weight = self.lora_down.weight.clone().float()
+
+        # Apply rank gates if present: W_eff = B @ diag(m) @ A = B @ (A * m[None,:])
+        rg = getattr(self, 'rank_gate', None)
+        if rg is not None and not self.full_rank:
+            m = rg.gates.detach().float()  # (r,) gates in float32
+            # Scale rows of A by gates: A_gated[r,:] = m[r] * A[r,:]
+            down_weight = down_weight * m.unsqueeze(1)
 
         # extract weight from org_module
         org_sd = self.org_module[0].state_dict()
@@ -539,7 +571,18 @@ class ToolkitNetworkMixin:
 
         return keymap
     
-    def get_state_dict(self: Network, extra_state_dict=None, dtype=torch.float16):
+    def get_state_dict(self: Network, extra_state_dict=None, dtype=torch.float16, step=None):
+        """
+        Get the state dict for saving.
+        
+        Args:
+            extra_state_dict: Additional state dict entries to include.
+            dtype: Output dtype for tensors.
+            step: Training step number. If None, this is the final save and rank
+                  gates are folded into LoRA weights for inference compatibility.
+                  If not None, this is a mid-training checkpoint: gates are kept
+                  as-is so training can resume with correct gate values.
+        """
         from toolkit.print import print_acc
         import time
         
@@ -573,6 +616,37 @@ class ToolkitNetworkMixin:
                 largest_tensor = (key, bytes_size)
         print_acc(f"[SAVE LOG] Total params: {total_params:,}, Total size: {total_bytes / 1024**3:.2f} GB")
         print_acc(f"[SAVE LOG] Largest tensor: {largest_tensor[0]} ({largest_tensor[1] / 1024**2:.2f} MB)")
+
+        # Handle rank gates differently for mid-training checkpoints vs final save.
+        # Final save (step=None): fold gates into LoRA weights for inference
+        # Mid-training checkpoint (step is not None): keep gates so resume works
+        if step is None:
+            # FINAL SAVE: fold gates into A matrices and strip gate keys.
+            # W_eff = B @ diag(m) @ A = B @ (diag(m) @ A)
+            # This ensures external loaders (ComfyUI, A1111, etc.) get the correct
+            # gated weights without needing to understand our gate keys.
+            print_acc("[SAVE LOG] Folding rank gates into LoRA A matrices (final save)...")
+            for lora in self.get_all_modules():
+                rg = getattr(lora, 'rank_gate', None)
+                if rg is None:
+                    continue
+                m = rg.gates.detach().float().view(-1, 1)  # (r, 1)
+                key_A = f"{lora.lora_name}.lora_down.weight"
+                if key_A in state_dict:
+                    A = state_dict[key_A].float()
+                    state_dict[key_A] = (A * m).to(A.dtype)
+            
+            # Strip all gate-related keys from state_dict to avoid bloat.
+            # Gates are already folded into A matrices above.
+            gate_keys_to_remove = [k for k in state_dict.keys() if '.rank_gate.' in k]
+            if gate_keys_to_remove:
+                print_acc(f"[SAVE LOG] Removing {len(gate_keys_to_remove)} gate-related keys from state_dict")
+                for k in gate_keys_to_remove:
+                    del state_dict[k]
+        else:
+            # MID-TRAINING CHECKPOINT: keep gates as-is for correct resume.
+            # Do NOT fold gates into A — that would compound attenuation on resume.
+            print_acc(f"[SAVE LOG] Keeping rank gates in checkpoint at step {step} (for resume)")
 
         save_dict = OrderedDict()
         print_acc("[SAVE LOG] Starting tensor processing (detach/clone/to_cpu/to_dtype)...")
@@ -645,12 +719,24 @@ class ToolkitNetworkMixin:
             self: Network,
             file, dtype=torch.float16,
             metadata=None,
-            extra_state_dict: Optional[OrderedDict] = None
+            extra_state_dict: Optional[OrderedDict] = None,
+            step=None
     ):
+        """
+        Save network weights to file.
+        
+        Args:
+            file: Output file path.
+            dtype: Output dtype for tensors.
+            metadata: Metadata dict for safetensors.
+            extra_state_dict: Additional state dict entries to include.
+            step: Training step number. If None, this is the final save and rank
+                  gates are folded into LoRA weights for inference compatibility.
+        """
         from toolkit.print import print_acc
         import time
         
-        print_acc(f"[SAVE LOG] save_weights called. File: {file}")
+        print_acc(f"[SAVE LOG] save_weights called. File: {file}, step: {step}")
         start_time = time.time()
         
         # Set up a simple watchdog to detect hangs
@@ -671,7 +757,7 @@ class ToolkitNetworkMixin:
         watchdog_thread = threading.Thread(target=watchdog, daemon=True)
         watchdog_thread.start()
         
-        save_dict = self.get_state_dict(extra_state_dict=extra_state_dict, dtype=dtype)
+        save_dict = self.get_state_dict(extra_state_dict=extra_state_dict, dtype=dtype, step=step)
         
         if metadata is not None and len(metadata) == 0:
             metadata = None

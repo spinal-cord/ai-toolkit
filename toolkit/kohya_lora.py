@@ -1290,9 +1290,18 @@ class LoRANetwork(torch.nn.Module):
         all_params = []
 
         def enumerate_params(loras):
+            """
+            Collect parameters for optimizer, excluding rank gate parameters.
+            
+            Rank gates must NOT be in the optimizer - they are updated by the
+            dedicated SparseForge rule, not by the optimizer.
+            """
+            from .rank_gates import is_gate_parameter
             params = []
             for lora in loras:
-                params.extend(lora.parameters())
+                for name, p in lora.named_parameters():
+                    if not is_gate_parameter(p):
+                        params.append(p)
             return params
 
         if self.text_encoder_loras:

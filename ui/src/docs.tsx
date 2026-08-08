@@ -764,6 +764,256 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  // ============================================================================
+  // Rank Gate Annealing Documentation
+  // ============================================================================
+  'config.process[0].network.rank_gates.enabled': {
+    title: 'Enable Rank Gates',
+    description: (
+      <>
+        Enable or disable SparseForge-inspired rank gate annealing. When enabled, each LoRA rank gets a soft gate that
+        gradually prunes redundant ranks during training.
+        <br />
+        <br />
+        <strong>Default:</strong> Enabled (recommended for all LoRA training).
+        <br />
+        <strong>Effect:</strong> Prevents rank collapse by making soft, curvature-aware pruning decisions instead of
+        hard truncation.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.target_rank_ratio': {
+    title: 'Target Rank Ratio',
+    description: (
+      <>
+        Final fraction of ranks to keep after annealing. Gates anneal from 1 → {0,1}, selecting which ranks survive.
+        <br />
+        <br />
+        <strong>Conservative (0.6–0.9):</strong> Keep more ranks. Use for small datasets, early exploration, or when
+        you want to preserve rank diversity.
+        <br />
+        <strong>Aggressive (0.2–0.4):</strong> Keep fewer ranks. Use for large datasets, quick pruning of
+        noise-dominated ranks, or when many ranks are redundant.
+        <br />
+        <strong>Default:</strong> 0.3 (keep 30% of ranks, prune 70%).
+        <br />
+        <br />
+        <em>Example:</em> With rank 256 and ratio 0.3, ~77 ranks will survive at the end of training.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.lambda_mid_max': {
+    title: 'Lambda Mid Max (Binary Preference)',
+    description: (
+      <>
+        Maximum strength of the binary preference penalty <code>L_mid = Σ m(1-m)</code>. This penalty pushes gates
+        toward 0 or 1 (decisive) rather than staying in the middle (0.5).
+        <br />
+        <br />
+        <strong>Conservative (0.001–0.005):</strong> Weak penalty, gates can stay intermediate longer. Smoother
+        transitions but slower pruning.
+        <br />
+        <strong>Aggressive (0.01–0.05):</strong> Strong penalty, forces gates to {0,1} quickly. Decisive pruning but
+        less reversible.
+        <br />
+        <strong>Default:</strong> 0.01.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.alpha': {
+    title: 'Alpha (Gate EMA Rate)',
+    description: (
+      <>
+        EMA update rate for gates: <code>m ← (1-α)m + α·score</code>. Controls how quickly gates respond to
+        curvature-aware importance scores.
+        <br />
+        <br />
+        <strong>Conservative (0.01–0.05):</strong> Gentle updates, smooth transitions. Gates change slowly.
+        <br />
+        <strong>Aggressive (0.1–0.2):</strong> Fast updates, responsive to score changes. Gates adapt quickly.
+        <br />
+        <strong>Default:</strong> 0.1.
+        <br />
+        <br />
+        <em>Tip:</em> Lower values (= smoother) work better for long training runs; higher values for short runs.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.gamma': {
+    title: 'Gamma (Temperature Decay)',
+    description: (
+      <>
+        Temperature decay per update: <code>T ← γ·T</code>. Controls how quickly the sigmoid sharpens (makes
+        decisions more decisive) over time.
+        <br />
+        <br />
+        <strong>Conservative (0.98–0.999):</strong> Slow decay, soft decisions maintained longer. Gentler annealing.
+        <br />
+        <strong>Aggressive (0.93–0.96):</strong> Fast decay, sharp decisions sooner. Quicker pruning.
+        <br />
+        <strong>Default:</strong> 0.95.
+        <br />
+        <br />
+        <em>Effect:</em> Temperature starts at 1.0 and decays geometrically. Lower temperature = sharper sigmoid =
+        more decisive 0/1 choices.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.update_every': {
+    title: 'Update Every (Steps)',
+    description: (
+      <>
+        Number of steps between gate updates. Gates are not updated every step to reduce overhead and avoid
+        instability.
+        <br />
+        <br />
+        <strong>Conservative (30–50):</strong> Infrequent updates. Smoother annealing but slower adaptation.
+        <br />
+        <strong>Aggressive (10–20):</strong> Frequent updates. Faster pruning but more computational overhead.
+        <br />
+        <strong>Default:</strong> 15.
+        <br />
+        <br />
+        <em>Example:</em> With 2000 steps and update_every=15, gates update ~133 times. With update_every=25, only
+        ~80 times.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.temperature': {
+    title: 'Temperature (Initial)',
+    description: (
+      <>
+        Initial sigmoid temperature for gate decisions. Higher temperature = softer/more uncertain decisions; lower =
+        sharper/more confident.
+        <br />
+        <br />
+        <strong>Conservative (2.0–5.0):</strong> Softer initial decisions, more exploration.
+        <br />
+        <strong>Aggressive (0.5–1.0):</strong> Sharper initial decisions, quicker pruning.
+        <br />
+        <strong>Default:</strong> 1.0.
+        <br />
+        <br />
+        <em>Note:</em> Temperature decays over time via gamma, so initial value mainly affects early training.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.fisher_decay': {
+    title: 'Fisher Decay (EMA)',
+    description: (
+      <>
+        EMA decay for Fisher information diagonal estimation. Controls memory length of curvature tracking.
+        <br />
+        <br />
+        <strong>Recommended:</strong> Keep at 0.999 for long memory. Lower values (0.95–0.99) react faster to
+        gradient changes but are noisier.
+        <br />
+        <strong>Default:</strong> 0.999.
+        <br />
+        <br />
+        <em>Why keep this default:</em> Fisher EMA needs long memory to accurately estimate curvature. Changing this
+        is rarely beneficial.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.use_first_order': {
+    title: 'Use First-Order Term',
+    description: (
+      <>
+        Include the first-order term <code>|g·w|</code> in rank scoring. This adds gradient-weight magnitude to the
+        curvature-based scoring.
+        <br />
+        <br />
+        <strong>Recommended:</strong> Enabled (true). Helps distinguish between ranks with similar curvature but
+        different gradient magnitudes.
+        <br />
+        <strong>Default:</strong> true.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.hardening_window': {
+    title: 'Hardening Window',
+    description: (
+      <>
+        Number of steps at the end of training for soft→hard interpolation. Gates gradually binarize during this
+        window.
+        <br />
+        <br />
+        <strong>Typical range:</strong> 200–1000 steps.
+        <br />
+        <strong>Default:</strong> 500 (auto-capped at 5% of total steps for short runs).
+        <br />
+        <br />
+        <em>Effect:</em> Longer windows give smoother finalization; shorter windows make quicker final cuts.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.final_hardening': {
+    title: 'Final Hardening (Binarize)',
+    description: (
+      <>
+        Enable final binarization of gates at end of training. When enabled, gates are set to exactly 0 or 1 for the
+        final saved model.
+        <br />
+        <br />
+        <strong>Recommended:</strong> Enabled (true). Ensures the saved model has clean, discrete rank selection.
+        <br />
+        <strong>Default:</strong> true.
+        <br />
+        <br />
+        <em>Note:</em> If disabled, gates remain continuous [0,1] in the saved model (useful for further fine-tuning).
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.start_step': {
+    title: 'Start Step (Annealing)',
+    description: (
+      <>
+        Global step at which annealing begins. Leave empty for auto (5% of total steps).
+        <br />
+        <br />
+        <strong>Auto:</strong> <code>max(100, total_steps × 0.05)</code>.
+        <br />
+        <strong>Manual:</strong> Set after warmup completes (typically 500–2000 steps).
+        <br />
+        <br />
+        <em>Tip:</em> Don't start annealing during warmup; let weights stabilize first.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.end_step': {
+    title: 'End Step (Annealing)',
+    description: (
+      <>
+        Global step at which annealing completes. Leave empty for auto (75% of total steps).
+        <br />
+        <br />
+        <strong>Auto:</strong> <code>min(total_steps - hardening_window, total_steps × 0.75)</code>.
+        <br />
+        <strong>Manual:</strong> Set before the hardening window begins.
+        <br />
+        <br />
+        <em>Note:</em> Must be less than <code>total_steps - hardening_window</code>.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.eta_pen': {
+    title: 'Eta Penalty (Mid-Preference Nudge)',
+    description: (
+      <>
+        Penalty coefficient for nudging gates away from 0.5 (the "mid-preference" zone). Works in conjunction with
+        <code>lambda_mid_max</code>.
+        <br />
+        <br />
+        <strong>Typical range:</strong> 0.005–0.02.
+        <br />
+        <strong>Default:</strong> 0.01.
+        <br />
+        <br />
+        <em>Effect:</em> Higher values push gates more aggressively away from indecisive 0.5 values.
+      </>
+    ),
+  },
 };
 
 export const getDoc = (key: string | null | undefined): ConfigDoc | null => {

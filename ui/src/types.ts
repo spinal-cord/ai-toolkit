@@ -75,6 +75,23 @@ export interface Wan22TensorTypesConfig {
   head?: Wan22TensorTypeConfig;
 }
 
+export interface RankGateConfig {
+  enabled?: boolean;
+  target_rank_ratio?: number;
+  start_step?: number | null;
+  end_step?: number | null;
+  temperature?: number;
+  gamma?: number;
+  alpha?: number;
+  lambda_mid_max?: number;
+  update_every?: number;
+  fisher_decay?: number;
+  use_first_order?: boolean;
+  hardening_window?: number;
+  eta_pen?: number;
+  final_hardening?: boolean;
+}
+
 export interface NetworkConfig {
   type: string;
   linear: number;
@@ -96,6 +113,8 @@ export interface NetworkConfig {
   // Wan 2.2 tensor type specific configuration
   wan22_tensor_types?: Wan22TensorTypesConfig;
   wan22_enabled_types?: string[];
+  // Rank gate annealing (SparseForge-inspired)
+  rank_gates?: RankGateConfig;
 }
 
 export interface SaveConfig {

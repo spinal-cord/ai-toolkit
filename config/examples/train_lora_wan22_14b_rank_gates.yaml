@@ -1,0 +1,83 @@
+# Wan 2.2 14B I2V LoRA Training with Rank Gate Annealing (SparseForge-inspired)
+# 
+# Rank gates are ENABLED BY DEFAULT for better training quality.
+# This config shows explicit rank_gates settings for fine-tuning.
+#
+# How it works:
+# - Each LoRA rank gets a soft gate m_r ∈ [0,1], starting at 1 (all active)
+# - Gates anneal gradually based on curvature-aware importance scores
+# - At end of training, gates harden to {0,1}, selecting surviving ranks
+# - Prevents rank collapse by making decisions softly, not via hard truncation
+
+processes:
+  - model:
+      arch: wan22_14b_i2v
+      name_or_path: Wan-AI/Wan2.2-I2V-14B-Diffusers
+      low_vram: true
+      quantize: true
+      quantize_te: true
+
+    train:
+      batch_size: 1
+      steps: 20000
+      gradient_accumulation: 1
+      lr: 1e-5              # Note: use 'lr', not 'learning_rate'
+      noise_scheduler: flowmatch
+      timestep_type: weighted
+
+    save:
+      save_every: 1000
+
+    sample:
+      sample_every: 500
+      prompts:
+        - "A person walking down the street"
+      num_frames: 81
+      fps: 16
+      width: 832
+      height: 480
+      guidance_scale: 5.0
+
+    network:
+      type: lora
+      linear: 256        # Start with generous rank; gates will prune to ~30%
+      alpha: 256
+      
+      # =================================================================
+      # Rank Gate Annealing Configuration (ENABLED BY DEFAULT)
+      # =================================================================
+      # To DISABLE: set rank_gates.enabled: false
+      #
+      # Aggressive defaults (recommended for most training):
+      # - target_rank_ratio: 0.3 (keep 30% of ranks, prune 70%)
+      # - lambda_mid_max: 0.01 (stronger binary preference)
+      # - alpha: 0.1 (faster gate updates)
+      # - gamma: 0.95 (faster temperature decay)
+      # - update_every: 15 (more frequent updates)
+      # =================================================================
+      rank_gates:
+        enabled: true
+        target_rank_ratio: 0.3     # Keep 30% of ranks, kill 70% (aggressive)
+        start_step: 1000           # Begin annealing after warmup (global step)
+        end_step: 14000            # Complete annealing (global step, < steps - hardening_window)
+        temperature: 1.0           # Initial sigmoid temperature
+        gamma: 0.95                # Temperature decay per update (faster sharpening)
+        alpha: 0.1                 # Gate EMA rate (faster updates)
+        lambda_mid_max: 0.01       # Binary preference penalty max (stronger)
+        update_every: 15           # Update gates every N steps (more frequent)
+        fisher_decay: 0.999        # Fisher EMA decay (keep long memory)
+        use_first_order: true      # Include |g·w| term (recommended for diffusion)
+        hardening_window: 500      # Final soft→hard interpolation window
+        eta_pen: 0.01              # Mid-preference nudge strength
+        final_hardening: true      # Binarize gates at end
+
+    datasets:
+      - folder_path: /path/to/dataset
+        resolution: 480
+        num_frames: 81
+        fps: 16
+        buckets: true
+        cache_latents_to_disk: true
+        do_i2v: true
+        do_t2v: true
+        num_workers: 4
