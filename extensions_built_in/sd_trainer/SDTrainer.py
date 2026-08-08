@@ -20,6 +20,7 @@ from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, Guid
 from toolkit.image_utils import show_tensors, show_latents
 from toolkit.ip_adapter import IPAdapter
 from toolkit.custom_adapter import CustomAdapter
+from toolkit.memory_management import sync_grad_transfers
 from toolkit.print import print_acc
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
@@ -2359,6 +2360,9 @@ class SDTrainer(BaseSDTrainProcess):
 
         grad_norm_value = None
         if not self.is_grad_accumulation_step:
+            # grads of memory-managed (offloaded) params are async D2H copies into
+            # pinned tensors; join them before anything on the CPU reads .grad
+            sync_grad_transfers()
             grad_norm_tensor = self._calculate_grad_norm(self.params)
             if grad_norm_tensor is not None:
                 grad_norm_value = grad_norm_tensor.item()
