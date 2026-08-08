@@ -34,7 +34,7 @@ from diffusers import EMAModel
 import math
 from toolkit.train_tools import precondition_model_outputs_flow_match
 from toolkit.models.diffusion_feature_extraction import DiffusionFeatureExtractor, load_dfe
-from toolkit.util.losses import wavelet_loss, stepped_loss
+from toolkit.util.losses import wavelet_loss, stepped_loss, spectral_loss
 import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
 from PIL import Image
@@ -902,6 +902,19 @@ class SDTrainer(BaseSDTrainProcess):
                 loss = torch.nn.functional.l1_loss(pred.float(), target.float(), reduction="none")
             elif self.train_config.loss_type == "wavelet":
                 loss = wavelet_loss(pred, batch.latents, noise)
+            elif self.train_config.loss_type == "spectral":
+                loss = spectral_loss(
+                    pred,
+                    batch.latents,
+                    noise,
+                    low_weight=self.train_config.spectral_low_weight,
+                    mid_weight=self.train_config.spectral_mid_weight,
+                    high_weight=self.train_config.spectral_high_weight,
+                    low_cutoff=self.train_config.spectral_low_cutoff,
+                    high_cutoff=self.train_config.spectral_high_cutoff,
+                    use_phase=self.train_config.spectral_use_phase,
+                    lcr_weight=self.train_config.spectral_lcr_weight,
+                )
             elif self.train_config.loss_type == "stepped":
                 loss = stepped_loss(pred, batch.latents, noise, noisy_latents, timesteps, self.sd.noise_scheduler)
                 # the way this loss works, it is low, increase it to match predictable LR effects

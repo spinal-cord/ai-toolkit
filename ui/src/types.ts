@@ -189,8 +189,16 @@ export interface TrainConfig {
   blank_prompt_preservation?: boolean;
   blank_prompt_preservation_multiplier?: number;
   switch_boundary_every: number;
-  loss_type: 'mse' | 'mae' | 'wavelet' | 'stepped' | 'mean_flow' | 'pseudo_huber';
+  loss_type: 'mse' | 'mae' | 'wavelet' | 'spectral' | 'stepped' | 'mean_flow' | 'pseudo_huber';
   pseudo_huber_c?: number;
+  // Spectral loss config
+  spectral_low_weight?: number;
+  spectral_mid_weight?: number;
+  spectral_high_weight?: number;
+  spectral_low_cutoff?: number;
+  spectral_high_cutoff?: number;
+  spectral_use_phase?: boolean;
+  spectral_lcr_weight?: number;
   do_differential_guidance?: boolean;
   differential_guidance_scale?: number;
   audio_loss_multiplier?: number;

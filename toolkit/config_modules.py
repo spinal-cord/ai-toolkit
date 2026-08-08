@@ -680,8 +680,19 @@ class TrainConfig:
         self.correct_pred_norm = kwargs.get('correct_pred_norm', False)
         self.correct_pred_norm_multiplier = kwargs.get('correct_pred_norm_multiplier', 1.0)
 
-        self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, pixelspace, mean_flow, pseudo_huber
+        self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, spectral, pixelspace, mean_flow, pseudo_huber
         self.pseudo_huber_c = kwargs.get('pseudo_huber_c', 0.01) # c value for pseudo_huber loss
+        
+        # Spectral loss config - frequency dissociation and balancing
+        # Low freq = structure/motion, High freq = texture/details
+        # Inspired by SSVAE research on latent spectral biasing for superior diffusability
+        self.spectral_low_weight = kwargs.get('spectral_low_weight', 1.0)   # structure/motion weight
+        self.spectral_mid_weight = kwargs.get('spectral_mid_weight', 1.0)   # mid frequencies weight
+        self.spectral_high_weight = kwargs.get('spectral_high_weight', 2.0) # texture/details weight (emphasize)
+        self.spectral_low_cutoff = kwargs.get('spectral_low_cutoff', 0.15)  # radius separating low/mid freq
+        self.spectral_high_cutoff = kwargs.get('spectral_high_cutoff', 0.5) # radius separating mid/high freq
+        self.spectral_use_phase = kwargs.get('spectral_use_phase', True)    # use phase info (more accurate)
+        self.spectral_lcr_weight = kwargs.get('spectral_lcr_weight', 0.0)   # SSVAE LCR weight (0.0 = disabled)
         
         # do the loss on a timestep to 0 prediction
         self.t0_loss_target = kwargs.get('t0_loss_target', False)

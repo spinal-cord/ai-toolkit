@@ -1280,6 +1280,7 @@ export default function SimpleJob({
                     { value: 'mse', label: 'Mean Squared Error' },
                     { value: 'mae', label: 'Mean Absolute Error' },
                     { value: 'wavelet', label: 'Wavelet' },
+                    { value: 'spectral', label: 'Spectral (Frequency Balancing)' },
                     { value: 'stepped', label: 'Stepped Recovery' },
                     { value: 'pseudo_huber', label: 'Pseudo Huber (Smooth L1)' },
                     { value: 'mean_flow', label: 'Mean Flow (Experimental)' },
@@ -1296,6 +1297,97 @@ export default function SimpleJob({
                     min={0}
                     step={0.001}
                   />
+                )}
+                {jobConfig.config.process[0].train.loss_type === 'spectral' && (
+                  <div className="border border-gray-700 rounded-lg p-4 mt-2 space-y-3">
+                    <p className="text-xs text-gray-400">
+                      Spectral loss dissociates low frequencies (structure/motion) from high frequencies (texture/details).
+                      Adjust weights to control detail density without compromising structural coherence.
+                    </p>
+                    <div className="grid grid-cols-3 gap-3">
+                      <NumberInput
+                        label="Low Freq Weight"
+                        className="pt-1"
+                        value={jobConfig.config.process[0].train.spectral_low_weight ?? 1.0}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.spectral_low_weight')}
+                        placeholder="1.0"
+                        docKey={'train.spectral_low_weight'}
+                        min={0}
+                        step={0.1}
+                      />
+                      <NumberInput
+                        label="Mid Freq Weight"
+                        className="pt-1"
+                        value={jobConfig.config.process[0].train.spectral_mid_weight ?? 1.0}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.spectral_mid_weight')}
+                        placeholder="1.0"
+                        docKey={'train.spectral_mid_weight'}
+                        min={0}
+                        step={0.1}
+                      />
+                      <NumberInput
+                        label="High Freq Weight"
+                        className="pt-1"
+                        value={jobConfig.config.process[0].train.spectral_high_weight ?? 2.0}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.spectral_high_weight')}
+                        placeholder="2.0"
+                        docKey={'train.spectral_high_weight'}
+                        min={0}
+                        step={0.1}
+                      />
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <NumberInput
+                        label="Low Cutoff (0-1)"
+                        className="pt-1"
+                        value={jobConfig.config.process[0].train.spectral_low_cutoff ?? 0.15}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.spectral_low_cutoff')}
+                        placeholder="0.15"
+                        docKey={'train.spectral_low_cutoff'}
+                        min={0}
+                        max={1}
+                        step={0.01}
+                      />
+                      <NumberInput
+                        label="High Cutoff (0-1)"
+                        className="pt-1"
+                        value={jobConfig.config.process[0].train.spectral_high_cutoff ?? 0.5}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.spectral_high_cutoff')}
+                        placeholder="0.5"
+                        docKey={'train.spectral_high_cutoff'}
+                        min={0}
+                        max={1}
+                        step={0.01}
+                      />
+                    </div>
+                    <div className="flex items-center space-x-2 pt-1">
+                      <input
+                        type="checkbox"
+                        id="spectral_use_phase"
+                        checked={jobConfig.config.process[0].train.spectral_use_phase ?? true}
+                        onChange={e => setJobConfig(e.target.checked, 'config.process[0].train.spectral_use_phase')}
+                        className="rounded border-gray-600"
+                      />
+                      <label htmlFor="spectral_use_phase" className="text-sm text-gray-300">
+                        Use Phase Information (more accurate, slightly slower)
+                      </label>
+                    </div>
+                    <NumberInput
+                      label="LCR Weight (SSVAE-inspired)"
+                      className="pt-1"
+                      value={jobConfig.config.process[0].train.spectral_lcr_weight ?? 0.0}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.spectral_lcr_weight')}
+                      placeholder="0.0 (disabled)"
+                      docKey={'train.spectral_lcr_weight'}
+                      min={0}
+                      step={0.01}
+                    />
+                    <p className="text-xs text-gray-500">
+                      Local Correlation Regularization encourages low-frequency bias in latents.
+                      Per SSVAE research, this improves diffusability and convergence speed.
+                      Try 0.01-0.1 for video models. 0.0 = disabled.
+                    </p>
+                  </div>
                 )}
                 {modelArch?.additionalSections?.includes('train.audio_loss_multiplier') && (
                   <NumberInput

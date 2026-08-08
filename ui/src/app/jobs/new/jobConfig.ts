@@ -105,6 +105,14 @@ export const defaultJobConfig: JobConfig = {
           switch_boundary_every: 1,
           loss_type: 'mse',
           pseudo_huber_c: 0.01,
+          // Spectral loss config
+          spectral_low_weight: 1.0,
+          spectral_mid_weight: 1.0,
+          spectral_high_weight: 2.0,
+          spectral_low_cutoff: 0.15,
+          spectral_high_cutoff: 0.5,
+          spectral_use_phase: true,
+          spectral_lcr_weight: 0.0,
         },
         logging: {
           log_every: 1,
