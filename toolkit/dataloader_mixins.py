@@ -1143,7 +1143,8 @@ class ImageProcessingDTOMixin:
     def load_and_process_image(
             self: 'FileItemDTO',
             transform: Union[None, transforms.Compose],
-            only_load_latents=False
+            only_load_latents=False,
+            force_load_images=False
     ):
         # handle get_prompt_embedding
         if self.is_text_embedding_cached:
@@ -1153,7 +1154,8 @@ class ImageProcessingDTOMixin:
             self.get_latent()
             # if load_image_when_caching_latents is set, we still need the raw image
             # tensor in addition to the cached latent, so fall through to load it below
-            if not self.dataset_config.load_image_when_caching_latents:
+            # force_load_images can be used to bypass this for special cases like flow caching
+            if not self.dataset_config.load_image_when_caching_latents and not force_load_images:
                 if self.has_control_image:
                     self.load_control_image()
                 if self.has_inpaint_image:

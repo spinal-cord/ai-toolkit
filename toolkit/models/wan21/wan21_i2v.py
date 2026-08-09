@@ -511,7 +511,9 @@ class Wan21I2V(Wan21):
             image_embeds = image_embeds.to(self.device_torch, dtype=self.torch_dtype)
             
             # Add conditioning using the standalone function
-            conditioned_latent = add_first_frame_conditioning(
+            # FIX: add_first_frame_conditioning returns a tuple (conditioned_latent, loss_mask).
+            # We only need the conditioned_latent for inference.
+            conditioned_latent, _ = add_first_frame_conditioning(
                 latent_model_input=latent_model_input,
                 first_frame=first_frames,
                 vae=self.vae

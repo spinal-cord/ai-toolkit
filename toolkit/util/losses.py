@@ -228,11 +228,8 @@ def _calculate_lcr_loss_ssvae_style(latents, patch_size=2, alpha=0.75):
         if len(all_corrs) == 0:
             return torch.tensor(0.0, device=latents.device, dtype=latents.dtype)
         
-        # Handle case where correlations are scalars (0-dim tensors)
-        # _patchwise_pearson_correlation returns a scalar mean
-        scalar_corrs = [c.item() if c.numel() == 1 else c for c in all_corrs]
-        avg_corr = torch.tensor(sum(scalar_corrs) / len(scalar_corrs),
-                               device=latents.device, dtype=latents.dtype)
+        # Bug 2.4 fix: keep gradients end-to-end — stack tensors, don't use .item()
+        avg_corr = torch.stack(all_corrs).mean()
     
     else:
         # Image case: (B, C, H, W)
@@ -302,16 +299,18 @@ def spectral_loss(
     high_cutoff=0.5,
     use_phase=True,
     lcr_weight=0.0,
+    spectral_transform='dct',  # 'dct' (default, SSVAE-compliant) or 'fft'
+    prediction_target='velocity',  # 'velocity' or 'x0'
 ):
     """
     Spectral Training Loss with frequency dissociation and balancing.
     
-    Implements advanced spectral balancing via FFT analysis to dissociate
+    Implements advanced spectral balancing via FFT or DCT analysis to dissociate
     low frequencies (structure/motion) from high frequencies (texture/details).
     Inspired by SSVAE research on latent spectral biasing for superior diffusability.
     
     This loss:
-    1. Decomposes prediction and target into frequency bands via FFT
+    1. Decomposes prediction and target into frequency bands via FFT or DCT
     2. Applies independent MSE loss per frequency band
     3. Weighted combination allows emphasizing texture while preserving structure
     4. Optional LCR (Local Correlation Regularization) for low-frequency bias
@@ -330,6 +329,8 @@ def spectral_loss(
         use_phase: If True, also penalize phase differences (more accurate but slower)
         lcr_weight: SSVAE-inspired Local Correlation Regularization weight (0.0 = disabled)
                    Encourages low-frequency bias in latents for better diffusability
+        spectral_transform: 'dct' for DCT-based (SSVAE-compliant, default), 'fft' for FFT-based
+        prediction_target: 'velocity' (model predicts ε - x₀) or 'x0' (model predicts x₀ directly)
     
     Returns:
         Loss tensor with same shape as input latents
@@ -339,77 +340,39 @@ def spectral_loss(
     latents = latents.float()
     noise = noise.float()
     
-    # Reverse noise prediction to get predicted clean latents: x0_pred = noise - noise_pred
-    pred_latents = noise - model_pred
+    # Reconstruct predicted clean latents based on prediction target:
+    # - velocity: model_pred = ε - x₀ ⇒ x₀ = ε - model_pred = noise - model_pred
+    # - x0: model_pred = x₀ directly
+    if prediction_target == 'x0':
+        pred_latents = model_pred
+    else:
+        pred_latents = noise - model_pred
     
     # Determine if video (5D) or image (4D)
     is_video = len(latents.shape) == 5
-    
+
     if is_video:
         # Video: (B, C, T, H, W)
-        # Apply FFT on spatial dimensions (H, W) for each frame
-        batch_size, channels, num_frames, height, width = latents.shape
-        
-        # Reshape to treat all frames as batch for FFT
-        pred_reshaped = pred_latents.permute(0, 2, 1, 3, 4).reshape(
-            batch_size * num_frames, channels, height, width
-        )
-        target_reshaped = latents.permute(0, 2, 1, 3, 4).reshape(
-            batch_size * num_frames, channels, height, width
-        )
-        
-        # Apply 2D FFT on spatial dimensions
-        pred_fft = torch.fft.rfft2(pred_reshaped, norm='ortho')
-        target_fft = torch.fft.rfft2(target_reshaped, norm='ortho')
-        
-        fft_height, fft_width = pred_fft.shape[-2], pred_fft.shape[-1]
-        
-        # Create frequency masks
-        low_mask, mid_mask, high_mask = _create_radial_frequency_masks(
-            fft_height, fft_width, low_cutoff, high_cutoff
-        )
-        # Expand masks to match FFT shape: (1, 1, H_fft, W_fft)
-        masks = (low_mask, mid_mask, high_mask)
-        
-        # Compute per-band losses
-        band_losses = []
-        weights = [low_weight, mid_weight, high_weight]
-        
-        for mask, weight in zip(masks, weights):
-            mask_expanded = mask.unsqueeze(0).unsqueeze(0).to(pred_fft.device)
-            
-            # Apply mask to isolate frequency band
-            pred_band = pred_fft * mask_expanded
-            target_band = target_fft * mask_expanded
-            
-            if use_phase:
-                # Full complex loss (magnitude + phase)
-                band_loss = F.mse_loss(pred_band.real, target_band.real, reduction='none') + \
-                           F.mse_loss(pred_band.imag, target_band.imag, reduction='none')
-            else:
-                # Magnitude-only loss (faster, focuses on frequency content)
-                pred_mag = pred_band.abs()
-                target_mag = target_band.abs()
-                band_loss = F.mse_loss(pred_mag, target_mag, reduction='none')
-            
-            band_losses.append(band_loss * weight)
-        
-        # Sum band losses
-        total_loss_fft = torch.stack(band_losses, dim=1).sum(dim=1)
-        
-        # Inverse FFT to get loss in spatial domain
-        # Create a complex tensor with loss magnitude
-        loss_fft = torch.view_as_complex(
-            torch.stack([total_loss_fft, torch.zeros_like(total_loss_fft)], dim=-1)
-        )
-        
-        # Apply inverse FFT
-        loss_spatial = torch.fft.irfft2(loss_fft, s=(height, width), norm='ortho').abs()
-        
-        # Reshape back to video shape
-        loss_spatial = loss_spatial.reshape(batch_size, num_frames, channels, height, width)
-        loss_spatial = loss_spatial.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
-        
+        # Use 3D FFT over (T, H, W) for spatio-temporal frequency analysis.
+        # Per SSVAE paper: "we adopt a 3D DCT to analyze the spatio-temporal
+        # frequency spectrum... [2D-only methods] do not adequately address
+        # the temporal dimension in video latents."
+        if spectral_transform == 'dct':
+            loss_spatial = _spectral_loss_3d_video_dct(
+                pred_latents, latents,
+                low_weight, mid_weight, high_weight,
+                low_cutoff, high_cutoff,
+                use_phase
+            )
+        else:
+            # Default: FFT
+            loss_spatial = _spectral_loss_3d_video(
+                pred_latents, latents,
+                low_weight, mid_weight, high_weight,
+                low_cutoff, high_cutoff,
+                use_phase
+            )
+
     else:
         # Image: (B, C, H, W)
         batch_size, channels, height, width = latents.shape
@@ -482,3 +445,708 @@ def spectral_loss(
         loss_spatial = loss_spatial + lcr_loss_uniform
     
     return loss_spatial
+
+
+def _dct_1d(x: torch.Tensor, n: int = None, dim: int = -1, norm: str = 'ortho') -> torch.Tensor:
+    """
+    1D DCT-II using FFT (fallback when torch.dct is unavailable).
+
+    Implements the standard FFT-based DCT algorithm:
+      1. Create even-symmetric extension: y[k] = x[k] for k<N, y[2N-1-k] = x[k]
+      2. Apply FFT of length 2N
+      3. Extract first N coefficients with phase correction
+      4. Scale by 0.5 to compensate for the mirror-concatenation doubling the signal.
+
+    NOTE [SCALING BUG FIX]: The original version missed step 4. Concatenating x with
+    flip(x) creates length 2N where every sample is counted twice, making the FFT result
+    exactly 2× larger than the mathematical DCT-II. For spectral loss this only changed
+    absolute magnitude uniformly across bands, but paired with _idct_1d it broke the
+    roundtrip. The fix is a single result *= 0.5 (see implementation).
+
+    Args:
+        x: Input tensor
+        n: Transform length (defaults to input size along dim)
+        dim: Dimension along which to compute DCT
+        norm: Normalization mode ('ortho' for orthonormal, or None)
+
+    Returns:
+        DCT-II transform along specified dimension
+    """
+    if n is None:
+        n = x.shape[dim]
+
+    ndim = x.dim()
+    dim = dim % ndim  # Normalize negative dim
+
+    # Create even-symmetric extension of length 2n
+    # y = [x[0], x[1], ..., x[n-1], x[n-1], x[n-2], ..., x[0]]
+    x_flipped = x.flip(dim)
+    y = torch.cat([x, x_flipped], dim=dim)
+
+    # Apply FFT of length 2n
+    Y = torch.fft.fft(y, n=2 * n, dim=dim)
+
+    # Extract first n coefficients and apply phase correction
+    # Build broadcastable shape for k: 1 everywhere except dim
+    k_shape = [1] * ndim
+    k_shape[dim] = n
+    k = torch.arange(n, device=x.device, dtype=torch.float32).view(k_shape)
+    phase = torch.exp(-1j * torch.pi * k / (2 * n))
+
+    # Take first n FFT coefficients
+    slices = [slice(None)] * ndim
+    slices[dim] = slice(0, n)
+    Y_n = Y[tuple(slices)]
+
+    result = (Y_n * phase).real
+
+    # SCALE FIX: The even-symmetric mirror concatenation gives length 2N with each element
+    # counted twice, so the FFT-based result is exactly 2× larger than the mathematical DCT.
+    # Correcting here so coefficients match scipy.fft.dct and compose properly with _idct_1d.
+    result *= 0.5
+
+    # Handle orthonormal normalization
+    if norm == 'ortho':
+        scale = torch.ones(n, device=x.device, dtype=x.dtype)
+        scale[0] = torch.sqrt(torch.tensor(1.0 / n, device=x.device, dtype=x.dtype))
+        scale[1:] = torch.sqrt(torch.tensor(2.0 / n, device=x.device, dtype=x.dtype))
+        scale_shape = [1] * ndim
+        scale_shape[dim] = n
+        scale = scale.view(scale_shape)
+        result = result * scale
+
+    return result
+
+
+def _idct_1d(x: torch.Tensor, n: int = None, dim: int = -1, norm: str = 'ortho') -> torch.Tensor:
+    """
+    1D IDCT-II (Inverse DCT, equivalent to DCT-III for orthonormal DCT-II).
+
+    Direct computation using the inverse definition:
+        x[j] = sum_{k=0}^{N-1} c[k] * X[k] * cos(pi*(2j+1)*k/(2N))
+    where c[0] = sqrt(1/N), c[k] = sqrt(2/N) for k >= 1 (orthonormal).
+
+    This is the exact inverse of _dct_1d with orthonormal normalization.
+
+    Args:
+        x: Input DCT coefficients
+        n: Transform length (defaults to input size along dim)
+        dim: Dimension along which to compute IDCT
+        norm: Normalization mode ('ortho' for orthonormal, or None)
+
+    Returns:
+        Reconstructed signal along specified dimension
+    """
+    if n is None:
+        n = x.shape[dim]
+
+    # Ensure float32, restore dtype at end
+    input_dtype = x.dtype
+    x = x.float()
+
+    # Move dim to last position
+    if dim != x.dim() - 1 and dim != -1:
+        x = x.transpose(dim, x.dim() - 1)
+
+    # For orthonormal DCT-II, the inverse uses the same cosine basis but
+    # with normalization applied first, then the transpose basis.
+    # x[j] = sum_k c[k] * X[k] * cos(pi*(2j+1)*k/(2N))
+    # This is: cos_basis^T @ (scale * X) where cos_basis has rows=j, cols=k
+
+    # Build cosine basis: same as forward (transpose-symmetric structure)
+    j = torch.arange(n, device=x.device, dtype=torch.float32).unsqueeze(1)  # (N, 1)
+    k = torch.arange(n, device=x.device, dtype=torch.float32).unsqueeze(0)  # (1, N)
+    cosine_basis = torch.cos(torch.pi * (2 * j + 1) * k / (2 * n))
+
+    # Apply normalization first
+    if norm == 'ortho':
+        scale = torch.ones(n, device=x.device, dtype=torch.float32)
+        scale[0] = torch.sqrt(torch.tensor(1.0 / n, dtype=torch.float32))
+        scale[1:] = torch.sqrt(torch.tensor(2.0 / n, dtype=torch.float32))
+        x_scaled = x * scale
+    else:
+        x_scaled = x
+
+    # Result: (*batch, N) @ (N, N)^T = (*batch, N)
+    # Since cosine_basis[j,k] is symmetric in structure, we transpose it
+    result = torch.matmul(x_scaled, cosine_basis.transpose(-1, -2))
+
+    # Restore original dimension order and dtype
+    if dim != x.dim() - 1 and dim != -1:
+        result = result.transpose(dim, result.dim() - 1)
+    return result.to(input_dtype)
+
+
+def _create_spherical_frequency_masks(
+    fft_t: int,
+    fft_h: int,
+    fft_w: int,
+    low_cutoff: float = 0.15,
+    high_cutoff: float = 0.5,
+    device=None,
+):
+    """
+    Create 3D spherical frequency masks for spatio-temporal FFT.
+
+    Uses proper frequency coordinates accounting for FFT wraparound:
+    - Full FFT dims (t, h): frequencies wrap around; index 0 is DC, then positive,
+      then negative (high freq). Use |fftfreq| for radial distance.
+    - Real FFT dim (w): frequencies are [0, ..., 0.5]; no wraparound.
+
+    Args:
+        fft_t: Temporal FFT size (T for full FFT)
+        fft_h: Height FFT size
+        fft_w: Width FFT size (W//2+1 for rfft on last dim)
+        low_cutoff: Inner radius (0-1) for low-frequency band
+        high_cutoff: Outer radius (0-1) for mid-frequency band
+        device: Device for tensors
+
+    Returns:
+        low_mask, mid_mask, high_mask: each (fft_t, fft_h, fft_w)
+    """
+    # Full FFT dims: use absolute frequency (DC at 0, high freq at ±0.5)
+    t_freqs = torch.abs(torch.fft.fftfreq(fft_t, device=device))
+    h_freqs = torch.abs(torch.fft.fftfreq(fft_h, device=device))
+    # Real FFT dim: frequencies are [0, ..., 0.5]; use rfftfreq for correct scaling.
+    # BUG FIX B: previously used arange(fft_w)/(fft_w-1) which mapped to [0, 1.0],
+    # but rfftn's last dim maps to [0, 0.5]. This caused 2× elongation of spherical
+    # masks along the W axis. We reconstruct W from fft_w = W//2+1.
+    W = (fft_w - 1) * 2 if fft_w > 1 else 2
+    w_freqs = torch.fft.rfftfreq(W, device=device)
+
+    # Meshgrid: (fft_t, fft_h, fft_w)
+    t_grid, h_grid, w_grid = torch.meshgrid(t_freqs, h_freqs, w_freqs, indexing='ij')
+
+    # Radial frequency (magnitude)
+    radius = torch.sqrt(t_grid**2 + h_grid**2 + w_grid**2)
+    max_radius = radius.max().clamp(min=1e-8)
+    radius_norm = radius / max_radius
+
+    low_mask = (radius_norm <= low_cutoff).float()
+    mid_mask = ((radius_norm > low_cutoff) & (radius_norm <= high_cutoff)).float()
+    high_mask = (radius_norm > high_cutoff).float()
+
+    return low_mask, mid_mask, high_mask
+
+
+def _create_dct_frequency_masks(
+    dct_t: int,
+    dct_h: int,
+    dct_w: int,
+    low_cutoff: float = 0.15,
+    high_cutoff: float = 0.5,
+    device=None,
+):
+    """
+    Create 3D spherical frequency masks for spatio-temporal DCT.
+
+    Per SSVAE paper: "we adopt a 3D DCT to analyze the spatio-temporal
+    frequency spectrum." DCT frequencies are monotonically increasing
+    from DC (0,0,0) to Nyquist, with no wraparound.
+
+    Args:
+        dct_t: Temporal DCT size (T)
+        dct_h: Height DCT size (H)
+        dct_w: Width DCT size (W)
+        low_cutoff: Inner radius (0-1) for low-frequency band
+        high_cutoff: Outer radius (0-1) for mid-frequency band
+        device: Device for tensors
+
+    Returns:
+        low_mask, mid_mask, high_mask: each (dct_t, dct_h, dct_w)
+    """
+    # DCT frequencies: indices 0..N-1 map to 0..(N-1)/(N-1) = 0..1
+    # No wraparound; index 0 is DC, highest index is highest freq
+    t_freqs = torch.arange(dct_t, device=device) / max(dct_t - 1, 1)
+    h_freqs = torch.arange(dct_h, device=device) / max(dct_h - 1, 1)
+    w_freqs = torch.arange(dct_w, device=device) / max(dct_w - 1, 1)
+
+    # Meshgrid: (dct_t, dct_h, dct_w)
+    t_grid, h_grid, w_grid = torch.meshgrid(t_freqs, h_freqs, w_freqs, indexing='ij')
+
+    # Radial frequency
+    radius = torch.sqrt(t_grid**2 + h_grid**2 + w_grid**2)
+    max_radius = radius.max().clamp(min=1e-8)
+    radius_norm = radius / max_radius
+
+    low_mask = (radius_norm <= low_cutoff).float()
+    mid_mask = ((radius_norm > low_cutoff) & (radius_norm <= high_cutoff)).float()
+    high_mask = (radius_norm > high_cutoff).float()
+
+    return low_mask, mid_mask, high_mask
+
+
+def _spectral_loss_3d_video(
+    pred_latents: torch.Tensor,
+    latents: torch.Tensor,
+    low_weight: float,
+    mid_weight: float,
+    high_weight: float,
+    low_cutoff: float,
+    high_cutoff: float,
+    use_phase: bool,
+) -> torch.Tensor:
+    """
+    3D spatio-temporal spectral loss for video (B, C, T, H, W).
+
+    Applies 3D FFT over (T, H, W) to analyze frequency content across
+    all three dimensions simultaneously. This is the correct approach
+    per SSVAE paper, which notes that 2D-only methods "do not
+    adequately address the temporal dimension in video latents."
+
+    Benefits:
+    - Penalizes temporal flickering (high temporal frequencies)
+    - Enforces low-frequency bias in motion (smooth trajectories)
+    - Captures spatio-temporal correlations that 2D FFT misses
+
+    Args:
+        pred_latents: (B, C, T, H, W) predicted clean latents
+        latents: (B, C, T, H, W) ground truth clean latents
+        low_weight, mid_weight, high_weight: per-band loss weights
+        low_cutoff, high_cutoff: spherical frequency band boundaries
+        use_phase: include phase in loss
+
+    Returns:
+        loss_spatial: (B, C, T, H, W) loss tensor
+    """
+    B, C, T, H, W = latents.shape
+
+    # Permute to (B*C, T, H, W) for batched 3D FFT
+    pred = pred_latents.reshape(B * C, T, H, W)
+    target = latents.reshape(B * C, T, H, W)
+
+    # 3D FFT over (T, H, W)
+    # rfftn with last two dims real -> output shape: (B*C, T, H, W//2+1)
+    pred_fft = torch.fft.rfftn(pred, dim=(-3, -2, -1), norm='ortho')
+    target_fft = torch.fft.rfftn(target, dim=(-3, -2, -1), norm='ortho')
+
+    fft_t, fft_h, fft_w = pred_fft.shape[-3], pred_fft.shape[-2], pred_fft.shape[-1]
+
+    # Create 3D spherical masks
+    low_mask, mid_mask, high_mask = _create_spherical_frequency_masks(
+        fft_t, fft_h, fft_w,
+        low_cutoff, high_cutoff,
+        device=pred_fft.device
+    )
+
+    # Expand masks: (1, fft_t, fft_h, fft_w)
+    mask_exp_shape = (1, fft_t, fft_h, fft_w)
+
+    band_losses = []
+    masks = [low_mask, mid_mask, high_mask]
+    weights = [low_weight, mid_weight, high_weight]
+
+    for mask, weight in zip(masks, weights):
+        mask_exp = mask.view(mask_exp_shape).to(pred_fft.device)
+        pred_band = pred_fft * mask_exp
+        target_band = target_fft * mask_exp
+
+        if use_phase:
+            band_loss = (
+                F.mse_loss(pred_band.real, target_band.real, reduction='none') +
+                F.mse_loss(pred_band.imag, target_band.imag, reduction='none')
+            )
+        else:
+            band_loss = F.mse_loss(pred_band.abs(), target_band.abs(), reduction='none')
+
+        band_losses.append(band_loss * weight)
+
+    # Sum band losses: (B*C, T, H, W//2+1)
+    total_fft_loss = torch.stack(band_losses, dim=1).sum(dim=1)
+
+    # Convert to complex and inverse FFT back to spatio-temporal domain
+    loss_fft_complex = torch.view_as_complex(
+        torch.stack([total_fft_loss, torch.zeros_like(total_fft_loss)], dim=-1)
+    )
+
+    # irfftn with s to restore original shape
+    loss_spatial = torch.fft.irfftn(
+        loss_fft_complex, s=(T, H, W), dim=(-3, -2, -1), norm='ortho'
+    ).abs()  # (B*C, T, H, W)
+
+    # Reshape back to (B, C, T, H, W)
+    loss_spatial = loss_spatial.reshape(B, C, T, H, W)
+
+    return loss_spatial
+
+
+def _spectral_loss_3d_video_dct(
+    pred_latents: torch.Tensor,
+    latents: torch.Tensor,
+    low_weight: float,
+    mid_weight: float,
+    high_weight: float,
+    low_cutoff: float,
+    high_cutoff: float,
+    use_phase: bool,
+) -> torch.Tensor:
+    """
+    3D spatio-temporal spectral loss for video using DCT (SSVAE-compliant).
+
+    Applies 3D DCT over (T, H, W) as specified in the SSVAE paper:
+    "we adopt a 3D DCT to analyze the spatio-temporal frequency spectrum."
+
+    DCT advantages over FFT:
+    - Real-valued coefficients (no complex arithmetic overhead)
+    - Mirror boundary conditions (no wraparound artifacts)
+    - Matches SSVAE paper methodology exactly
+
+    Args:
+        pred_latents: (B, C, T, H, W) predicted clean latents
+        latents: (B, C, T, H, W) ground truth clean latents
+        low_weight, mid_weight, high_weight: per-band loss weights
+        low_cutoff, high_cutoff: spherical frequency band boundaries
+        use_phase: ignored for DCT (real-valued only)
+
+    Returns:
+        loss_spatial: (B, C, T, H, W) loss tensor
+    """
+    B, C, T, H, W = latents.shape
+
+    # Reshape to (B*C, T, H, W) for batched 3D DCT
+    pred = pred_latents.reshape(B * C, T, H, W)
+    target = latents.reshape(B * C, T, H, W)
+
+    # 3D DCT over (T, H, W) using 1D DCT composition
+    # DCT-II with orthonormal normalization
+    pred_dct = _dct_1d(_dct_1d(_dct_1d(pred, n=T, dim=-3, norm='ortho'),
+                               n=H, dim=-2, norm='ortho'),
+                       n=W, dim=-1, norm='ortho')
+    target_dct = _dct_1d(_dct_1d(_dct_1d(target, n=T, dim=-3, norm='ortho'),
+                                 n=H, dim=-2, norm='ortho'),
+                         n=W, dim=-1, norm='ortho')
+
+    # Create 3D spherical masks using DCT frequency coordinates
+    low_mask, mid_mask, high_mask = _create_dct_frequency_masks(
+        T, H, W,
+        low_cutoff, high_cutoff,
+        device=pred_dct.device
+    )
+
+    # Expand masks: (1, T, H, W)
+    mask_exp_shape = (1, T, H, W)
+
+    band_losses = []
+    masks = [low_mask, mid_mask, high_mask]
+    weights = [low_weight, mid_weight, high_weight]
+
+    for mask, weight in zip(masks, weights):
+        mask_exp = mask.view(mask_exp_shape).to(pred_dct.device)
+        pred_band = pred_dct * mask_exp
+        target_band = target_dct * mask_exp
+
+        # DCT is real-valued; no phase component
+        band_loss = F.mse_loss(pred_band, target_band, reduction='none')
+        band_losses.append(band_loss * weight)
+
+    # Sum band losses: (B*C, T, H, W) - still in DCT frequency domain
+    total_dct_loss = torch.stack(band_losses, dim=1).sum(dim=1)
+
+    # Inverse DCT to convert loss from frequency domain back to spatio-temporal domain.
+    # This ensures that applying a per-frame mask (e.g., I2V conditioning mask that
+    # zeros out the first temporal position) correctly masks temporal/spatial positions
+    # rather than incorrectly zeroing out a specific frequency component (temporal DC).
+    # Matches the FFT path's behavior of applying irfftn before returning.
+    loss_spatial = _idct_1d(_idct_1d(_idct_1d(total_dct_loss, n=T, dim=-3, norm='ortho'),
+                                     n=H, dim=-2, norm='ortho'),
+                            n=W, dim=-1, norm='ortho')
+
+    # Reshape back to (B, C, T, H, W) and take absolute value, matching the FFT path.
+    # The IDCT can produce negative values for loss computed in frequency domain;
+    # abs() ensures non-negative loss and correct semantic for per-pixel masks.
+    loss_spatial = loss_spatial.reshape(B, C, T, H, W).abs()
+
+    return loss_spatial
+
+
+def spectral_flow_loss(
+    model_pred,
+    latents,
+    noise,
+    batch_flow=None,
+    timesteps=None,
+    flow_loss_module=None,
+    vae_temporal_stride=4,
+    vae_spatial_stride=8,
+    # Spectral params
+    low_weight=1.0,
+    mid_weight=1.0,
+    high_weight=2.0,
+    low_cutoff=0.15,
+    high_cutoff=0.5,
+    use_phase=True,
+    lcr_weight=0.0,
+    spectral_transform='dct',  # 'dct' (default, SSVAE-compliant) or 'fft'
+    prediction_target='velocity',  # 'velocity' or 'x0'
+    # Flow params
+    flow_weight=0.1,
+    flow_max_timestep=800,
+    motion_weighted=True,
+    adaptive=False,
+    current_flow_weight=None,
+):
+    """
+    Combined spectral + optical flow loss for video diffusion training.
+
+    Spectral loss handles spatial frequency distribution (structure vs texture).
+    Flow loss handles temporal motion consistency via latent-space flow warping.
+
+    Args:
+        spectral_transform: 'dct' for DCT-based (SSVAE-compliant, default), 'fft' for FFT-based
+        prediction_target: 'velocity' (model predicts ε - x₀) or 'x0' (model predicts x₀ directly)
+        flow_loss_module: Pre-cached FlowConsistencyLoss from SDTrainer.
+                          If None, creates a new one (fallback for testing).
+        current_flow_weight: Adaptive weight override. None = use flow_weight.
+
+    Returns:
+        tuple: (total_loss, flow_deviation, spatial_loss_val, flow_loss_val,
+                spectral_component, flow_component)
+        - total_loss: combined loss tensor (per-pixel)
+        - flow_deviation: scalar flow loss for logging/rejection
+        - spatial_loss_val: scalar spectral loss for logging
+        - flow_loss_val: scalar flow loss for logging
+        - spectral_component: spectral loss tensor (for gradient-selective rejection)
+        - flow_component: flow loss tensor (for gradient-selective rejection)
+    """
+    # Convert to float32 for precision
+    model_pred = model_pred.float()
+    latents = latents.float()
+    noise = noise.float()
+
+    # Reconstruct predicted clean latents based on prediction target:
+    # - velocity: model_pred = ε - x₀ ⇒ x₀ = noise - model_pred
+    # - x0: model_pred = x₀ directly
+    if prediction_target == 'x0':
+        pred_latents = model_pred
+    else:
+        pred_latents = noise - model_pred
+
+    is_video = len(latents.shape) == 5
+
+    # === SPECTRAL LOSS ===
+    #
+    # NOTE: The original implementation used 2D FFT (spatial only) on each frame
+    # independently. This was a quick prototype that treated video as a stack of
+    # images. The SSVAE paper explicitly states this is incorrect:
+    #
+    #   "we adopt a 3D DCT to analyze the spatio-temporal frequency spectrum... they
+    #    do not adequately address the temporal dimension in video latents."
+    #
+    # Problems with 2D-only FFT:
+    # - Ignores temporal frequency components entirely
+    # - Cannot penalize temporal flickering or inconsistent motion at the frequency level
+    # - Leaves high-frequency temporal noise unchecked
+    #
+    # The 3D FFT below correctly operates over (T, H, W), enforcing low-frequency
+    # bias in the temporal axis as well as spatial axes. This forces the model to
+    # learn smoother motion transitions — a proven benefit from SSVAE's 3x
+    # convergence speedup.
+    #
+    # The 2D implementation is preserved in comments below for reference.
+
+    if is_video:
+        # Choose transform based on config
+        if spectral_transform == 'dct':
+            loss_spatial = _spectral_loss_3d_video_dct(
+                pred_latents, latents,
+                low_weight, mid_weight, high_weight,
+                low_cutoff, high_cutoff,
+                use_phase
+            )
+        else:
+            # Default: FFT
+            loss_spatial = _spectral_loss_3d_video(
+                pred_latents, latents,
+                low_weight, mid_weight, high_weight,
+                low_cutoff, high_cutoff,
+                use_phase
+            )
+    else:
+        # Image case: 2D FFT is correct
+        B, C, H, W = latents.shape
+        pred_reshaped = pred_latents
+        target_reshaped = latents
+
+        pred_fft = torch.fft.rfft2(pred_reshaped, norm='ortho')
+        target_fft = torch.fft.rfft2(target_reshaped, norm='ortho')
+
+        fft_h, fft_w = pred_fft.shape[-2], pred_fft.shape[-1]
+        low_mask, mid_mask, high_mask = _create_radial_frequency_masks(
+            fft_h, fft_w, low_cutoff, high_cutoff
+        )
+
+        band_losses = []
+        weights = [low_weight, mid_weight, high_weight]
+
+        for mask, weight in zip([low_mask, mid_mask, high_mask], weights):
+            mask_exp = mask.unsqueeze(0).unsqueeze(0).to(pred_fft.device)
+            pred_band = pred_fft * mask_exp
+            target_band = target_fft * mask_exp
+
+            if use_phase:
+                band_loss = F.mse_loss(pred_band.real, target_band.real, reduction='none') + \
+                           F.mse_loss(pred_band.imag, target_band.imag, reduction='none')
+            else:
+                band_loss = F.mse_loss(pred_band.abs(), target_band.abs(), reduction='none')
+
+            band_losses.append(band_loss * weight)
+
+        total_fft_loss = torch.stack(band_losses, dim=1).sum(dim=1)
+        loss_fft_complex = torch.view_as_complex(
+            torch.stack([total_fft_loss, torch.zeros_like(total_fft_loss)], dim=-1)
+        )
+        loss_spatial = torch.fft.irfft2(loss_fft_complex, s=(H, W), norm='ortho').abs()
+
+    # ============================================================
+    # LEGACY 2D-ONLY IMPLEMENTATION (COMMENTED OUT)
+    # ============================================================
+    # This was the original approach: apply 2D FFT per frame.
+    # Preserved for reference and rollback if needed.
+    #
+    # if is_video:
+    #     B, C, T, H, W = latents.shape
+    #     # Reshape to treat all frames as batch for FFT
+    #     pred_reshaped = pred_latents.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+    #     target_reshaped = latents.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+    # else:
+    #     B, C, H, W = latents.shape
+    #     pred_reshaped = pred_latents
+    #     target_reshaped = latents
+    #
+    # # FFT on spatial dimensions only
+    # pred_fft = torch.fft.rfft2(pred_reshaped, norm='ortho')
+    # target_fft = torch.fft.rfft2(target_reshaped, norm='ortho')
+    #
+    # fft_h, fft_w = pred_fft.shape[-2], pred_fft.shape[-1]
+    # low_mask, mid_mask, high_mask = _create_radial_frequency_masks(
+    #     fft_h, fft_w, low_cutoff, high_cutoff
+    # )
+    #
+    # band_losses = []
+    # weights = [low_weight, mid_weight, high_weight]
+    #
+    # for mask, weight in zip([low_mask, mid_mask, high_mask], weights):
+    #     mask_exp = mask.unsqueeze(0).unsqueeze(0).to(pred_fft.device)
+    #     pred_band = pred_fft * mask_exp
+    #     target_band = target_fft * mask_exp
+    #
+    #     if use_phase:
+    #         band_loss = F.mse_loss(pred_band.real, target_band.real, reduction='none') + \
+    #                    F.mse_loss(pred_band.imag, target_band.imag, reduction='none')
+    #     else:
+    #         band_loss = F.mse_loss(pred_band.abs(), target_band.abs(), reduction='none')
+    #
+    #     band_losses.append(band_loss * weight)
+    #
+    # total_fft_loss = torch.stack(band_losses, dim=1).sum(dim=1)
+    # loss_fft_complex = torch.view_as_complex(
+    #     torch.stack([total_fft_loss, torch.zeros_like(total_fft_loss)], dim=-1)
+    # )
+    # loss_spatial = torch.fft.irfft2(loss_fft_complex, s=(H, W), norm='ortho').abs()
+    #
+    # if is_video:
+    #     loss_spatial = loss_spatial.reshape(B, T, C, H, W).permute(0, 2, 1, 3, 4)
+    # ============================================================
+
+    # LCR loss
+    if lcr_weight > 0.0:
+        lcr_loss_scalar = _calculate_lcr_loss_ssvae_style(
+            pred_latents,
+            patch_size=2,
+            alpha=0.75
+        )
+        spectral_mean = loss_spatial.mean()
+        lcr_loss_scaled = lcr_loss_scalar * lcr_weight * spectral_mean
+        lcr_loss_uniform = lcr_loss_scaled * torch.ones_like(loss_spatial)
+        loss_spatial = loss_spatial + lcr_loss_uniform
+
+    # === OPTICAL FLOW LOSS (temporal motion) ===
+    flow_loss = torch.tensor(0.0, device=model_pred.device, dtype=model_pred.dtype)
+    flow_deviation = 0.0
+
+    if (is_video and batch_flow is not None and flow_weight > 0
+            and timesteps is not None):
+        B, C, T_lat, H_lat, W_lat = model_pred.shape
+
+        if T_lat >= 2:
+            from toolkit.optical_flow.flow_loss import FlowConsistencyLoss
+
+            # Handle expand_timesteps (Wan22 5B): timesteps may be (B, seq_len)
+            # instead of (B,). Use scalar timesteps for the timestep gate.
+            if timesteps.dim() == 2:
+                # Per-pixel timesteps — use first token's timestep as representative
+                t = timesteps[:, 0].float()
+            else:
+                t = timesteps.float()
+            gate = torch.clamp(1.0 - (t / flow_max_timestep), min=0.0)
+
+            if gate.sum() > 1e-6:
+                # x0 reconstruction for flow loss:
+                # FlowConsistencyLoss.forward() uses: pred_x0 = noisy_latents - sigma * noise_pred
+                # This is correct when noisy_latents=x_t and noise_pred=velocity.
+                #
+                # For velocity prediction (default):
+                #   x_t = (1-σ)·x0 + σ·ε, pass model_pred (velocity) directly
+                #   pred_x0 = x_t - σ·v = x0 ✓
+                #
+                # For x0 prediction:
+                #   model_pred = x0 directly; convert to velocity form for the flow module:
+                #   v_equiv = (x_t - x0_pred) / σ
+                #   pred_x0 = x_t - σ·v_equiv = x_t - (x_t - x0_pred) = x0_pred ✓
+                sigma = (t / 1000.0).view(B, 1, 1, 1, 1).to(latents.dtype)
+                x_t = (1.0 - sigma) * latents + sigma * noise  # (B, C, T_lat, H_lat, W_lat)
+
+                if flow_loss_module is None:
+                    flow_module = FlowConsistencyLoss(
+                        vae_temporal_stride=vae_temporal_stride,
+                        vae_spatial_stride=vae_spatial_stride
+                    ).to(model_pred.device, dtype=model_pred.dtype)
+                else:
+                    # Only move if device/dtype differs (avoid wasteful .to() every step)
+                    param = next(flow_loss_module.parameters(), None)
+                    if param is None or param.device != model_pred.device or param.dtype != model_pred.dtype:
+                        flow_module = flow_loss_module.to(model_pred.device, dtype=model_pred.dtype)
+                    else:
+                        flow_module = flow_loss_module
+
+                # Handle prediction_target: convert x0 prediction to velocity form if needed
+                if prediction_target == 'x0':
+                    # model_pred is x0; convert to equivalent velocity
+                    # v = (x_t - x0) / sigma
+                    flow_noise_pred = (x_t - model_pred) / sigma.clamp(min=1e-8)
+                else:
+                    flow_noise_pred = model_pred
+
+                flow_loss = flow_module(
+                    noise_pred=flow_noise_pred,
+                    noisy_latents=x_t,
+                    timesteps=t,
+                    batch_flow=batch_flow.float().to(model_pred.device),
+                    max_timestep=flow_max_timestep,
+                    motion_weighted=motion_weighted
+                )
+                flow_deviation = flow_loss.item()
+
+    # === COMBINE ===
+    if adaptive:
+        # When adaptive, use the dynamically-adjusted weight.
+        # current_flow_weight defaults to None, falling back to flow_weight.
+        effective_flow_weight = current_flow_weight if current_flow_weight is not None else flow_weight
+    else:
+        # When not adaptive, use the configured base weight
+        effective_flow_weight = flow_weight
+
+    # Keep spectral and flow components separate so rejection can zero only
+    # the flow gradient without killing the spectral learning signal.
+    spectral_component = loss_spatial
+    flow_component = flow_loss * effective_flow_weight
+    total_loss = spectral_component + flow_component
+
+    # Return in original dtype for mixed precision compatibility
+    original_dtype = latents.dtype
+    spectral_component = spectral_component.to(original_dtype)
+    flow_component = flow_component.to(original_dtype)
+    total_loss = total_loss.to(original_dtype)
+
+    return (total_loss, flow_deviation, loss_spatial.mean().item(), flow_loss.item(),
+            spectral_component, flow_component)

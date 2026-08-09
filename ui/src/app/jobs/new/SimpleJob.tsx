@@ -1586,11 +1586,26 @@ export default function SimpleJob({
                     { value: 'mae', label: 'Mean Absolute Error' },
                     { value: 'wavelet', label: 'Wavelet' },
                     { value: 'spectral', label: 'Spectral (Frequency Balancing)' },
+                    { value: 'spectral_flow', label: 'Spectral + Flow (Video Motion)' },
                     { value: 'stepped', label: 'Stepped Recovery' },
                     { value: 'pseudo_huber', label: 'Pseudo Huber (Smooth L1)' },
                     { value: 'mean_flow', label: 'Mean Flow (Experimental)' },
                   ]}
                 />
+                <SelectInput
+                  label="Prediction Target"
+                  className="pt-2"
+                  value={jobConfig.config.process[0].train.prediction_target ?? 'velocity'}
+                  onChange={value => setJobConfig(value, 'config.process[0].train.prediction_target')}
+                  options={[
+                    { value: 'velocity', label: 'Velocity (default for flow-matching)' },
+                    { value: 'x0', label: 'x0 (direct latent prediction)' },
+                  ]}
+                />
+                <p className="text-xs text-gray-500 -mt-1">
+                  Velocity: model predicts ε - x₀ (standard for pretrained flow-matching models).
+                  x0: model predicts x₀ directly (requires compatible backbone; x0 reconstruction changes).
+                </p>
                 {jobConfig.config.process[0].train.loss_type === 'pseudo_huber' && (
                   <NumberInput
                     label="Pseudo Huber C Value"
@@ -1691,6 +1706,123 @@ export default function SimpleJob({
                       Local Correlation Regularization encourages low-frequency bias in latents.
                       Per SSVAE research, this improves diffusability and convergence speed.
                       Try 0.01-0.1 for video models. 0.0 = disabled.
+                    </p>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-300 mb-1">
+                        Transform Type
+                      </label>
+                      <select
+                        className="w-full bg-gray-800 text-gray-200 text-xs rounded px-2 py-1.5 border border-gray-600 focus:border-blue-500 focus:outline-none"
+                        value={jobConfig.config.process[0].train.spectral_transform ?? 'dct'}
+                        onChange={e => setJobConfig(e.target.value, 'config.process[0].train.spectral_transform')}
+                      >
+                        <option value="dct">DCT (default, SSVAE-compliant, mirror boundaries)</option>
+                        <option value="fft">FFT (fast, periodic boundaries)</option>
+                      </select>
+                      <p className="text-xs text-gray-500 mt-1">
+                        DCT: real-valued with mirror boundaries — matches SSVAE paper methodology.<br />
+                        FFT: complex transform with periodic boundaries (faster).
+                      </p>
+                    </div>
+                  </div>
+                )}
+                {jobConfig.config.process[0].train.loss_type === 'spectral_flow' && (
+                  <div className="border border-blue-900 rounded-lg p-4 mt-2 space-y-3">
+                    <p className="text-xs text-blue-300">
+                      Spectral+Flow loss combines spectral (spatial frequency) with optical flow (temporal motion) consistency.
+                      Requires cache_optical_flow_to_disk enabled on video datasets.
+                    </p>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-300 mb-1">
+                        Transform Type
+                      </label>
+                      <select
+                        className="w-full bg-gray-800 text-gray-200 text-xs rounded px-2 py-1.5 border border-gray-600 focus:border-blue-500 focus:outline-none"
+                        value={jobConfig.config.process[0].train.spectral_transform ?? 'dct'}
+                        onChange={e => setJobConfig(e.target.value, 'config.process[0].train.spectral_transform')}
+                      >
+                        <option value="dct">DCT (default, SSVAE-compliant, mirror boundaries)</option>
+                        <option value="fft">FFT (fast, periodic boundaries)</option>
+                      </select>
+                      <p className="text-xs text-gray-500 mt-1">
+                        DCT: real-valued with mirror boundaries — matches SSVAE paper methodology.<br />
+                        FFT: complex transform with periodic boundaries (faster).
+                      </p>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <NumberInput
+                        label="Flow Loss Weight"
+                        className="pt-1"
+                        value={jobConfig.config.process[0].train.spectral_flow_weight ?? 0.1}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.spectral_flow_weight')}
+                        placeholder="0.1"
+                        docKey={'train.spectral_flow_weight'}
+                        min={0}
+                        step={0.01}
+                      />
+                      <NumberInput
+                        label="Flow Max Timestep"
+                        className="pt-1"
+                        value={jobConfig.config.process[0].train.spectral_flow_max_timestep ?? 800}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.spectral_flow_max_timestep')}
+                        placeholder="800"
+                        docKey={'train.spectral_flow_max_timestep'}
+                        min={0}
+                        max={1000}
+                        step={50}
+                      />
+                    </div>
+                    <div className="flex items-center space-x-4 pt-1">
+                      <div className="flex items-center space-x-2">
+                        <input
+                          type="checkbox"
+                          id="spectral_flow_motion_weighted"
+                          checked={jobConfig.config.process[0].train.spectral_flow_motion_weighted ?? true}
+                          onChange={e => setJobConfig(e.target.checked, 'config.process[0].train.spectral_flow_motion_weighted')}
+                          className="rounded border-gray-600"
+                        />
+                        <label htmlFor="spectral_flow_motion_weighted" className="text-sm text-gray-300">
+                          Motion Weighted
+                        </label>
+                      </div>
+                      <div className="flex items-center space-x-2">
+                        <input
+                          type="checkbox"
+                          id="spectral_flow_adaptive"
+                          checked={jobConfig.config.process[0].train.spectral_flow_adaptive ?? false}
+                          onChange={e => setJobConfig(e.target.checked, 'config.process[0].train.spectral_flow_adaptive')}
+                          className="rounded border-gray-600"
+                        />
+                        <label htmlFor="spectral_flow_adaptive" className="text-sm text-gray-300">
+                          Adaptive Weighting
+                        </label>
+                      </div>
+                    </div>
+                    <NumberInput
+                      label="Rejection Threshold"
+                      className="pt-1"
+                      value={jobConfig.config.process[0].train.spectral_flow_rejection_threshold ?? 5.0}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.spectral_flow_rejection_threshold')}
+                      placeholder="5.0"
+                      docKey={'train.spectral_flow_rejection_threshold'}
+                      min={0}
+                      step={0.5}
+                    />
+                    <NumberInput
+                      label="Max Rejections (per expert)"
+                      className="pt-1"
+                      value={jobConfig.config.process[0].train.spectral_flow_max_rejections ?? 100}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.spectral_flow_max_rejections')}
+                      placeholder="100"
+                      docKey={'train.spectral_flow_max_rejections'}
+                      min={0}
+                      step={10}
+                    />
+                    <p className="text-xs text-gray-500">
+                      Flow loss enforces temporal motion consistency by warping predicted frames with ground truth optical flow.
+                      Only active at timesteps &lt; Flow Max Timestep (low-noise regime where motion is meaningful).
+                      Adaptive weighting dynamically adjusts flow weight based on deviation history.
+                      Steps with deviation exceeding rejection threshold have their gradients zeroed.
                     </p>
                   </div>
                 )}
@@ -2169,6 +2301,43 @@ export default function SimpleJob({
                             }}
                             docKey="datasets.audio_preserve_pitch"
                           />
+                        )}
+                        {/* Optical flow caching options for video datasets */}
+                        {(dataset.num_frames > 1 || dataset.auto_frame_count || jobConfig.config.process[0].train.loss_type === 'spectral_flow') && (
+                          <div className="mt-2 space-y-2">
+                            <div className="flex items-center justify-between">
+                              <span className="text-sm font-medium text-gray-300">Optical Flow Caching</span>
+                              <span className="text-xs text-gray-500">Required for spectral_flow loss</span>
+                            </div>
+                            <Checkbox
+                              label="Cache optical flow to disk"
+                              checked={dataset.cache_optical_flow_to_disk || false}
+                              onChange={value => {
+                                setJobConfig(value, `config.process[0].datasets[${i}].cache_optical_flow_to_disk`);
+                              }}
+                              docKey="datasets.cache_optical_flow_to_disk"
+                            />
+                            {dataset.cache_optical_flow_to_disk && (
+                              <div className="pl-4 pt-1">
+                                <SelectInput
+                                  label="Flow Model"
+                                  className="pt-1"
+                                  value={dataset.optical_flow_model ?? 'sea-raft-m'}
+                                  onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].optical_flow_model`)}
+                                  docKey="datasets.optical_flow_model"
+                                  options={[
+                                    { value: 'sea-raft-m', label: 'SEA-RAFT-M (Medium, Recommended)' },
+                                    { value: 'sea-raft-s', label: 'SEA-RAFT-S (Small, Faster)' },
+                                  ]}
+                                />
+                                <p className="text-xs text-gray-500 mt-1">
+                                  SEA-RAFT-M: Best accuracy/speed balance (~3GB VRAM).
+                                  SEA-RAFT-S: Faster but slightly less accurate (~2GB VRAM).
+                                  Model downloads on first use.
+                                </p>
+                              </div>
+                            )}
+                          </div>
                         )}
                       </FormGroup>
                       {!isAudioModel && (

@@ -23,6 +23,7 @@ from toolkit.dataloader_mixins import (
     TextEmbeddingFileItemDTOMixin,
     AudioProcessingDTOMixin,
 )
+from toolkit.optical_flow.flow_file_item_mixin import OpticalFlowFileItemDTOMixin
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 
 if TYPE_CHECKING:
@@ -40,6 +41,7 @@ def print_once(msg):
 
 class FileItemDTO(
     LatentCachingFileItemDTOMixin,
+    OpticalFlowFileItemDTOMixin,
     TextEmbeddingFileItemDTOMixin,
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
@@ -209,6 +211,7 @@ class DataLoaderBatchDTO:
             self.audio_tensor: Union[torch.Tensor, None] = None
             self.first_frame_latents: Union[torch.Tensor, None] = None
             self.audio_latents: Union[torch.Tensor, None] = None
+            self.flow: Union[torch.Tensor, None] = None  # (B, T-1, 2, H, W) fp16 optical flow
 
             # just for holding noise and preds during training
             self.audio_target: Union[torch.Tensor, None] = None
@@ -254,6 +257,20 @@ class DataLoaderBatchDTO:
                             for x in self.file_items
                         ]
                     )
+
+            # Assemble optical flow if any file item has it cached
+            if any([getattr(x, 'is_flow_cached', False) for x in self.file_items]):
+                base_flow = None
+                for x in self.file_items:
+                    if getattr(x, 'is_flow_cached', False):
+                        base_flow = x.get_flow()
+                        break
+                if base_flow is not None:
+                    self.flow = torch.cat([
+                        x.get_flow().unsqueeze(0) if getattr(x, 'is_flow_cached', False)
+                        else torch.zeros_like(base_flow).unsqueeze(0)
+                        for x in self.file_items
+                    ])  # (B, T-1, 2, H, W) fp16
 
             self.prompt_embeds: Union[PromptEmbeds, None] = None
             # if self.file_items[0].control_tensor is not None:

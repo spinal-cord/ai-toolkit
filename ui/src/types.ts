@@ -157,6 +157,9 @@ export interface DatasetConfig {
   control_path_2?: string | null;
   control_path_3?: string | null;
   auto_frame_count?: boolean;
+  // Optical flow caching for spectral_flow loss
+  cache_optical_flow_to_disk?: boolean;
+  optical_flow_model?: string;
 }
 
 export interface EMAConfig {
@@ -208,7 +211,7 @@ export interface TrainConfig {
   blank_prompt_preservation?: boolean;
   blank_prompt_preservation_multiplier?: number;
   switch_boundary_every: number;
-  loss_type: 'mse' | 'mae' | 'wavelet' | 'spectral' | 'stepped' | 'mean_flow' | 'pseudo_huber';
+  loss_type: 'mse' | 'mae' | 'wavelet' | 'spectral' | 'spectral_flow' | 'stepped' | 'mean_flow' | 'pseudo_huber';
   pseudo_huber_c?: number;
   // Spectral loss config
   spectral_low_weight?: number;
@@ -218,6 +221,13 @@ export interface TrainConfig {
   spectral_high_cutoff?: number;
   spectral_use_phase?: boolean;
   spectral_lcr_weight?: number;
+  // Spectral flow loss config
+  spectral_flow_weight?: number;
+  spectral_flow_max_timestep?: number;
+  spectral_flow_motion_weighted?: boolean;
+  spectral_flow_adaptive?: boolean;
+  spectral_flow_rejection_threshold?: number;
+  spectral_flow_max_rejections?: number;
   do_differential_guidance?: boolean;
   differential_guidance_scale?: number;
   audio_loss_multiplier?: number;

@@ -21,6 +21,7 @@ from toolkit.basic import get_resize_method
 from toolkit.buckets import get_bucket_for_image_size, BucketResolution
 from toolkit.config_modules import DatasetConfig, preprocess_dataset_raw_config
 from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, ControlCachingMixin, TextEmbeddingCachingMixin
+from toolkit.optical_flow.flow_caching_mixin import OpticalFlowCachingMixin
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
@@ -426,7 +427,7 @@ class PairedImageDataset(Dataset):
         return img, prompt, (self.neg_weight, self.pos_weight)
 
 
-class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin, TextEmbeddingCachingMixin, BucketsMixin, CaptionMixin, Dataset):
+class AiToolkitDataset(LatentCachingMixin, OpticalFlowCachingMixin, ControlCachingMixin, CLIPCachingMixin, TextEmbeddingCachingMixin, BucketsMixin, CaptionMixin, Dataset):
 
     def __init__(
             self,
@@ -671,6 +672,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 self.setup_buckets()
             if self.is_caching_latents:
                 self.cache_latents_all_latents()
+            if self.is_caching_optical_flow:
+                self.cache_optical_flow_all()
             if self.is_caching_clip_vision_to_disk:
                 self.cache_clip_vision_to_disk()
             if self.is_caching_text_embeddings:

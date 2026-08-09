@@ -35,7 +35,7 @@ from diffusers import EMAModel
 import math
 from toolkit.train_tools import precondition_model_outputs_flow_match
 from toolkit.models.diffusion_feature_extraction import DiffusionFeatureExtractor, load_dfe
-from toolkit.util.losses import wavelet_loss, stepped_loss, spectral_loss
+from toolkit.util.losses import wavelet_loss, stepped_loss, spectral_loss, spectral_flow_loss
 import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
 from PIL import Image
@@ -90,6 +90,13 @@ class SDTrainer(BaseSDTrainProcess):
         
         self.dfe: Optional[DiffusionFeatureExtractor] = None
         self.unconditional_embeds = None
+
+        # Spectral flow loss state
+        self.flow_loss_module = None
+        # Per-expert spectral flow state (Issue #1 fix)
+        self.flow_deviation_history = {}      # {expert_label: [...]}
+        self.current_flow_weight = {}         # {expert_label: float}
+        self.flow_rejection_count = {}        # {expert_label: int}
         
         if self.train_config.diff_output_preservation:
             if self.trigger_word is None:
@@ -573,6 +580,26 @@ class SDTrainer(BaseSDTrainProcess):
                 except:
                     pass
 
+        # Initialize spectral flow loss module if using spectral_flow loss type
+        if self.train_config.loss_type == 'spectral_flow':
+            from toolkit.optical_flow.flow_loss import load_flow_loss
+            self.flow_loss_module = load_flow_loss(self.sd).to(self.device_torch, dtype=self.sd.torch_dtype)
+            # FlowConsistencyLoss has no learnable parameters (static helpers only),
+            # so .eval()/.parameters() are unnecessary but harmless
+            print_acc(f"Spectral+Flow loss enabled. Base flow weight: {self.train_config.spectral_flow_weight}, "
+                      f"max_timestep: {self.train_config.spectral_flow_max_timestep}")
+            # TODO: SEA-RAFT vendored impl (sea_raft_impl/model.py) has different CorrBlock/AltCorrBlock
+            # tensor layouts than the official SEA-RAFT. Loading official weights with strict=False will
+            # silently drop or misalign keys, producing potentially inaccurate flow estimates.
+            # Needs additional research against official SEA-RAFT implementation; fix deferred.
+
+    def _get_active_expert_label(self):
+        """Get the active expert label for per-expert training logging."""
+        if hasattr(self.sd, 'model') and hasattr(self.sd.model, '_active_transformer_name'):
+            active = self.sd.model._active_transformer_name
+            if getattr(self.sd, 'train_high_noise', False) and getattr(self.sd, 'train_low_noise', False):
+                return "high" if active == "transformer_1" else "low"
+        return "single"
 
     def process_output_for_turbo(self, pred, noisy_latents, timesteps, noise, batch):
         # to process turbo learning, we make one big step from our current timestep to the end
@@ -1019,7 +1046,212 @@ class SDTrainer(BaseSDTrainProcess):
                     high_cutoff=self.train_config.spectral_high_cutoff,
                     use_phase=self.train_config.spectral_use_phase,
                     lcr_weight=self.train_config.spectral_lcr_weight,
+                    spectral_transform=self.train_config.spectral_transform,
+                    prediction_target=self.train_config.prediction_target,
                 )
+            elif self.train_config.loss_type == "spectral_flow":
+                # Combined spectral (spatial frequency) + optical flow (temporal motion) loss
+
+                # BUG FIX D: guard against x0_pred mode (e.g. turbo or any x0-predicting model).
+                # spectral_flow loss assumes velocity prediction (model_pred = ε - x0), so
+                # x0 reconstruction uses: pred_latents = noise - model_pred.
+                # If the model directly predicts x0, this gives noise - x0 ≠ x0.
+                # Previously the condition was "x0_pred AND train_turbo" which missed
+                # cases where x0_pred=True but train_turbo=False.
+                if getattr(self.sd, 'x0_pred', False):
+                    if self.accelerator.is_main_process:
+                        print_acc("[WARN] spectral_flow loss is incompatible with x0_pred mode. "
+                                  "Falling back to spectral loss.")
+                    loss = spectral_loss(
+                        pred,
+                        batch.latents,
+                        noise,
+                        low_weight=self.train_config.spectral_low_weight,
+                        mid_weight=self.train_config.spectral_mid_weight,
+                        high_weight=self.train_config.spectral_high_weight,
+                        low_cutoff=self.train_config.spectral_low_cutoff,
+                        high_cutoff=self.train_config.spectral_high_cutoff,
+                        use_phase=self.train_config.spectral_use_phase,
+                        lcr_weight=self.train_config.spectral_lcr_weight,
+                        spectral_transform=self.train_config.spectral_transform,
+                        prediction_target=self.train_config.prediction_target,
+                    )
+                    # Continue with standard loss handling below (falls through)
+                else:
+                    vae_ts = self.flow_loss_module.vae_temporal_stride if self.flow_loss_module else 4
+                    vae_ss = self.flow_loss_module.vae_spatial_stride if self.flow_loss_module else 8
+
+                    expert = self._get_active_expert_label()
+
+                    # Issue #1 fix: use per-expert current_flow_weight
+                    base_flow_weight = self.train_config.spectral_flow_weight
+                    expert_flow_weight = self.current_flow_weight.get(expert, base_flow_weight)
+
+                    (total_loss, flow_dev, spatial_val, flow_val,
+                     spectral_component, flow_component) = spectral_flow_loss(
+                        model_pred=pred,
+                        latents=batch.latents,
+                        noise=noise,
+                        batch_flow=getattr(batch, 'flow', None),
+                        timesteps=timesteps,
+                        flow_loss_module=self.flow_loss_module,
+                        vae_temporal_stride=vae_ts,
+                        vae_spatial_stride=vae_ss,
+                        low_weight=self.train_config.spectral_low_weight,
+                        mid_weight=self.train_config.spectral_mid_weight,
+                        high_weight=self.train_config.spectral_high_weight,
+                        low_cutoff=self.train_config.spectral_low_cutoff,
+                        high_cutoff=self.train_config.spectral_high_cutoff,
+                        use_phase=self.train_config.spectral_use_phase,
+                        lcr_weight=self.train_config.spectral_lcr_weight,
+                        spectral_transform=self.train_config.spectral_transform,
+                        prediction_target=self.train_config.prediction_target,
+                        flow_weight=base_flow_weight,
+                        flow_max_timestep=self.train_config.spectral_flow_max_timestep,
+                        motion_weighted=self.train_config.spectral_flow_motion_weighted,
+                        adaptive=self.train_config.spectral_flow_adaptive,
+                        current_flow_weight=expert_flow_weight,
+                    )
+
+                    # Issue #1 fix: per-expert flow deviation tracking
+                    if expert not in self.flow_deviation_history:
+                        self.flow_deviation_history[expert] = []
+                    self.flow_deviation_history[expert].append(flow_dev)
+
+                    # Issue #1 fix: per-expert adaptive weight adjustment
+                    if self.train_config.spectral_flow_adaptive:
+                        expert_history = self.flow_deviation_history[expert]
+                        if len(expert_history) > 50:
+                            import numpy as np
+                            recent_avg = np.mean(expert_history[-50:])
+                            threshold = self.train_config.spectral_flow_rejection_threshold
+
+                            if expert not in self.current_flow_weight:
+                                self.current_flow_weight[expert] = base_flow_weight
+
+                            if recent_avg > threshold:
+                                self.current_flow_weight[expert] = min(
+                                    self.current_flow_weight[expert] * 1.2,
+                                    base_flow_weight * 5.0
+                                )
+                            elif recent_avg < threshold * 0.3:
+                                self.current_flow_weight[expert] = max(
+                                    self.current_flow_weight[expert] * 0.95,
+                                    base_flow_weight * 0.1
+                                )
+
+                    # Issue #1 fix: per-expert rejection budget
+                    if expert not in self.flow_rejection_count:
+                        self.flow_rejection_count[expert] = 0
+                    max_rejections = self.train_config.spectral_flow_max_rejections
+                    if (flow_dev > self.train_config.spectral_flow_rejection_threshold
+                            and self.flow_rejection_count[expert] < max_rejections):
+                        self.flow_rejection_count[expert] += 1
+                        if self.accelerator.is_main_process:
+                            print_acc(f"[FLOW REJECT] Expert={expert} Deviation={flow_dev:.4f} > "
+                                      f"{self.train_config.spectral_flow_rejection_threshold}. "
+                                      f"Rejecting step {self.flow_rejection_count[expert]}/{max_rejections}")
+                        # Only detach flow gradients — keep spectral learning signal alive.
+                        # Previously this did total_loss.detach() which killed ALL learning.
+                        flow_component = flow_component.detach()
+
+                    # Bug 2.1 fix: apply mask BEFORE mean reduction, with proper time dim
+                    # Build per-video expansion of mask_multiplier (B,1,H,W) -> (B,C,T,H,W) for video
+                    loss_multiplier_batch = mask_multiplier
+                    if len(noise_pred.shape) == 5:
+                        # video B,C,T,H,W — expand mask to match
+                        loss_multiplier_batch = loss_multiplier_batch.unsqueeze(2)
+                        loss_multiplier_batch = loss_multiplier_batch.repeat(
+                            1, 1, noise_pred.shape[2], 1, 1
+                        )
+
+                    # BUG FIX (issue #2): Apply per-pixel mask AND I2V conditioning mask ONLY to
+                    # spectral_component (spatially structured tensor). The flow_component is already
+                    # a fully-reduced scalar (MSE across all frames/pixels). Broadcasting it to
+                    # (B,C,T,H,W) and then applying scale_loss would zero its contribution in first-frame
+                    # masked regions and renormalize by masked mean — incorrectly attenuating its weight.
+                    # So: mask+scale spectral only, reduce it to (B,), THEN add flow_component.
+
+                    # Apply mask to spectral component
+                    loss = spectral_component * loss_multiplier_batch
+
+                    # Apply model-specific loss scaling (e.g., I2V conditioning mask via _i2v_loss_mask).
+                    # Must be per-element for Wan22 I2V: only generated frames contribute.
+                    loss = self.sd.scale_loss(loss)
+
+                    # Reduce spectral loss to (B,)
+                    if len(noise_pred.shape) == 5:
+                        loss = loss.mean([1, 2, 3, 4])  # (B,)
+                    else:
+                        loss = loss.mean([1, 2, 3])     # (B,)
+
+                    # Apply per-batch loss_multiplier (reg weight)
+                    loss = loss * loss_multiplier
+
+                    # Per-expert loss logging
+                    self.additional_logs[f'loss_{expert}/spatial'] = spatial_val
+                    self.additional_logs[f'loss_{expert}/flow'] = flow_val
+                    self.additional_logs[f'loss_{expert}/flow_weight'] = expert_flow_weight
+                    self.additional_logs[f'loss_{expert}/flow_deviation'] = flow_dev
+
+                    # SNR weighting on (B,) loss, THEN final mean
+                    if not self.train_config.train_turbo:
+                        if self.train_config.learnable_snr_gos:
+                            loss = apply_learnable_snr_gos(loss, timesteps, self.snr_gos)
+                        elif (self.train_config.snr_gamma is not None and
+                              self.train_config.snr_gamma > 0.000001 and not ignore_snr):
+                            loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler,
+                                                    self.train_config.snr_gamma, fixed=True)
+                        elif (self.train_config.min_snr_gamma is not None and
+                              self.train_config.min_snr_gamma > 0.000001 and not ignore_snr):
+                            loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler,
+                                                    self.train_config.min_snr_gamma)
+
+                    loss = loss.mean()  # scalar spectral loss after SNR
+
+                    # Combine with flow component (scalar, already fully reduced).
+                    # Added here after all per-pixel masking/scaling so its weight is not
+                    # attenuated by I2V conditioning masks or renormalization.
+                    loss = loss + flow_component
+
+                    # Check for audio loss
+                    if batch.audio_pred is not None and batch.audio_target is not None:
+                        audio_loss = torch.nn.functional.mse_loss(
+                            batch.audio_pred.float(), batch.audio_target.float(), reduction="mean"
+                        )
+                        audio_loss = audio_loss * self.train_config.audio_loss_multiplier
+                        loss = loss + audio_loss
+
+                    # Check for additional losses from adapter
+                    if (self.adapter is not None and hasattr(self.adapter, "additional_loss")
+                            and self.adapter.additional_loss is not None):
+                        loss = loss + self.adapter.additional_loss.mean()
+                        self.adapter.additional_loss = None
+
+                    if self.train_config.target_norm_std:
+                        pred_std = noise_pred.std([2, 3], keepdim=True)
+                        norm_std_loss = torch.abs(self.train_config.target_norm_std_value - pred_std).mean()
+                        loss = loss + norm_std_loss
+
+                    loss = loss + additional_loss
+
+                    if hasattr(self.sd, "get_additional_loss"):
+                        additional_model_loss = self.sd.get_additional_loss(pred, target)
+                        if additional_model_loss is not None:
+                            loss = loss + additional_model_loss
+                            self.additional_logs["additional_model_loss"] = additional_model_loss.item()
+
+                    if self.train_config.max_loss_debug and self.train_config.max_loss is not None:
+                        if loss.item() > self.train_config.max_loss:
+                            print_acc(f"Loss {loss.item()} is greater than max loss {self.train_config.max_loss}. "
+                                      f"Clipping to max loss.")
+                            print_acc(f"timesteps: {timesteps}")
+
+                    if self.train_config.max_loss is not None:
+                        loss = torch.clamp(loss, max=self.train_config.max_loss)
+
+                    # Skip the rest of the function for spectral_flow
+                    return loss
             elif self.train_config.loss_type == "stepped":
                 loss = stepped_loss(pred, batch.latents, noise, noisy_latents, timesteps, self.sd.noise_scheduler)
                 # the way this loss works, it is low, increase it to match predictable LR effects

@@ -101,9 +101,18 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Do I2V',
     description: (
       <>
-        For video models that can handle both I2V (Image to Video) and T2V (Text to Video), this option sets this
-        dataset to be trained as an I2V dataset. This means that the first frame will be extracted from the video and
-        used as the start image for the video. Can be combined with "Do T2V" to train the model on both modes.
+        For video models that support both I2V (Image to Video) and T2V (Text to Video), this option trains this
+        dataset in I2V mode. The first frame is extracted and used as conditioning; the loss is computed only on
+        generated frames (after the first).
+        <br /><br />
+        For <strong>image datasets</strong> (num_frames=1), enabling Do I2V still works: the image is used as
+        conditioning AND the model predicts it as output — effectively behaving like T2V with an additional
+        conditioning input. This allows video models trained in I2V mode to also learn image generation.
+        For video datasets, at least 5 frames are recommended so the model learns motion beyond the first frame
+        (the first latent frame is masked from loss).
+        <br /><br />
+        Can be combined with "Do T2V" to train both modes (each video element is used twice: once conditioned,
+        once unconditional).
       </>
     ),
   },
@@ -111,10 +120,15 @@ const docs: { [key: string]: ConfigDoc } = {
     title: 'Do T2V',
     description: (
       <>
-        For video models that can handle both I2V (Image to Video) and T2V (Text to Video), this option trains this
-        dataset as a T2V dataset without first frame conditioning. Can be combined with "Do I2V" to train the model
-        on both modes simultaneously - when both are enabled, each video element is effectively used twice (once
-        with I2V conditioning, once without), doubling the training steps per epoch for this dataset.
+        For video models that support both I2V (Image to Video) and T2V (Text to Video), this option trains this
+        dataset in pure T2V mode: no first-frame conditioning, all frames are generated freely from text.
+        <br /><br />
+        For <strong>image datasets</strong> (num_frames=1), this is the recommended option — it behaves
+        like standard text-to-image training: no conditioning overhead, full gradient on the single frame.
+        Works with both video and image diffusion backends.
+        <br /><br />
+        Can be combined with "Do I2V" to train both modes simultaneously (each video element is used twice:
+        once conditioned, once unconditional), doubling the training steps per epoch for this dataset.
       </>
     ),
   },

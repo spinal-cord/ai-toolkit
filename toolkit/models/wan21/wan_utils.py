@@ -16,7 +16,9 @@ def add_first_frame_conditioning(
         vae: VAE model for encoding the conditioning
 
     Returns:
-        conditioned_latent: The complete conditioned latent input (bs, 36, num_frames, height, width)
+        tuple: (conditioned_latent, loss_mask)
+            - conditioned_latent: (bs, 36, num_frames, height, width)
+            - loss_mask: (bs, 1, num_frames, height, width) with 0 for conditioned tokens (first frame)
     """
     device = latent_model_input.device
     dtype = latent_model_input.dtype
@@ -116,7 +118,27 @@ def add_first_frame_conditioning(
     conditioned_latent = torch.cat(
         [latent_model_input, first_frame_condition], dim=1)
 
-    return conditioned_latent
+    # Build loss mask: 0 for first latent frame (conditioned), 1 for all others.
+    # EXCEPTION: single-frame (image) datasets — don't mask loss or training breaks
+    # entirely since there is only the first frame. The model learns to output
+    # the conditioning image itself (T2V semantics, with I2V channel layout).
+    # Matches convention of _apply_first_frame_conditioning_cached so callers can
+    # rely on a consistent (conditioned_latent, loss_mask) tuple return type.
+    batch_size = latent_model_input.shape[0]
+    num_latent_frames = latent_model_input.shape[2]
+    latent_height = latent_model_input.shape[3]
+    latent_width = latent_model_input.shape[4]
+
+    if num_latent_frames == 1:
+        return conditioned_latent, None
+
+    loss_mask = torch.ones(
+        batch_size, 1, num_latent_frames, latent_height, latent_width,
+        device=device, dtype=dtype
+    )
+    loss_mask[:, :, 0:1] = 0  # zero out first frame
+
+    return conditioned_latent, loss_mask
 
 
 def add_first_frame_conditioning_v22(
@@ -129,6 +151,7 @@ def add_first_frame_conditioning_v22(
     """
     Overwrites first few time steps in latent_model_input with VAE-encoded first_frame,
     and returns the modified latent + binary mask (0=conditioned, 1=noise).
+    For single-frame (image) input, returns mask=None so loss isn't zeroed out.
 
     Args:
         latent_model_input: torch.Tensor of shape (bs, 48, T, H, W)
@@ -186,8 +209,11 @@ def add_first_frame_conditioning_v22(
     latent[:, :, :encoded.shape[2]] = encoded  # typically first frame: [:, :, 0]
 
     # Mask: 0 where conditioned, 1 otherwise
-    mask = torch.ones(bs, 1, T, H, W, device=device, dtype=dtype)
-    mask[:, :, :encoded.shape[2]] = 0.0
+    # EXCEPTION: single-frame (image) datasets — don't mask loss
+    mask = None
+    if T > 1:
+        mask = torch.ones(bs, 1, T, H, W, device=device, dtype=dtype)
+        mask[:, :, :encoded.shape[2]] = 0.0
     
     if last_frame is not None:
         # If last_frame is provided, encode it similarly
@@ -197,8 +223,9 @@ def add_first_frame_conditioning_v22(
         last_encoded = last_encoded.to(device, dtype)
         last_encoded = (last_encoded - mean) * std
         latent[:, :, -last_encoded.shape[2]:] = last_encoded  # replace last
-        mask[:, :, -last_encoded.shape[2]:] = 0.0  #
-        # Ensure mask is still binary
-        mask = mask.clamp(0.0, 1.0)
+        if mask is not None:
+            mask[:, :, -last_encoded.shape[2]:] = 0.0  #
+            # Ensure mask is still binary
+            mask = mask.clamp(0.0, 1.0)
 
     return latent, mask

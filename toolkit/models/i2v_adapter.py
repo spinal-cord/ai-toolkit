@@ -280,7 +280,9 @@ def new_wan_forward(
                     hidden_states = hidden_states[:, :16, :, :, :]
                 
                 
-                hidden_states = add_first_frame_conditioning(
+                # add_first_frame_conditioning returns (conditioned_latent, loss_mask).
+                # Sampling path ignores the mask; training path in wan22_14b_i2v_model.py uses it.
+                hidden_states, _ = add_first_frame_conditioning(
                     latent_model_input=hidden_states,
                     first_frame=conditioning_frame,
                     vae=adapter.adapter_ref().sd_ref().vae,

@@ -74,7 +74,9 @@ class Wan2214bI2VModel(Wan2214bModel):
             )  # normalize to [-1, 1]
             
             # Add conditioning using the standalone function
-            gen_config.latents = add_first_frame_conditioning(
+            # FIX: add_first_frame_conditioning returns a tuple (conditioned_latent, loss_mask).
+            # We only need the conditioned_latent for inference.
+            gen_config.latents, _ = add_first_frame_conditioning(
                 latent_model_input=latents,
                 first_frame=first_frame_n1p1,
                 vae=self.vae
@@ -114,8 +116,15 @@ class Wan2214bI2VModel(Wan2214bModel):
     
     def _apply_first_frame_conditioning_cached(
         self, latent_model_input: torch.Tensor, first_frame_latents: torch.Tensor
-    ) -> torch.Tensor:
-        """Apply first frame conditioning using cached first frame latents."""
+    ) -> tuple:
+        """Apply first frame conditioning using cached first frame latents.
+        
+        Returns:
+            (conditioned_latent, loss_mask) where loss_mask is (B, 1, T_lat, H_lat, W_lat)
+            with 0 for conditioned tokens (first frame) and 1 for generated tokens.
+            For single-frame (image) input, loss_mask is None since masking the only
+            latent frame would zero all gradients.
+        """
         device = latent_model_input.device
         dtype = latent_model_input.dtype
         
@@ -127,23 +136,15 @@ class Wan2214bI2VModel(Wan2214bModel):
         latent_height = first_frame_latents.shape[3]
         latent_width = first_frame_latents.shape[4]
         
-        # Initialize mask for all frames
+        # Build the conditioning mask used in the model input
         mask_lat_size = torch.ones(
             batch_size, 1, num_frames, latent_height, latent_width, device=device, dtype=dtype)
-        
-        # Set all non-first frames to 0
         mask_lat_size[:, :, 1:] = 0
-        
-        # Special handling for first frame
         first_frame_mask = mask_lat_size[:, :, 0:1]
         first_frame_mask = torch.repeat_interleave(
             first_frame_mask, dim=2, repeats=vae_scale_factor_temporal)
-        
-        # Combine first frame mask with rest
         mask_lat_size = torch.concat(
             [first_frame_mask, mask_lat_size[:, :, 1:, :]], dim=2)
-        
-        # Reshape and transpose for model input
         mask_lat_size = mask_lat_size.view(
             batch_size, -1, vae_scale_factor_temporal, latent_height, latent_width)
         mask_lat_size = mask_lat_size.transpose(1, 2)
@@ -155,10 +156,24 @@ class Wan2214bI2VModel(Wan2214bModel):
         )
         latent_condition[:, :, 0:1] = first_frame_latents
         
-        # Combine conditioning with latent input
         first_frame_condition = torch.concat(
             [mask_lat_size, latent_condition], dim=1)
-        return torch.cat([latent_model_input, first_frame_condition], dim=1)
+        conditioned_latent = torch.cat([latent_model_input, first_frame_condition], dim=1)
+        
+        # Build loss mask: 0 for first latent frame (conditioned), 1 for all others
+        # EXCEPTION: single-frame (image) datasets — don't mask loss or training breaks
+        # entirely since there is only the first frame. The model learns to output
+        # the conditioning image itself (T2V semantics, with I2V channel layout).
+        if num_latent_frames == 1:
+            return conditioned_latent, None
+
+        loss_mask = torch.ones(
+            batch_size, 1, num_latent_frames, latent_height, latent_width,
+            device=device, dtype=dtype
+        )
+        loss_mask[:, :, 0:1] = 0  # zero out first frame
+        
+        return conditioned_latent, loss_mask
 
     def _pad_for_no_conditioning(
         self, latent_model_input: torch.Tensor
@@ -218,15 +233,23 @@ class Wan2214bI2VModel(Wan2214bModel):
         # Determine batch type
         is_mixed_batch = len(i2v_indices) > 0 and len(t2v_indices) > 0
         pure_i2v = len(i2v_indices) == latent_model_input.shape[0]
+        pure_t2v = len(t2v_indices) == latent_model_input.shape[0]
+        
+        # Initialize loss mask (used by scale_loss to zero out conditioned tokens)
+        self._i2v_loss_mask = None
         
         with torch.no_grad():
+            # Handle pure T2V (no conditioning needed)
+            if pure_t2v:
+                conditioned_latent = self._pad_for_no_conditioning(latent_model_input)
+                self._i2v_loss_mask = None
             # Handle pure I2V case (original behavior - no overhead)
-            if pure_i2v and batch.dataset_config.do_i2v:
+            elif pure_i2v and batch.dataset_config.do_i2v:
                 if batch.first_frame_latents is not None:
                     first_frame_latents = batch.first_frame_latents.to(
                         self.device_torch, self.torch_dtype
                     )
-                    conditioned_latent = self._apply_first_frame_conditioning_cached(
+                    conditioned_latent, self._i2v_loss_mask = self._apply_first_frame_conditioning_cached(
                         latent_model_input, first_frame_latents
                     )
                 else:
@@ -239,15 +262,18 @@ class Wan2214bI2VModel(Wan2214bModel):
                         first_frames = frames[:, 0]
                     else:
                         raise ValueError(f"Unknown frame shape {frames.shape}")
-                    conditioned_latent = add_first_frame_conditioning(
+                    # add_first_frame_conditioning now returns (conditioned_latent, loss_mask)
+                    # to match the cached path's return type.
+                    conditioned_latent, self._i2v_loss_mask = add_first_frame_conditioning(
                         latent_model_input=latent_model_input,
                         first_frame=first_frames,
                         vae=self.vae
                     )
             else:
-                # Mixed or pure T2V: build conditioned_latent by concatenating processed items
+                # Mixed or pure I2V without cache: build conditioned_latent by concatenating processed items
                 # This avoids cloning and handles channel dimension change (16 -> 36 for I2V)
                 i2v_processed = []
+                i2v_loss_masks = []
                 t2v_processed = []
                 
                 # Process I2V items
@@ -259,30 +285,35 @@ class Wan2214bI2VModel(Wan2214bModel):
                         i2v_first_frame_latents = batch.first_frame_latents.to(
                             self.device_torch, self.torch_dtype
                         )
-                        i2v_processed = [self._apply_first_frame_conditioning_cached(
+                        result = self._apply_first_frame_conditioning_cached(
                             i2v_latents, i2v_first_frame_latents
-                        )]
+                        )
+                        i2v_processed.append(result[0])
+                        i2v_loss_masks.append(result[1])
                     else:
                         frames = batch.tensor
                         if frames is not None:
                             first_frames = frames[i2v_indices, 0] if len(frames.shape) == 5 else frames
-                            i2v_processed = [add_first_frame_conditioning(
+                            # add_first_frame_conditioning returns (conditioned_latent, loss_mask)
+                            conditioned_latent_i2v, loss_mask_i2v = add_first_frame_conditioning(
                                 latent_model_input=i2v_latents,
                                 first_frame=first_frames,
                                 vae=self.vae
-                            )]
+                            )
+                            i2v_processed.append(conditioned_latent_i2v)
+                            i2v_loss_masks.append(loss_mask_i2v)
                 
                 # Process T2V items
                 if t2v_indices:
                     if is_mixed_batch:
                         # Pad with zero conditioning to match I2V shape
                         t2v_latents = latent_model_input[t2v_indices]
-                        t2v_processed = [self._pad_for_no_conditioning(t2v_latents)]
+                        t2v_processed.append(self._pad_for_no_conditioning(t2v_latents))
                     else:
                         # Pure T2V: still pad with zero conditioning so the channel
                         # dimension matches what the I2V model's patch_embedding
                         # expects (16 latent + 4 mask + 16 latent = 36 channels)
-                        t2v_processed = [self._pad_for_no_conditioning(latent_model_input)]
+                        t2v_processed.append(self._pad_for_no_conditioning(latent_model_input))
                 
                 # Combine in original order
                 if i2v_processed and t2v_processed:
@@ -296,10 +327,26 @@ class Wan2214bI2VModel(Wan2214bModel):
                         conditioned_latent[orig_idx] = i2v_result[idx]
                     for idx, orig_idx in enumerate(t2v_indices):
                         conditioned_latent[orig_idx] = t2v_result[idx]
+                    
+                    # Build combined loss mask: all 1s, then apply I2V masks per-item
+                    B, C, T_lat, H_lat, W_lat = latent_model_input.shape
+                    self._i2v_loss_mask = torch.ones(
+                        B, 1, T_lat, H_lat, W_lat,
+                        device=latent_model_input.device, dtype=latent_model_input.dtype
+                    )
+                    # Apply masks per-item; None masks (image datasets with num_frames=1)
+                    # are skipped, leaving their positions at all-ones.
+                    if i2v_loss_masks:
+                        i2v_mask_tensor = i2v_loss_masks[0]
+                        for idx, orig_idx in enumerate(i2v_indices):
+                            if i2v_mask_tensor is not None:
+                                self._i2v_loss_mask[orig_idx] = i2v_mask_tensor[idx]
                 elif i2v_processed:
                     conditioned_latent = i2v_processed[0]
+                    self._i2v_loss_mask = i2v_loss_masks[0] if i2v_loss_masks else None
                 else:
                     conditioned_latent = t2v_processed[0]
+                    self._i2v_loss_mask = None
         
         noise_pred = self.model(
             hidden_states=conditioned_latent,
@@ -309,3 +356,17 @@ class Wan2214bI2VModel(Wan2214bModel):
             **kwargs
         )[0]
         return noise_pred
+
+    def scale_loss(self, loss):
+        """Zero out the loss on I2V conditioned tokens, renormalized so the loss
+        magnitude matches unconditioned batches (masked mean).
+        
+        For Wan22 14B I2V, the first frame is conditioned (not generated), so
+        we should not compute loss on those tokens. This ensures spectral_flow
+        loss doesn't analyze conditioned-then-zeroed regions.
+        """
+        if self._i2v_loss_mask is not None:
+            loss_mask = self._i2v_loss_mask.to(loss.device, dtype=loss.dtype)
+            loss = loss * loss_mask / loss_mask.mean().clamp(min=1e-8)
+            self._i2v_loss_mask = None
+        return loss

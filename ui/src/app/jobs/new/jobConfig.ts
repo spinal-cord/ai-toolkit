@@ -22,6 +22,8 @@ export const defaultDatasetConfig: DatasetConfig = {
   flip_x: false,
   flip_y: false,
   num_repeats: 1,
+  cache_optical_flow_to_disk: false,
+  optical_flow_model: 'sea-raft-m',
 };
 
 export const defaultSliderConfig: SliderConfig = {
@@ -113,6 +115,15 @@ export const defaultJobConfig: JobConfig = {
           spectral_high_cutoff: 0.5,
           spectral_use_phase: true,
           spectral_lcr_weight: 0.0,
+          spectral_transform: 'dct',
+          prediction_target: 'velocity',
+          // Spectral flow loss config
+          spectral_flow_weight: 0.1,
+          spectral_flow_max_timestep: 800,
+          spectral_flow_motion_weighted: true,
+          spectral_flow_adaptive: false,
+          spectral_flow_rejection_threshold: 5.0,
+          spectral_flow_max_rejections: 100,
         },
         logging: {
           log_every: 1,

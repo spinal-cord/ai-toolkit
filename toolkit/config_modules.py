@@ -761,9 +761,9 @@ class TrainConfig:
         self.correct_pred_norm = kwargs.get('correct_pred_norm', False)
         self.correct_pred_norm_multiplier = kwargs.get('correct_pred_norm_multiplier', 1.0)
 
-        self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, spectral, pixelspace, mean_flow, pseudo_huber
-        self.pseudo_huber_c = kwargs.get('pseudo_huber_c', 0.01) # c value for pseudo_huber loss
-        
+        self.loss_type = kwargs.get('loss_type', 'mse')  # mse, mae, wavelet, spectral, spectral_flow, pixelspace, mean_flow, pseudo_huber
+        self.pseudo_huber_c = kwargs.get('pseudo_huber_c', 0.01)  # c value for pseudo_huber loss
+
         # Spectral loss config - frequency dissociation and balancing
         # Low freq = structure/motion, High freq = texture/details
         # Inspired by SSVAE research on latent spectral biasing for superior diffusability
@@ -774,6 +774,17 @@ class TrainConfig:
         self.spectral_high_cutoff = kwargs.get('spectral_high_cutoff', 0.5) # radius separating mid/high freq
         self.spectral_use_phase = kwargs.get('spectral_use_phase', True)    # use phase info (more accurate)
         self.spectral_lcr_weight = kwargs.get('spectral_lcr_weight', 0.0)   # SSVAE LCR weight (0.0 = disabled)
+        self.spectral_transform = kwargs.get('spectral_transform', 'dct')   # 'dct' (default, SSVAE-compliant) or 'fft'
+        self.prediction_target = kwargs.get('prediction_target', 'velocity')  # 'velocity' (default) or 'x0'
+
+        # Spectral flow loss config - combines spectral (spatial frequency) + optical flow (temporal motion)
+        # Flow loss weight: 0.05-0.15 recommended for Wan 2.2 I2V LoRA
+        self.spectral_flow_weight = kwargs.get('spectral_flow_weight', 0.1)  # flow loss weight
+        self.spectral_flow_max_timestep = kwargs.get('spectral_flow_max_timestep', 800)  # timestep gate for flow loss
+        self.spectral_flow_motion_weighted = kwargs.get('spectral_flow_motion_weighted', True)  # weight by motion magnitude
+        self.spectral_flow_adaptive = kwargs.get('spectral_flow_adaptive', False)  # dynamic weight adjustment
+        self.spectral_flow_rejection_threshold = kwargs.get('spectral_flow_rejection_threshold', 5.0)  # deviation threshold
+        self.spectral_flow_max_rejections = kwargs.get('spectral_flow_max_rejections', 100)  # per-expert rejection budget
         
         # do the loss on a timestep to 0 prediction
         self.t0_loss_target = kwargs.get('t0_loss_target', False)
@@ -1332,6 +1343,19 @@ class DatasetConfig:
         self.do_audio: bool = kwargs.get('do_audio', False) # load audio from video files for models that support it
         self.audio_preserve_pitch: bool = kwargs.get('audio_preserve_pitch', False) # preserve pitch when stretching audio to fit num_frames
         self.audio_normalize: bool = kwargs.get('audio_normalize', False) # normalize audio volume levels when loading
+
+        # Optical flow caching for video datasets (used by spectral_flow loss type)
+        # Mirrors cache_latents_to_disk: stores precomputed flow in _flow_cache/ beside videos
+        self.cache_optical_flow_to_disk: bool = kwargs.get('cache_optical_flow_to_disk', False)
+        # Which pretrained flow model to use. Options: "sea-raft-m" (default), "sea-raft-s"
+        self.optical_flow_model: str = kwargs.get('optical_flow_model', 'sea-raft-m')
+        # Resolution at which flow is computed. "dataset" = bucketed training resolution (default)
+        self.optical_flow_resolution: str = kwargs.get('optical_flow_resolution', 'dataset')
+
+        # Validation: flow caching requires video data
+        if self.cache_optical_flow_to_disk and self.num_frames <= 1 and not self.auto_frame_count:
+            print(f"WARNING: cache_optical_flow_to_disk requires num_frames > 1 or auto_frame_count. Disabling.")
+            self.cache_optical_flow_to_disk = False
 
 
 def preprocess_dataset_raw_config(raw_config: List[dict]) -> List[dict]:
