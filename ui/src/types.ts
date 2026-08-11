@@ -92,6 +92,12 @@ export interface RankGateConfig {
   final_hardening?: boolean;
 }
 
+export interface LayerOverrideConfig {
+  tensor_type: string;
+  rank: number;
+  layer_range: string;
+}
+
 export interface NetworkConfig {
   type: string;
   linear: number;
@@ -113,6 +119,11 @@ export interface NetworkConfig {
   // Wan 2.2 tensor type specific configuration
   wan22_tensor_types?: Wan22TensorTypesConfig;
   wan22_enabled_types?: string[];
+  // Per-layer rank overrides (global - applies to all experts)
+  layer_overrides?: LayerOverrideConfig[];
+  // Per-expert per-layer rank overrides (takes precedence over global layer_overrides)
+  layer_overrides_high?: LayerOverrideConfig[]; // transformer_1 / high-noise expert
+  layer_overrides_low?: LayerOverrideConfig[];  // transformer_2 / low-noise expert
   // Rank gate annealing (SparseForge-inspired)
   rank_gates?: RankGateConfig;
 }

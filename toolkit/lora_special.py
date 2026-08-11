@@ -11,7 +11,7 @@ from diffusers import UNet2DConditionModel, PixArtTransformer2DModel, AuraFlowTr
 from transformers import CLIPTextModel
 from toolkit.models.lokr import LokrModule
 
-from .config_modules import NetworkConfig, get_wan22_tensor_type_from_name, WAN22_TENSOR_TYPES, is_wan22_tensor_type_enabled
+from .config_modules import NetworkConfig, get_wan22_tensor_type_from_name, WAN22_TENSOR_TYPES, is_wan22_tensor_type_enabled, _is_single_tensor_type
 from .lorm import count_parameters
 from .network_mixins import ToolkitNetworkMixin, ToolkitModuleMixin, ExtractableModuleMixin
 from .rank_gates import GatedLoRA
@@ -663,9 +663,100 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                             alpha = None
 
                             # =====================================================================
-                            # Wan 2.2 Tensor-Type-Specific LoRA Rank
+                            # Per-Layer Rank Overrides (Additive - Highest Rank Wins)
                             # =====================================================================
-                            if wan22_config_for_layer is not None:
+                            # Priority: per-expert overrides > global layer_overrides > wan22_tensor_types > global rank
+                            # Override behavior: If multiple overrides match the same tensor+layer,
+                            # the HIGHEST rank is applied (additive).
+                            # If rank <= 0 is explicitly set for a tensor type, LoRA is EXCLUDED for that tensor.
+                            # =====================================================================
+                            override_dim = None
+                            override_alpha = None
+                            should_exclude = False
+
+                            def _find_matching_overrides(overrides_list, tensor_type, child_name):
+                                """Find all matching overrides from a given list."""
+                                if not overrides_list:
+                                    return []
+                                matching_overrides = []
+                                for ov in overrides_list:
+                                    # Match exact type OR parent type
+                                    # e.g., 'self_attn' override matches 'self_attn.q', 'self_attn.k', etc.
+                                    # e.g., 'self_attn.q' override matches only 'self_attn.q'
+                                    if not (ov['tensor_type'] == tensor_type or tensor_type.startswith(ov['tensor_type'] + '.')):
+                                        continue
+                                    
+                                    # Use centralized single-tensor check (resolves aliases too)
+                                    if _is_single_tensor_type(tensor_type):
+                                        # Single tensor: matches all instances of this type (ignore layer_range)
+                                        matching_overrides.append(ov)
+                                    else:
+                                        # Per-layer tensor: check if this layer index matches
+                                        match = re.search(r'blocks\.(\d+)', child_name)
+                                        if match:
+                                            layer_idx = int(match.group(1))
+                                            if layer_idx in ov['layers']:
+                                                matching_overrides.append(ov)
+                                return matching_overrides
+
+                            if self.network_config is not None:
+                                tensor_type = get_wan22_tensor_type_from_name(clean_name)
+                                if tensor_type is not None:
+                                    # Determine owner transformer from child_name (same logic used later for lora.set_owner_transformer)
+                                    owner = None
+                                    if _is_multistage_root:
+                                        if child_name.startswith("transformer_1"):
+                                            owner = "transformer_1"
+                                        elif child_name.startswith("transformer_2"):
+                                            owner = "transformer_2"
+                                    
+                                    # Step 1: Check per-expert overrides first (highest priority)
+                                    expert_overrides = None
+                                    
+                                    if owner == 'transformer_1' and self.network_config.layer_overrides_high:
+                                        expert_overrides = self.network_config.layer_overrides_high
+                                    elif owner == 'transformer_2' and self.network_config.layer_overrides_low:
+                                        expert_overrides = self.network_config.layer_overrides_low
+                                    
+                                    if expert_overrides:
+                                        matching = _find_matching_overrides(expert_overrides, tensor_type, child_name)
+                                        if matching:
+                                            best = max(matching, key=lambda o: o['rank'])
+                                            override_dim = best['rank']
+                                            override_alpha = best['rank']
+                                            expert_label = 'high (transformer_1)' if owner == 'transformer_1' else 'low (transformer_2)'
+                                            if override_dim <= 0:
+                                                print(f"Excluding {clean_name} from LoRA: rank={override_dim} (disabled by per-expert override) [expert: {expert_label}]")
+                                                should_exclude = True
+                                            else:
+                                                print(f"Applying per-expert layer override for {clean_name}: rank={override_dim} (from {len(matching)} matching overrides) [expert: {expert_label}]")
+                                    
+                                    # Step 2: Fall back to global layer_overrides if no per-expert match
+                                    if override_dim is None and self.network_config.layer_overrides:
+                                        matching = _find_matching_overrides(self.network_config.layer_overrides, tensor_type, child_name)
+                                        if matching:
+                                            best = max(matching, key=lambda o: o['rank'])
+                                            override_dim = best['rank']
+                                            override_alpha = best['rank']
+                                            if override_dim <= 0:
+                                                print(f"Excluding {clean_name} from LoRA: rank={override_dim} (disabled by global override)")
+                                                should_exclude = True
+                                            else:
+                                                print(f"Applying global layer override for {clean_name}: rank={override_dim} (from {len(matching)} matching overrides)")
+
+                            # If exclusion is requested, skip LoRA creation for this tensor
+                            if should_exclude:
+                                skipped.append(lora_name)
+                                continue
+                            
+                            # Apply override if one was found
+                            if override_dim is not None:
+                                dim = override_dim
+                                alpha = override_alpha
+                            # =====================================================================
+                            # Wan 2.2 Tensor-Type-Specific LoRA Rank (fallback if no override)
+                            # =====================================================================
+                            elif wan22_config_for_layer is not None:
                                 wan22_rank = wan22_config_for_layer.get('rank', None)
                                 wan22_alpha = wan22_config_for_layer.get('alpha', wan22_rank)
                                 

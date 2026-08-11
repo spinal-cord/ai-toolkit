@@ -22,6 +22,53 @@ else:
     EmptyLogger = None
 
 # =============================================================================
+# Layer Range Parsing Utility
+# =============================================================================
+def _parse_layer_range(s: str) -> List[int]:
+    """Parse a layer range string like '0-2', '0..2', '0...2', '0,1,2', or '1-4,5-6' into a list of layer indices."""
+    if not isinstance(s, str):
+        s = str(s)
+    s = s.strip()
+    if not s:
+        return []
+    
+    # Split by comma to handle multiple segments (e.g., '1-4,5-6' or '0,1,2')
+    segments = [seg.strip() for seg in s.split(',') if seg.strip()]
+    
+    result = []
+    for seg in segments:
+        # Try range with 1 to 3 dots
+        match = re.match(r'^(\d+)(?:\.{1,3})(\d+)$', seg)
+        if match:
+            start = int(match.group(1))
+            end = int(match.group(2))
+            if start <= end:
+                result.extend(range(start, end + 1))
+            else:
+                result.extend(range(start, end - 1, -1))
+            continue
+
+        # Try range with hyphen
+        match = re.match(r'^(\d+)-(\d+)$', seg)
+        if match:
+            start = int(match.group(1))
+            end = int(match.group(2))
+            if start <= end:
+                result.extend(range(start, end + 1))
+            else:
+                result.extend(range(start, end - 1, -1))
+            continue
+
+        # Try single number
+        try:
+            result.append(int(seg))
+        except ValueError:
+            return []  # Invalid segment — return empty
+
+    return result
+
+
+# =============================================================================
 # Wan 2.2 14B Tensor Type Configuration
 # =============================================================================
 # These define the tensor types in Wan 2.2 and their maximum LoRA ranks.
@@ -48,64 +95,180 @@ WAN22_TENSOR_TYPES: Dict[str, Dict[str, Union[int, str, List[str]]]] = {
         'max_rank': 5120,
         'description': 'Self-attention (attn1) q/k/v/o projections',
         'name_patterns': [r'attn1\.to_q', r'attn1\.to_k', r'attn1\.to_v', r'attn1\.to_out\.0'],
+        'sub_types': {
+            'self_attn.q': { 'pattern': r'attn1\.to_q', 'max_rank': 5120, 'description': 'Self-attention Q projection' },
+            'self_attn.k': { 'pattern': r'attn1\.to_k', 'max_rank': 5120, 'description': 'Self-attention K projection' },
+            'self_attn.v': { 'pattern': r'attn1\.to_v', 'max_rank': 5120, 'description': 'Self-attention V projection' },
+            'self_attn.o': { 'pattern': r'attn1\.to_out\.0', 'max_rank': 5120, 'description': 'Self-attention output projection' },
+        }
     },
     'cross_attn': {
         'max_rank': 5120,
         'description': 'Cross-attention (attn2) q/k/v/o projections',
         'name_patterns': [r'attn2\.to_q', r'attn2\.to_k', r'attn2\.to_v', r'attn2\.to_out\.0'],
+        'sub_types': {
+            'cross_attn.q': { 'pattern': r'attn2\.to_q', 'max_rank': 5120, 'description': 'Cross-attention Q projection' },
+            'cross_attn.k': { 'pattern': r'attn2\.to_k', 'max_rank': 5120, 'description': 'Cross-attention K projection' },
+            'cross_attn.v': { 'pattern': r'attn2\.to_v', 'max_rank': 5120, 'description': 'Cross-attention V projection' },
+            'cross_attn.o': { 'pattern': r'attn2\.to_out\.0', 'max_rank': 5120, 'description': 'Cross-attention output projection' },
+        }
     },
     'ffn': {
         'max_rank': 5120,
         'description': 'Feed-forward network projections',
         'name_patterns': [r'ffn\.net\.0\.proj', r'ffn\.net\.2'],
+        'sub_types': {
+            'ffn.0': { 'pattern': r'ffn\.net\.0\.proj', 'max_rank': 5120, 'description': 'FFN up projection' },
+            'ffn.2': { 'pattern': r'ffn\.net\.2', 'max_rank': 5120, 'description': 'FFN down projection' },
+        }
     },
     'text_embedding': {
         'max_rank': 4096,
         'description': 'Text embedding projections (linear_1/linear_2)',
         'name_patterns': [r'condition_embedder\.text_embedder\.linear_1', r'condition_embedder\.text_embedder\.linear_2'],
+        'sub_types': {
+            'text_embedding.1': { 'pattern': r'condition_embedder\.text_embedder\.linear_1', 'max_rank': 4096, 'description': 'Text embedding linear_1' },
+            'text_embedding.2': { 'pattern': r'condition_embedder\.text_embedder\.linear_2', 'max_rank': 4096, 'description': 'Text embedding linear_2' },
+        }
     },
     'time_embedding': {
         'max_rank': 256,
         'description': 'Time embedding projections (linear_1/linear_2)',
         'name_patterns': [r'condition_embedder\.time_embedder\.linear_1', r'condition_embedder\.time_embedder\.linear_2'],
+        'sub_types': {
+            'time_embedding.1': { 'pattern': r'condition_embedder\.time_embedder\.linear_1', 'max_rank': 256, 'description': 'Time embedding linear_1' },
+            'time_embedding.2': { 'pattern': r'condition_embedder\.time_embedder\.linear_2', 'max_rank': 256, 'description': 'Time embedding linear_2' },
+        }
     },
     'head': {
         'max_rank': 64,
         'description': 'Output head projection',
         'name_patterns': [r'proj_out'],
+        'sub_types': {}
     },
     # Layers that typically should be full weight, not LoRA
     'patch_embedding': {
         'max_rank': -1,  # -1 means full weight only
         'description': 'Patch embedding (conv-like, full weight recommended)',
         'name_patterns': [r'patch_embedding'],
+        'sub_types': {}
     },
     'modulation': {
         'max_rank': -1,  # -1 means full weight only
         'description': 'Modulation / scale_shift_table parameters',
         'name_patterns': [r'scale_shift_table'],
+        'sub_types': {}
     },
     'norm': {
         'max_rank': -1,  # -1 means full weight only
         'description': 'Normalization layer parameters',
         'name_patterns': [r'norm\d+\.weight', r'norm\d+\.bias'],
+        'sub_types': {}
     },
     'time_projection': {
         'max_rank': -1,  # -1 means full weight only
         'description': 'Time projection parameters',
         'name_patterns': [r'condition_embedder\.time_proj'],
+        'sub_types': {}
     },
 }
 
+# User-friendly aliases for tensor types (config accepts both formats)
+# Includes short names (ffn.up), full layer paths, and alternative naming conventions
+WAN22_TENSOR_TYPE_ALIASES: Dict[str, str] = {
+    # FFN aliases
+    'ffn.up': 'ffn.0',
+    'ffn.down': 'ffn.2',
+    'ffn.net.0.proj': 'ffn.0',
+    'ffn.net.2': 'ffn.2',
+    # Text embedding aliases (full layer paths)
+    'condition_embedder.text_embedder.linear_1': 'text_embedding.1',
+    'condition_embedder.text_embedder.linear_2': 'text_embedding.2',
+    'text_embedder.linear_1': 'text_embedding.1',
+    'text_embedder.linear_2': 'text_embedding.2',
+    # Time embedding aliases (full layer paths)
+    'condition_embedder.time_embedder.linear_1': 'time_embedding.1',
+    'condition_embedder.time_embedder.linear_2': 'time_embedding.2',
+    'time_embedder.linear_1': 'time_embedding.1',
+    'time_embedder.linear_2': 'time_embedding.2',
+    # Head aliases
+    'proj_out': 'head',
+    # Patch embedding aliases
+    'patch_embed': 'patch_embedding',
+    # Modulation aliases
+    'scale_shift_table': 'modulation',
+    'mod': 'modulation',
+    # Time projection aliases
+    'condition_embedder.time_proj': 'time_projection',
+    'time_proj': 'time_projection',
+    # Self attention sub-type aliases
+    'attn1.to_q': 'self_attn.q',
+    'attn1.to_k': 'self_attn.k',
+    'attn1.to_v': 'self_attn.v',
+    'attn1.to_out.0': 'self_attn.o',
+    # Cross attention sub-type aliases
+    'attn2.to_q': 'cross_attn.q',
+    'attn2.to_k': 'cross_attn.k',
+    'attn2.to_v': 'cross_attn.v',
+    'attn2.to_out.0': 'cross_attn.o',
+}
+
+# Flatten sub-types into a single lookup dict
+WAN22_ALL_TENSOR_TYPES: Dict[str, Dict[str, Union[int, str]]] = {}
+for _parent_type, _info in WAN22_TENSOR_TYPES.items():
+    WAN22_ALL_TENSOR_TYPES[_parent_type] = _info
+    if 'sub_types' in _info:
+        for _sub_name, _sub_info in _info['sub_types'].items():
+            WAN22_ALL_TENSOR_TYPES[_sub_name] = _sub_info
+
 WAN22_LINEAR_TENSOR_TYPES = [k for k, v in WAN22_TENSOR_TYPES.items() if v['max_rank'] > 0]
 WAN22_FULL_TENSOR_TYPES = [k for k, v in WAN22_TENSOR_TYPES.items() if v['max_rank'] == -1]
+
+# Tensor types that are single (not per-block/layer) - layer_range is ignored for these
+WAN22_SINGLE_TENSOR_TYPES = {
+    'patch_embedding', 'modulation', 'norm', 'time_projection', 'head',
+    'text_embedding', 'text_embedding.1', 'text_embedding.2',
+    'time_embedding', 'time_embedding.1', 'time_embedding.2',
+}
+
+
+def _resolve_tensor_type(tensor_type: str) -> str:
+    """Resolve a tensor type to its canonical name using aliases.
+    
+    If the tensor type is already canonical, returns it unchanged.
+    If it's an alias (e.g., 'ffn.up', 'condition_embedder.text_embedder.linear_1'),
+    returns the canonical name (e.g., 'ffn.0', 'text_embedding.1').
+    If not found in either, returns the input unchanged.
+    """
+    # Already canonical?
+    if tensor_type in WAN22_ALL_TENSOR_TYPES:
+        return tensor_type
+    # Check aliases
+    if tensor_type in WAN22_TENSOR_TYPE_ALIASES:
+        return WAN22_TENSOR_TYPE_ALIASES[tensor_type]
+    # Return as-is (might be validated later or might be invalid)
+    return tensor_type
+
+
+def _is_single_tensor_type(tensor_type: str) -> bool:
+    """Check if a tensor type is a single tensor (not per-block).
+    Resolves aliases first."""
+    canonical = _resolve_tensor_type(tensor_type)
+    return canonical in WAN22_SINGLE_TENSOR_TYPES
 
 
 def get_wan22_tensor_type_from_name(layer_name: str) -> Optional[str]:
     """
     Determine the Wan 2.2 tensor type from a layer name (diffusers format).
-    Returns the tensor type key (e.g., 'self_attn', 'ffn') or None if not matched.
+    Returns the most specific tensor type key (e.g., 'self_attn.q', 'self_attn', 'ffn') or None if not matched.
+    Prefers sub-types (e.g., 'self_attn.q') over parent types (e.g., 'self_attn').
     """
+    # First try sub-types (more specific match)
+    for tensor_type, config in WAN22_ALL_TENSOR_TYPES.items():
+        if 'pattern' in config:
+            if re.search(config['pattern'], layer_name):
+                return tensor_type
+    # Then try parent types (fallback)
     for tensor_type, config in WAN22_TENSOR_TYPES.items():
         for pattern in config['name_patterns']:
             if re.search(pattern, layer_name):
@@ -118,6 +281,8 @@ def get_wan22_max_rank_for_type(tensor_type: str) -> int:
     Get the maximum LoRA rank for a Wan 2.2 tensor type.
     Returns -1 for types that should use full weight training.
     """
+    if tensor_type in WAN22_ALL_TENSOR_TYPES:
+        return WAN22_ALL_TENSOR_TYPES[tensor_type]['max_rank']
     if tensor_type in WAN22_TENSOR_TYPES:
         return WAN22_TENSOR_TYPES[tensor_type]['max_rank']
     return -1
@@ -482,6 +647,93 @@ class NetworkConfig:
         else:
             # Default: ENABLED with sensible defaults
             self.rank_gates: Optional[RankGateConfig] = RankGateConfig(enabled=True)
+        
+        # =====================================================================
+        # Per-Layer Rank Overrides
+        # =====================================================================
+        # Allows fine-grained rank control for specific layers within a tensor type.
+        # Format: list of dicts with 'tensor_type', 'rank', 'layer_range'
+        # e.g. [{'tensor_type': 'cross_attn', 'rank': 64, 'layer_range': '0-2'}]
+        #      -> layers 0,1,2 of cross_attn get rank 64
+        # These overrides take precedence over wan22_tensor_types and global rank.
+        # =====================================================================
+        layer_overrides_input = kwargs.get('layer_overrides', [])
+        self.layer_overrides: List[Dict] = []
+        for override in layer_overrides_input:
+            if not isinstance(override, dict):
+                continue
+            tensor_type = override.get('tensor_type', 'cross_attn')
+            # Resolve aliases (e.g., 'ffn.up' -> 'ffn.0', 'condition_embedder.text_embedder.linear_1' -> 'text_embedding.1')
+            canonical_type = _resolve_tensor_type(tensor_type)
+            if canonical_type != tensor_type:
+                print(f"Resolved tensor type alias: '{tensor_type}' -> '{canonical_type}'")
+            
+            # For single tensors, layer_range is ignored
+            if _is_single_tensor_type(canonical_type):
+                self.layer_overrides.append({
+                    'tensor_type': canonical_type,
+                    'rank': override.get('rank', 32),
+                    'layers': []  # Empty means "all instances" for single tensors
+                })
+            else:
+                layer_range_str = override.get('layer_range', '')
+                layers = _parse_layer_range(layer_range_str)
+                if not layers:
+                    print(f"Ignoring layer override with invalid/empty layer_range: {layer_range_str}")
+                    continue
+                self.layer_overrides.append({
+                    'tensor_type': canonical_type,
+                    'rank': override.get('rank', 32),
+                    'layers': layers
+                })
+        
+        # =====================================================================
+        # Per-Expert Per-Layer Rank Overrides
+        # =====================================================================
+        # Same format as layer_overrides, but scoped to a specific transformer expert.
+        # layer_overrides_high -> transformer_1 (high-noise expert)
+        # layer_overrides_low  -> transformer_2 (low-noise expert)
+        # Priority: per-expert overrides > global layer_overrides > wan22_tensor_types > global rank
+        # =====================================================================
+        def _parse_overrides(input_overrides: List[Dict], expert_name: str) -> List[Dict]:
+            overrides = []
+            for override in input_overrides:
+                if not isinstance(override, dict):
+                    continue
+                tensor_type = override.get('tensor_type', 'cross_attn')
+                # Resolve aliases
+                canonical_type = _resolve_tensor_type(tensor_type)
+                if canonical_type != tensor_type:
+                    print(f"Resolved {expert_name} tensor type alias: '{tensor_type}' -> '{canonical_type}'")
+                
+                # For single tensors, layer_range is ignored
+                if _is_single_tensor_type(canonical_type):
+                    overrides.append({
+                        'tensor_type': canonical_type,
+                        'rank': override.get('rank', 32),
+                        'layers': []  # Empty means "all instances" for single tensors
+                    })
+                else:
+                    layer_range_str = override.get('layer_range', '')
+                    layers = _parse_layer_range(layer_range_str)
+                    if not layers:
+                        print(f"Ignoring {expert_name} layer override with invalid/empty layer_range: {layer_range_str}")
+                        continue
+                    overrides.append({
+                        'tensor_type': canonical_type,
+                        'rank': override.get('rank', 32),
+                        'layers': layers
+                    })
+            return overrides
+        
+        self.layer_overrides_high: List[Dict] = _parse_overrides(
+            kwargs.get('layer_overrides_high', []),
+            'layer_overrides_high (transformer_1)'
+        )
+        self.layer_overrides_low: List[Dict] = _parse_overrides(
+            kwargs.get('layer_overrides_low', []),
+            'layer_overrides_low (transformer_2)'
+        )
 
 
 AdapterTypes = Literal['t2i', 'ip', 'ip+', 'clip', 'ilora', 'photo_maker', 'control_net', 'control_lora', 'i2v']

@@ -358,13 +358,99 @@ const loraInitOptions: SelectOption[] = [
 ];
 
 // Wan 2.2 Tensor Types Configuration
-const WAN22_TENSOR_TYPES = {
+const WAN22_TENSOR_TYPES: Record<string, { name: string; maxRank: number; description: string }> = {
   self_attn: { name: 'Self Attention', maxRank: 5120, description: 'attn1 q/k/v/o projections' },
+  'self_attn.q': { name: 'Self Attention Q', maxRank: 5120, description: 'attn1 Q projection' },
+  'self_attn.k': { name: 'Self Attention K', maxRank: 5120, description: 'attn1 K projection' },
+  'self_attn.v': { name: 'Self Attention V', maxRank: 5120, description: 'attn1 V projection' },
+  'self_attn.o': { name: 'Self Attention O', maxRank: 5120, description: 'attn1 output projection' },
   cross_attn: { name: 'Cross Attention', maxRank: 5120, description: 'attn2 q/k/v/o projections' },
+  'cross_attn.q': { name: 'Cross Attention Q', maxRank: 5120, description: 'attn2 Q projection' },
+  'cross_attn.k': { name: 'Cross Attention K', maxRank: 5120, description: 'attn2 K projection' },
+  'cross_attn.v': { name: 'Cross Attention V', maxRank: 5120, description: 'attn2 V projection' },
+  'cross_attn.o': { name: 'Cross Attention O', maxRank: 5120, description: 'attn2 output projection' },
   ffn: { name: 'Feed Forward', maxRank: 5120, description: 'FFN projections' },
+  'ffn.0': { name: 'FFN Up', maxRank: 5120, description: 'FFN up projection (ffn.up)' },
+  'ffn.2': { name: 'FFN Down', maxRank: 5120, description: 'FFN down projection (ffn.down)' },
   text_embedding: { name: 'Text Embedding', maxRank: 4096, description: 'text embedding linear layers' },
+  'text_embedding.1': { name: 'Text Embedding L1', maxRank: 4096, description: 'text embedding linear_1' },
+  'text_embedding.2': { name: 'Text Embedding L2', maxRank: 4096, description: 'text embedding linear_2' },
   time_embedding: { name: 'Time Embedding', maxRank: 256, description: 'time embedding linear layers' },
+  'time_embedding.1': { name: 'Time Embedding L1', maxRank: 256, description: 'time embedding linear_1' },
+  'time_embedding.2': { name: 'Time Embedding L2', maxRank: 256, description: 'time embedding linear_2' },
   head: { name: 'Output Head', maxRank: 64, description: 'output projection' },
+  patch_embedding: { name: 'Patch Embedding', maxRank: -1, description: 'patch embedding (full weight)' },
+  modulation: { name: 'Modulation', maxRank: -1, description: 'modulation parameters (full weight)' },
+  norm: { name: 'Norm', maxRank: -1, description: 'normalization parameters (full weight)' },
+  time_projection: { name: 'Time Projection', maxRank: -1, description: 'time projection (full weight)' },
+};
+
+// Aliases mapping - these are resolved to canonical tensor types
+// Matches backend WAN22_TENSOR_TYPE_ALIASES
+const WAN22_TENSOR_TYPE_ALIASES: Record<string, string> = {
+  // FFN aliases
+  'ffn.up': 'ffn.0',
+  'ffn.down': 'ffn.2',
+  'ffn.net.0.proj': 'ffn.0',
+  'ffn.net.2': 'ffn.2',
+  // Text embedding aliases (full layer paths)
+  'condition_embedder.text_embedder.linear_1': 'text_embedding.1',
+  'condition_embedder.text_embedder.linear_2': 'text_embedding.2',
+  'text_embedder.linear_1': 'text_embedding.1',
+  'text_embedder.linear_2': 'text_embedding.2',
+  // Time embedding aliases (full layer paths)
+  'condition_embedder.time_embedder.linear_1': 'time_embedding.1',
+  'condition_embedder.time_embedder.linear_2': 'time_embedding.2',
+  'time_embedder.linear_1': 'time_embedding.1',
+  'time_embedder.linear_2': 'time_embedding.2',
+  // Head aliases
+  'proj_out': 'head',
+  // Patch embedding aliases
+  'patch_embed': 'patch_embedding',
+  // Modulation aliases
+  'scale_shift_table': 'modulation',
+  'mod': 'modulation',
+  // Time projection aliases
+  'condition_embedder.time_proj': 'time_projection',
+  'time_proj': 'time_projection',
+  // Self attention sub-type aliases
+  'attn1.to_q': 'self_attn.q',
+  'attn1.to_k': 'self_attn.k',
+  'attn1.to_v': 'self_attn.v',
+  'attn1.to_out.0': 'self_attn.o',
+  // Cross attention sub-type aliases
+  'attn2.to_q': 'cross_attn.q',
+  'attn2.to_k': 'cross_attn.k',
+  'attn2.to_v': 'cross_attn.v',
+  'attn2.to_out.0': 'cross_attn.o',
+};
+
+// Resolve a tensor type to its canonical name
+const resolveTensorType = (typeKey: string): string => {
+  if (WAN22_TENSOR_TYPES[typeKey]) return typeKey;
+  if (WAN22_TENSOR_TYPE_ALIASES[typeKey]) return WAN22_TENSOR_TYPE_ALIASES[typeKey];
+  return typeKey; // Return as-is (will be validated later)
+};
+
+// Helper to check if a tensor type is a single tensor (not per-block)
+const isSingleTensorType = (typeKey: string): boolean => {
+  const canonical = resolveTensorType(typeKey);
+  const singleTensorTypes = [
+    'patch_embedding', 'modulation', 'norm', 'time_projection', 'head',
+    'text_embedding', 'text_embedding.1', 'text_embedding.2',
+    'time_embedding', 'time_embedding.1', 'time_embedding.2'
+  ];
+  return singleTensorTypes.includes(canonical);
+};
+
+// Helper to get max layers for a tensor type
+const getMaxLayers = (typeKey: string): number => {
+  const canonical = resolveTensorType(typeKey);
+  const typeInfo = WAN22_TENSOR_TYPES[canonical];
+  if (!typeInfo || typeInfo.maxRank === -1) return 0;
+  const name = typeInfo.name || '';
+  if (name.includes('Attn') || name.includes('FFN')) return 40; // Wan 2.2 has 40 transformer blocks (0-39)
+  return 0;
 };
 
 const schedulerOptions: SelectOption[] = [
@@ -1211,6 +1297,262 @@ export default function SimpleJob({
                   Clear Wan 2.2 Tensor Type Config (use Linear Rank for all)
                 </button>
               </div>
+            )}
+            {/* Per-Layer Rank Overrides */}
+            {jobConfig.config.process[0].network?.type == 'lora' && (
+              <>
+                <style jsx>{`input[type="number"]::-webkit-inner-spin-button,
+                  input[type="number"]::-webkit-outer-spin-button {
+                    -webkit-appearance: none;
+                    margin: 0;
+                  }
+                  input[type="number"] {
+                    -moz-appearance: textfield;
+                  }`}</style>
+                <div style={{ marginTop: '16px', paddingTop: '16px', borderTop: '1px solid var(--border)' }}>
+                  <div style={{ fontWeight: 600, marginBottom: '8px', color: 'var(--accent)' }}>Per-Layer Rank Overrides</div>
+                  <div style={{ fontSize: '11px', color: 'var(--muted)', marginBottom: '12px' }}>
+                    Apply specific ranks to individual layers or tensor types. Useful for fine-tuning specific blocks (e.g., layers 0-15).
+                    These settings override any global or Wan 2.2 tensor-type specific configurations.
+                  </div>
+
+                  {/* Helper components */}
+                  {(() => {
+                    const validateLayerRange = (rangeStr: string): boolean => {
+                      if (!rangeStr || rangeStr.trim() === '') return false;
+                      const segments = rangeStr.split(',').map(s => s.trim()).filter(Boolean);
+                      for (const seg of segments) {
+                        if (!/^(\d+)(?:[.]{1,3}\d+|\-\d+)$/.test(seg) && !/^\d+$/.test(seg)) {
+                          return false;
+                        }
+                      }
+                      return true;
+                    };
+
+                    const TensorOverrideRow = ({
+                      override,
+                      index,
+                      configKey,
+                      accentColor
+                    }: {
+                      override: { tensor_type: string; rank: number; layer_range: string };
+                      index: number;
+                      configKey: string;
+                      accentColor?: string;
+                    }) => {
+                      // Resolve aliases when loading from config (e.g., 'ffn.up' -> 'ffn.0')
+                      const canonicalType = resolveTensorType(override.tensor_type);
+                      const isSingleTensor = isSingleTensorType(canonicalType);
+                      const isDisabled = override.rank <= 0; // Tensor excluded from training
+                      const isRangeValid = isSingleTensor || validateLayerRange(override.layer_range);
+                      const maxLayers = getMaxLayers(canonicalType);
+
+                      const updateOverride = (field: string, value: any) => {
+                        const current = (jobConfig.config.process[0].network as any)?.[configKey] || [];
+                        const newOverrides = [...current];
+                        newOverrides[index] = { ...override, [field]: value };
+                        setJobConfig(newOverrides, `config.process[0].network.${configKey}`);
+                      };
+
+                      const removeOverride = () => {
+                        const current = (jobConfig.config.process[0].network as any)?.[configKey] || [];
+                        const newOverrides = current.filter((_, idx) => idx !== index);
+                        setJobConfig(newOverrides, `config.process[0].network.${configKey}`);
+                      };
+
+                      return (
+                        <div key={index} style={{
+                          display: 'grid',
+                          gridTemplateColumns: '1fr 1fr 1fr auto',
+                          gap: '8px',
+                          padding: '8px',
+                          background: isDisabled ? '#1a1a2e' : 'var(--bg-secondary)',
+                          borderRadius: '6px',
+                          alignItems: 'center',
+                          opacity: isDisabled ? 0.7 : 1,
+                          border: isDisabled ? '1px dashed #ef4444' : '1px solid transparent'
+                        }}>
+                          <SelectInput
+                            label={null}
+                            value={canonicalType} // Use resolved canonical type for display
+                            onChange={(value) => updateOverride('tensor_type', value)}
+                            options={Object.entries(WAN22_TENSOR_TYPES).map(([typeKey, typeInfo]) => ({
+                              value: typeKey,
+                              label: typeInfo.name
+                            }))}
+                            style={{ height: '28px' }}
+                          />
+                          <NumberInput
+                            label={null}
+                            value={override.rank}
+                            onChange={(value) => updateOverride('rank', value)}
+                            placeholder="rank"
+                            style={{
+                              height: '28px',
+                              border: isDisabled ? '1px solid #ef4444' : undefined,
+                              background: isDisabled ? '#2d1b1b' : undefined
+                            }}
+                          />
+                          <input
+                            type="text"
+                            value={isSingleTensor ? '' : override.layer_range}
+                            onChange={(e) => !isSingleTensor && updateOverride('layer_range', e.target.value)}
+                            placeholder={isSingleTensor ? "N/A (single tensor)" : "0-2, 1-4,5-6, or 0,1,2"}
+                            disabled={isSingleTensor || isDisabled}
+                            style={{
+                              height: '28px',
+                              background: isSingleTensor ? '#111827' : 'var(--bg-tertiary)',
+                              border: `1px solid ${isRangeValid ? 'var(--border)' : '#ef4444'}`,
+                              borderRadius: '4px',
+                              color: isSingleTensor ? '#4b5563' : 'var(--text)',
+                              padding: '0 8px',
+                              cursor: isSingleTensor ? 'not-allowed' : 'text'
+                            }}
+                          />
+                          <button
+                            onClick={removeOverride}
+                            style={{
+                              padding: '4px 8px',
+                              fontSize: '10px',
+                              cursor: 'pointer',
+                              background: 'var(--bg-tertiary)',
+                              color: 'var(--text)',
+                              border: '1px solid var(--border)',
+                              borderRadius: '4px'
+                            }}
+                          >
+                            <X className="w-4 h-4" />
+                          </button>
+                          <div style={{ gridColumn: '1 / -1', fontSize: '10px', color: isDisabled ? '#ef4444' : (isRangeValid ? 'var(--muted)' : '#ef4444'), marginTop: '4px' }}>
+                            {isDisabled
+                              ? "⚠ Tensor EXCLUDED from LoRA training (rank ≤ 0). Set rank > 0 to enable."
+                              : isSingleTensor
+                                ? "Single tensor (no layers). Layer range is ignored."
+                                : !isRangeValid && override.layer_range.trim() !== ''
+                                  ? "Invalid format. Use: 0-2, 1-4,5-6, or 0,1,2"
+                                  : maxLayers > 0
+                                    ? `Available layers: 0 to ${maxLayers - 1} (e.g., 0-${maxLayers - 1})`
+                                    : "Specify layer range like 0-2, 1-4,5-6, or 0,1,2"}
+                          </div>
+                        </div>
+                      );
+                    };
+
+                    const OverrideSection = ({
+                      title,
+                      description,
+                      configKey,
+                      accentColor,
+                      borderColor,
+                      exampleOverride
+                    }: {
+                      title: string;
+                      description: string;
+                      configKey: string;
+                      accentColor?: string;
+                      borderColor?: string;
+                      exampleOverride: { tensor_type: string; rank: number; layer_range: string };
+                    }) => {
+                      const overrides = (jobConfig.config.process[0].network as any)?.[configKey] || [];
+
+                      return (
+                        <div style={{
+                          marginBottom: '12px',
+                          padding: '10px',
+                          background: 'var(--bg-tertiary)',
+                          borderRadius: '6px',
+                          border: `1px solid ${borderColor || 'var(--border)'}`
+                        }}>
+                          <div style={{ fontWeight: 600, marginBottom: '4px', color: accentColor || 'var(--accent)', fontSize: '12px' }}>
+                            {title}
+                          </div>
+                          <div style={{ fontSize: '10px', color: 'var(--muted)', marginBottom: '8px' }}>
+                            {description}
+                          </div>
+                          {overrides.length > 0 && (
+                            <div style={{ display: 'grid', gap: '8px', marginBottom: '8px' }}>
+                              {overrides.map((override, i) => (
+                                <TensorOverrideRow
+                                  key={i}
+                                  override={override}
+                                  index={i}
+                                  configKey={configKey}
+                                  accentColor={accentColor}
+                                />
+                              ))}
+                            </div>
+                          )}
+                          <button
+                            onClick={() => {
+                              const current = (jobConfig.config.process[0].network as any)?.[configKey] || [];
+                              const newOverrides = [...current, exampleOverride];
+                              setJobConfig(newOverrides, `config.process[0].network.${configKey}`);
+                            }}
+                            style={{
+                              padding: '4px 8px',
+                              fontSize: '10px',
+                              cursor: 'pointer',
+                              background: accentColor || 'var(--accent)',
+                              color: 'white',
+                              border: 'none',
+                              borderRadius: '4px',
+                              marginRight: '6px'
+                            }}
+                          >
+                            Add Override
+                          </button>
+                          <button
+                            onClick={() => setJobConfig([], `config.process[0].network.${configKey}`)}
+                            style={{
+                              padding: '4px 8px',
+                              fontSize: '10px',
+                              cursor: 'pointer',
+                              background: 'transparent',
+                              color: 'var(--muted)',
+                              border: '1px dashed var(--border)',
+                              borderRadius: '4px'
+                            }}
+                          >
+                            Clear
+                          </button>
+                        </div>
+                      );
+                    };
+
+                    return (
+                      <>
+                        {/* Global Overrides */}
+                        <OverrideSection
+                          title="Global Overrides (all experts)"
+                          description="Applies to all transformer experts. Can be overridden by per-expert settings below."
+                          configKey="layer_overrides"
+                          exampleOverride={{ tensor_type: 'self_attn.v', rank: 64, layer_range: '0-2' }}
+                        />
+
+                        {/* High-Noise Expert Overrides */}
+                        <OverrideSection
+                          title="High-Noise Expert Overrides (transformer_1)"
+                          description="Overrides global settings for the high-noise expert (transformer_1). Empty = uses global overrides."
+                          configKey="layer_overrides_high"
+                          accentColor="#f59e0b"
+                          borderColor="#f59e0b33"
+                          exampleOverride={{ tensor_type: 'self_attn.q', rank: 128, layer_range: '0-10' }}
+                        />
+
+                        {/* Low-Noise Expert Overrides */}
+                        <OverrideSection
+                          title="Low-Noise Expert Overrides (transformer_2)"
+                          description="Overrides global settings for the low-noise expert (transformer_2). Empty = uses global overrides."
+                          configKey="layer_overrides_low"
+                          accentColor="#06b6d4"
+                          borderColor="#06b6d433"
+                          exampleOverride={{ tensor_type: 'self_attn.k', rank: 96, layer_range: '20-39' }}
+                        />
+                      </>
+                    );
+                  })()}
+                </div>
+              </>
             )}
             {/* Rank Gate Annealing (SparseForge-inspired) */}
             {jobConfig.config.process[0].network?.type == 'lora' && (
