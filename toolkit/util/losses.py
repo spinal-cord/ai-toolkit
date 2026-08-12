@@ -902,9 +902,9 @@ def spectral_flow_loss(
         tuple: (total_loss, flow_deviation, spatial_loss_val, flow_loss_val,
                 spectral_component, flow_component)
         - total_loss: combined loss tensor (per-pixel)
-        - flow_deviation: scalar flow loss for logging/rejection
+        - flow_deviation: scalar raw flow loss for rejection/adaptive logic
         - spatial_loss_val: scalar spectral loss for logging
-        - flow_loss_val: scalar flow loss for logging
+        - flow_loss_val: scalar weighted flow loss (with flow_weight applied) for logging
         - spectral_component: spectral loss tensor (for gradient-selective rejection)
         - flow_component: flow loss tensor (for gradient-selective rejection)
     """
@@ -1148,5 +1148,6 @@ def spectral_flow_loss(
     flow_component = flow_component.to(original_dtype)
     total_loss = total_loss.to(original_dtype)
 
-    return (total_loss, flow_deviation, loss_spatial.mean().item(), flow_loss.item(),
+    return (total_loss, flow_deviation, loss_spatial.mean().item(),
+            flow_loss.item() * effective_flow_weight,
             spectral_component, flow_component)

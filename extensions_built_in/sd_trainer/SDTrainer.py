@@ -1192,7 +1192,6 @@ class SDTrainer(BaseSDTrainProcess):
                     self.additional_logs[f'loss_{expert}/spatial'] = spatial_val
                     self.additional_logs[f'loss_{expert}/flow'] = flow_val
                     self.additional_logs[f'loss_{expert}/flow_weight'] = expert_flow_weight
-                    self.additional_logs[f'loss_{expert}/flow_deviation'] = flow_dev
 
                     # SNR weighting on (B,) loss, THEN final mean
                     if not self.train_config.train_turbo:
@@ -2852,19 +2851,19 @@ class SDTrainer(BaseSDTrainProcess):
 
         avg_loss = (total_loss / len(batch_list)).item()
 
-        loss_dict = OrderedDict(
-            {'loss': avg_loss}
-        )
+        # For MoE models training both experts, log only expert-tagged loss (loss_low/loss_high).
+        # For single-expert training, log the standard 'loss'.
+        expert_label = self._get_active_expert_label()
+        if expert_label != "single":
+            # MoE mode: log per-expert loss only
+            loss_dict = OrderedDict()
+            loss_dict[f'loss_{expert_label}'] = avg_loss
+        else:
+            # Single expert mode
+            loss_dict = OrderedDict({'loss': avg_loss})
+
         if grad_norm_value is not None:
             loss_dict['grad_norm'] = grad_norm_value
-
-        # For MoE models training both experts, tag the loss with the active expert.
-        # When only one expert is trained, the distinction is unnecessary.
-        if hasattr(self.sd, 'model') and hasattr(self.sd.model, '_active_transformer_name'):
-            active = self.sd.model._active_transformer_name
-            if getattr(self.sd, 'train_high_noise', False) and getattr(self.sd, 'train_low_noise', False):
-                expert_label = "high" if active == "transformer_1" else "low"
-                loss_dict[f'loss_{expert_label}'] = avg_loss
 
         self.end_of_training_loop()
 
