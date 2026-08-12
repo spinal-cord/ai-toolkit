@@ -2075,9 +2075,9 @@ export default function SimpleJob({
                     <p className="text-xs text-blue-400">
                       Flow Loss Settings (temporal motion consistency)
                     </p>
-                    <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-2">
                       <NumberInput
-                        label="Flow Loss Weight"
+                        label="Flow Loss Weight (global)"
                         className="pt-1"
                         value={jobConfig.config.process[0].train.spectral_flow_weight ?? 0.1}
                         onChange={value => setJobConfig(value, 'config.process[0].train.spectral_flow_weight')}
@@ -2086,6 +2086,32 @@ export default function SimpleJob({
                         min={0}
                         step={0.01}
                       />
+                      <p className="text-xs text-gray-500">Global weight used for single-expert models or as fallback when per-expert weight is not set.</p>
+                      <div className="grid grid-cols-2 gap-3">
+                        <NumberInput
+                          label="Flow Loss Weight (low noise)"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.spectral_flow_weight_low ?? null}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.spectral_flow_weight_low')}
+                          placeholder="Leave empty for global"
+                          docKey={'train.spectral_flow_weight_low'}
+                          min={0}
+                          step={0.01}
+                        />
+                        <NumberInput
+                          label="Flow Loss Weight (high noise)"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.spectral_flow_weight_high ?? null}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.spectral_flow_weight_high')}
+                          placeholder="Leave empty for global"
+                          docKey={'train.spectral_flow_weight_high'}
+                          min={0}
+                          step={0.01}
+                        />
+                      </div>
+                      <p className="text-xs text-gray-500">For MoE models: override global weight per expert. Leave empty to use global weight.</p>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
                       <NumberInput
                         label="Flow Max Timestep"
                         className="pt-1"
@@ -2097,20 +2123,22 @@ export default function SimpleJob({
                         max={1000}
                         step={50}
                       />
+                      <div className="flex items-end pb-1">
+                        <div className="flex items-center space-x-2">
+                          <input
+                            type="checkbox"
+                            id="spectral_flow_motion_weighted"
+                            checked={jobConfig.config.process[0].train.spectral_flow_motion_weighted ?? true}
+                            onChange={e => setJobConfig(e.target.checked, 'config.process[0].train.spectral_flow_motion_weighted')}
+                            className="rounded border-gray-600"
+                          />
+                          <label htmlFor="spectral_flow_motion_weighted" className="text-sm text-gray-300">
+                            Motion Weighted
+                          </label>
+                        </div>
+                      </div>
                     </div>
                     <div className="flex items-center space-x-4 pt-1">
-                      <div className="flex items-center space-x-2">
-                        <input
-                          type="checkbox"
-                          id="spectral_flow_motion_weighted"
-                          checked={jobConfig.config.process[0].train.spectral_flow_motion_weighted ?? true}
-                          onChange={e => setJobConfig(e.target.checked, 'config.process[0].train.spectral_flow_motion_weighted')}
-                          className="rounded border-gray-600"
-                        />
-                        <label htmlFor="spectral_flow_motion_weighted" className="text-sm text-gray-300">
-                          Motion Weighted
-                        </label>
-                      </div>
                       <div className="flex items-center space-x-2">
                         <input
                           type="checkbox"

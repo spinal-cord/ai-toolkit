@@ -1031,7 +1031,9 @@ class TrainConfig:
 
         # Spectral flow loss config - combines spectral (spatial frequency) + optical flow (temporal motion)
         # Flow loss weight: 0.05-0.15 recommended for Wan 2.2 I2V LoRA
-        self.spectral_flow_weight = kwargs.get('spectral_flow_weight', 0.1)  # flow loss weight
+        self.spectral_flow_weight = kwargs.get('spectral_flow_weight', 0.1)  # global flow loss weight (fallback)
+        self.spectral_flow_weight_low = kwargs.get('spectral_flow_weight_low', None)  # per-expert weight for low noise
+        self.spectral_flow_weight_high = kwargs.get('spectral_flow_weight_high', None)  # per-expert weight for high noise
         self.spectral_flow_max_timestep = kwargs.get('spectral_flow_max_timestep', 800)  # timestep gate for flow loss
         self.spectral_flow_motion_weighted = kwargs.get('spectral_flow_motion_weighted', True)  # weight by motion magnitude
         self.spectral_flow_adaptive = kwargs.get('spectral_flow_adaptive', False)  # dynamic weight adjustment

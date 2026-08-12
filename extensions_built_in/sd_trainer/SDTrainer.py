@@ -1083,8 +1083,15 @@ class SDTrainer(BaseSDTrainProcess):
 
                     expert = self._get_active_expert_label()
 
-                    # Issue #1 fix: use per-expert current_flow_weight
-                    base_flow_weight = self.train_config.spectral_flow_weight
+                    # Determine base flow weight: per-expert config overrides global
+                    if expert == "low" and self.train_config.spectral_flow_weight_low is not None:
+                        base_flow_weight = self.train_config.spectral_flow_weight_low
+                    elif expert == "high" and self.train_config.spectral_flow_weight_high is not None:
+                        base_flow_weight = self.train_config.spectral_flow_weight_high
+                    else:
+                        base_flow_weight = self.train_config.spectral_flow_weight
+
+                    # Issue #1 fix: use per-expert current_flow_weight (adaptive adjustment)
                     expert_flow_weight = self.current_flow_weight.get(expert, base_flow_weight)
 
                     (total_loss, flow_dev, spatial_val, flow_val,
