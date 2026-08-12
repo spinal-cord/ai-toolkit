@@ -1960,11 +1960,13 @@ export default function SimpleJob({
                     step={0.001}
                   />
                 )}
-                {jobConfig.config.process[0].train.loss_type === 'spectral' && (
-                  <div className="border border-gray-700 rounded-lg p-4 mt-2 space-y-3">
-                    <p className="text-xs text-gray-400">
-                      Spectral loss dissociates low frequencies (structure/motion) from high frequencies (texture/details).
-                      Adjust weights to control detail density without compromising structural coherence.
+                {(jobConfig.config.process[0].train.loss_type === 'spectral_flow' || jobConfig.config.process[0].train.loss_type === 'spectral') && (
+                  <div className="border border-blue-900 rounded-lg p-4 mt-2 space-y-3">
+                    <p className="text-xs text-blue-300">
+                      {jobConfig.config.process[0].train.loss_type === 'spectral_flow'
+                        ? 'Spectral+Flow loss combines spectral (spatial frequency) with optical flow (temporal motion) consistency. '
+                        : ''}Spectral loss dissociates low frequencies (structure/motion) from high frequencies (texture/details).
+                      {jobConfig.config.process[0].train.loss_type === 'spectral_flow' && 'Requires cache_optical_flow_to_disk enabled on video datasets.'}
                     </p>
                     <div className="grid grid-cols-3 gap-3">
                       <NumberInput
@@ -2069,28 +2071,10 @@ export default function SimpleJob({
                   </div>
                 )}
                 {jobConfig.config.process[0].train.loss_type === 'spectral_flow' && (
-                  <div className="border border-blue-900 rounded-lg p-4 mt-2 space-y-3">
-                    <p className="text-xs text-blue-300">
-                      Spectral+Flow loss combines spectral (spatial frequency) with optical flow (temporal motion) consistency.
-                      Requires cache_optical_flow_to_disk enabled on video datasets.
+                  <div className="border border-blue-800 rounded-lg p-4 mt-2 space-y-3">
+                    <p className="text-xs text-blue-400">
+                      Flow Loss Settings (temporal motion consistency)
                     </p>
-                    <div>
-                      <label className="block text-xs font-medium text-gray-300 mb-1">
-                        Transform Type
-                      </label>
-                      <select
-                        className="w-full bg-gray-800 text-gray-200 text-xs rounded px-2 py-1.5 border border-gray-600 focus:border-blue-500 focus:outline-none"
-                        value={jobConfig.config.process[0].train.spectral_transform ?? 'dct'}
-                        onChange={e => setJobConfig(e.target.value, 'config.process[0].train.spectral_transform')}
-                      >
-                        <option value="dct">DCT (default, SSVAE-compliant, mirror boundaries)</option>
-                        <option value="fft">FFT (fast, periodic boundaries)</option>
-                      </select>
-                      <p className="text-xs text-gray-500 mt-1">
-                        DCT: real-valued with mirror boundaries — matches SSVAE paper methodology.<br />
-                        FFT: complex transform with periodic boundaries (faster).
-                      </p>
-                    </div>
                     <div className="grid grid-cols-2 gap-3">
                       <NumberInput
                         label="Flow Loss Weight"
