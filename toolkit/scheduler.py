@@ -62,6 +62,13 @@ def get_lr_scheduler(
         elif 'total_iters' in kwargs:
             # Remove total_iters if T_0 is already specified
             kwargs.pop('total_iters')
+        # Ensure T_0 and T_mult are integers >= 1 (torch requirement)
+        # Round up non-integer values to allow flexible config while satisfying torch
+        import math
+        if 'T_0' in kwargs:
+            kwargs['T_0'] = max(1, math.ceil(kwargs['T_0']))
+        if 'T_mult' in kwargs:
+            kwargs['T_mult'] = max(1, math.ceil(kwargs['T_mult']))
         return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, **kwargs
         )
