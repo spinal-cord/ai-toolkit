@@ -60,6 +60,44 @@ config:
 #        disable_sampling: true
         dtype: bf16
 
+        # ================================================================
+        # Learning Rate Scheduler Configuration
+        # ================================================================
+        # Global scheduler (applies to single-expert mode or as default for both experts)
+        # Options: cosine, cosine_with_restarts, step, polynomial, constant, linear, constant_with_warmup
+        # lr_scheduler: "cosine"
+        # lr_scheduler_params:
+        #   total_iters: 2000  # will be auto-calculated from steps if not specified
+
+        # Per-expert schedulers for dual-expert Wan 2.2 14B training
+        # Each expert gets its own scheduler that tracks steps based on how many
+        # times that expert was active (not global step count).
+        #
+        # If NOT specified: each expert gets its own copy of the global scheduler
+        # configured to work on expert-specific step counts.
+        #
+        # If specified: the per-expert scheduler config overwrites the global
+        # scheduler for that expert.
+        #
+        # Example 1: Different schedulers for each expert
+        # expert_1_lr_scheduler: "cosine"         # high-noise expert (transformer_1)
+        # expert_1_lr_scheduler_params:
+        #   total_iters: 2000
+        # expert_2_lr_scheduler: "polynomial"     # low-noise expert (transformer_2)
+        # expert_2_lr_scheduler_params:
+        #   power: 0.5
+        #   lr_end: 1e-5
+        #
+        # Example 2: Only customize one expert, other uses global scheduler
+        # expert_1_lr_scheduler: "cosine"         # high-noise expert uses cosine
+        # expert_1_lr_scheduler_params:
+        #   total_iters: 2000
+        # expert_2_lr_scheduler: null             # low-noise expert uses global scheduler
+        #
+        # Example 3: Disable scheduler for one expert
+        # expert_1_lr_scheduler: "cosine"         # high-noise expert uses cosine
+        # expert_2_lr_scheduler: "none"           # low-noise expert uses constant LR
+
         # IMPORTANT: this is for Wan 2.2 MOE. It will switch training one stage or the other every this many steps
         switch_boundary_every: 10
 

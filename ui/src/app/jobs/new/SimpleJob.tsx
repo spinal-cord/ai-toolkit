@@ -1873,6 +1873,147 @@ export default function SimpleJob({
                     min={0}
                   />
                 )}
+
+                {/* Per-Expert LR Schedulers for Wan 2.2 14B Dual-Expert Models */}
+                {modelArch?.additionalSections?.includes('model.multistage') &&
+                  jobConfig.config.process[0].model.model_kwargs?.train_high_noise &&
+                  jobConfig.config.process[0].model.model_kwargs?.train_low_noise && (
+                  <div className="pt-3 pb-2 border-t border-gray-700">
+                    <p className="text-xs text-blue-400 mb-2 font-medium">
+                      Per-Expert LR Schedulers (Wan 2.2 14B Dual-Expert)
+                    </p>
+                    <p className="text-[10px] text-gray-500 mb-2">
+                      Each expert gets its own scheduler tracking expert-specific steps. Leave empty to use global scheduler for each expert.
+                    </p>
+
+                    {/* Expert 1 (High-Noise) Scheduler */}
+                    <div className="mb-2">
+                      <p className="text-[10px] text-green-400 mb-1 font-medium">High-Noise Expert (Transformer 1)</p>
+                      <SelectInput
+                        label="Expert 1 LR Scheduler"
+                        value={jobConfig.config.process[0].train.expert_1_lr_scheduler || 'Use global scheduler'}
+                        onChange={value => {
+                          if (value === 'Use global scheduler') {
+                            setJobConfig(undefined, 'config.process[0].train.expert_1_lr_scheduler');
+                            setJobConfig(undefined, 'config.process[0].train.expert_1_lr_scheduler_params');
+                          } else {
+                            setJobConfig(value, 'config.process[0].train.expert_1_lr_scheduler');
+                            const defaults = SCHEDULER_DEFAULT_PARAMS[value] || {};
+                            setJobConfig(defaults, 'config.process[0].train.expert_1_lr_scheduler_params');
+                          }
+                        }}
+                        options={[
+                          { value: 'Use global scheduler', label: 'Use global scheduler' },
+                          { value: 'none', label: 'None (constant LR)' },
+                          { value: 'cosine', label: 'Cosine' },
+                          { value: 'cosine_with_restarts', label: 'Cosine with Restarts' },
+                          { value: 'step', label: 'Step' },
+                          { value: 'polynomial', label: 'Polynomial' },
+                          { value: 'constant', label: 'Constant' },
+                          { value: 'linear', label: 'Linear' },
+                          { value: 'constant_with_warmup', label: 'Constant with Warmup' },
+                        ]}
+                      />
+                    </div>
+
+                    {/* Expert 1 Scheduler Params */}
+                    {jobConfig.config.process[0].train.expert_1_lr_scheduler === 'cosine' && (
+                      <NumberInput
+                        label="Expert 1 Total Iters"
+                        className="pt-1"
+                        value={jobConfig.config.process[0].train.expert_1_lr_scheduler_params?.total_iters ?? null}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.expert_1_lr_scheduler_params.total_iters')}
+                        placeholder="Defaults to training steps"
+                        min={1}
+                      />
+                    )}
+                    {jobConfig.config.process[0].train.expert_1_lr_scheduler === 'polynomial' && (
+                      <>
+                        <NumberInput
+                          label="Expert 1 Power"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.expert_1_lr_scheduler_params?.power ?? null}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.expert_1_lr_scheduler_params.power')}
+                          placeholder="eg. 0.8"
+                          min={0.01}
+                          max={10}
+                        />
+                        <NumberInput
+                          label="Expert 1 LR End"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.expert_1_lr_scheduler_params?.lr_end ?? null}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.expert_1_lr_scheduler_params.lr_end')}
+                          placeholder="eg. 0.0"
+                          min={0}
+                        />
+                      </>
+                    )}
+
+                    {/* Expert 2 (Low-Noise) Scheduler */}
+                    <div className="mb-2 mt-2">
+                      <p className="text-[10px] text-purple-400 mb-1 font-medium">Low-Noise Expert (Transformer 2)</p>
+                      <SelectInput
+                        label="Expert 2 LR Scheduler"
+                        value={jobConfig.config.process[0].train.expert_2_lr_scheduler || 'Use global scheduler'}
+                        onChange={value => {
+                          if (value === 'Use global scheduler') {
+                            setJobConfig(undefined, 'config.process[0].train.expert_2_lr_scheduler');
+                            setJobConfig(undefined, 'config.process[0].train.expert_2_lr_scheduler_params');
+                          } else {
+                            setJobConfig(value, 'config.process[0].train.expert_2_lr_scheduler');
+                            const defaults = SCHEDULER_DEFAULT_PARAMS[value] || {};
+                            setJobConfig(defaults, 'config.process[0].train.expert_2_lr_scheduler_params');
+                          }
+                        }}
+                        options={[
+                          { value: 'Use global scheduler', label: 'Use global scheduler' },
+                          { value: 'none', label: 'None (constant LR)' },
+                          { value: 'cosine', label: 'Cosine' },
+                          { value: 'cosine_with_restarts', label: 'Cosine with Restarts' },
+                          { value: 'step', label: 'Step' },
+                          { value: 'polynomial', label: 'Polynomial' },
+                          { value: 'constant', label: 'Constant' },
+                          { value: 'linear', label: 'Linear' },
+                          { value: 'constant_with_warmup', label: 'Constant with Warmup' },
+                        ]}
+                      />
+                    </div>
+
+                    {/* Expert 2 Scheduler Params */}
+                    {jobConfig.config.process[0].train.expert_2_lr_scheduler === 'cosine' && (
+                      <NumberInput
+                        label="Expert 2 Total Iters"
+                        className="pt-1"
+                        value={jobConfig.config.process[0].train.expert_2_lr_scheduler_params?.total_iters ?? null}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.expert_2_lr_scheduler_params.total_iters')}
+                        placeholder="Defaults to training steps"
+                        min={1}
+                      />
+                    )}
+                    {jobConfig.config.process[0].train.expert_2_lr_scheduler === 'polynomial' && (
+                      <>
+                        <NumberInput
+                          label="Expert 2 Power"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.expert_2_lr_scheduler_params?.power ?? null}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.expert_2_lr_scheduler_params.power')}
+                          placeholder="eg. 0.8"
+                          min={0.01}
+                          max={10}
+                        />
+                        <NumberInput
+                          label="Expert 2 LR End"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.expert_2_lr_scheduler_params?.lr_end ?? null}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.expert_2_lr_scheduler_params.lr_end')}
+                          placeholder="eg. 0.0"
+                          min={0}
+                        />
+                      </>
+                    )}
+                  </div>
+                )}
+
                 <NumberInput
                   label="Learning Rate"
                   className="pt-2"

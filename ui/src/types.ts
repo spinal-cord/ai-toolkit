@@ -205,6 +205,37 @@ export interface TrainConfig {
     start_factor?: number;
     num_warmup_steps?: number;
   };
+  // Per-expert LR schedulers for Wan 2.2 14B dual-expert models
+  expert_1_lr_scheduler?: string | undefined;
+  expert_1_lr_scheduler_params?: {
+    total_iters?: number;
+    power?: number;
+    lr_end?: number;
+    T_0?: number;
+    T_mult?: number;
+    eta_min?: number;
+    step_size?: number;
+    gamma?: number;
+    factor?: number;
+    end_factor?: number;
+    start_factor?: number;
+    num_warmup_steps?: number;
+  } | undefined;
+  expert_2_lr_scheduler?: string | undefined;
+  expert_2_lr_scheduler_params?: {
+    total_iters?: number;
+    power?: number;
+    lr_end?: number;
+    T_0?: number;
+    T_mult?: number;
+    eta_min?: number;
+    step_size?: number;
+    gamma?: number;
+    factor?: number;
+    end_factor?: number;
+    start_factor?: number;
+    num_warmup_steps?: number;
+  } | undefined;
   lr: number;
   ema_config?: EMAConfig;
   dtype: string;

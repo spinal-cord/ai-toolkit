@@ -2180,35 +2180,147 @@ class BaseSDTrainProcess(BaseTrainProcess):
             'constant_with_warmup': {'num_warmup_steps': 1000},
         }
 
-        # Only set up lr scheduler if it is not 'none'
-        if self.train_config.lr_scheduler and self.train_config.lr_scheduler.lower() != 'none':
-            lr_scheduler_params = self.train_config.lr_scheduler_params or {}
+        # Detect if we're training a dual-expert model (e.g., Wan 2.2 14B)
+        # Per-expert schedulers are only used when both experts are trainable.
+        is_dual_expert = (
+            hasattr(self.sd, 'is_multistage') and self.sd.is_multistage
+            and getattr(self.sd, 'train_high_noise', False)
+            and getattr(self.sd, 'train_low_noise', False)
+        )
 
-            # Apply default parameters for the selected scheduler type
-            scheduler_defaults = SCHEDULER_DEFAULT_PARAMS.get(self.train_config.lr_scheduler, {})
-            for key, default_value in scheduler_defaults.items():
-                if key not in lr_scheduler_params:
-                    lr_scheduler_params[key] = default_value
+        if is_dual_expert:
+            # ============================================================
+            # DUAL-EXPERT MODE: Create per-expert schedulers
+            # ============================================================
+            # Each expert gets its own scheduler that tracks steps based on
+            # how many times that expert was active (not global step count).
+            #
+            # Configuration logic:
+            # - If expert_X_lr_scheduler is specified: use that scheduler for expert X
+            # - If expert_X_lr_scheduler is NOT specified:
+            #   - If global lr_scheduler is specified: copy global scheduler config for expert X
+            #   - Otherwise: use 'none' for expert X
+            #
+            # Each scheduler's total_iters is set to the total training steps
+            # (not divided by 2), so if an expert is active ~50% of the time,
+            # its scheduler will complete its schedule over the full training run.
+            #
+            # Per-expert step counting is handled in SDTrainer.step().
 
-            # make sure it had bare minimum
-            if 'max_iterations' not in lr_scheduler_params:
-                # Adjust total_iters to account for gradient accumulation
-                # The scheduler should step once per optimizer step, not per training iteration
-                gradient_accumulation_steps = max(1, self.train_config.gradient_accumulation_steps)
-                if gradient_accumulation_steps == -1:
-                    # -1 means accumulate for entire epoch, difficult to predict step count
-                    # Use total steps as fallback (will step more frequently than ideal)
-                    lr_scheduler_params['total_iters'] = self.train_config.steps
+            self.expert_lr_schedulers = {}  # {"transformer_1": scheduler, "transformer_2": scheduler}
+            self.expert_step_counts = {"transformer_1": 0, "transformer_2": 0}  # track per-expert steps
+            self.use_per_expert_schedulers = True
+
+            gradient_accumulation_steps = max(1, self.train_config.gradient_accumulation_steps)
+            if gradient_accumulation_steps == -1:
+                # -1 means accumulate for entire epoch, use total steps as fallback
+                expert_total_iters = self.train_config.steps
+            else:
+                # Calculate actual number of optimizer steps
+                expert_total_iters = self.train_config.steps // gradient_accumulation_steps
+
+            # Configure scheduler for expert 1 (transformer_1, high-noise)
+            expert_1_scheduler_name = self.train_config.expert_1_lr_scheduler
+            expert_1_scheduler_params = self.train_config.expert_1_lr_scheduler_params or {}
+            if expert_1_scheduler_name is None:
+                # Use global scheduler as default
+                if self.train_config.lr_scheduler and self.train_config.lr_scheduler.lower() != 'none':
+                    expert_1_scheduler_name = self.train_config.lr_scheduler
+                    expert_1_scheduler_params = dict(self.train_config.lr_scheduler_params or {})
                 else:
-                    # Calculate actual number of optimizer steps
-                    lr_scheduler_params['total_iters'] = self.train_config.steps // gradient_accumulation_steps
+                    expert_1_scheduler_name = 'none'
 
-            lr_scheduler = get_lr_scheduler(
-                self.train_config.lr_scheduler,
-                optimizer,
-                **lr_scheduler_params
-            )
-            self.lr_scheduler = lr_scheduler
+            # Configure scheduler for expert 2 (transformer_2, low-noise)
+            expert_2_scheduler_name = self.train_config.expert_2_lr_scheduler
+            expert_2_scheduler_params = self.train_config.expert_2_lr_scheduler_params or {}
+            if expert_2_scheduler_name is None:
+                # Use global scheduler as default
+                if self.train_config.lr_scheduler and self.train_config.lr_scheduler.lower() != 'none':
+                    expert_2_scheduler_name = self.train_config.lr_scheduler
+                    expert_2_scheduler_params = dict(self.train_config.lr_scheduler_params or {})
+                else:
+                    expert_2_scheduler_name = 'none'
+
+            # Build scheduler for expert 1
+            if expert_1_scheduler_name and expert_1_scheduler_name.lower() != 'none':
+                # Apply default parameters
+                scheduler_defaults = SCHEDULER_DEFAULT_PARAMS.get(expert_1_scheduler_name, {})
+                for key, default_value in scheduler_defaults.items():
+                    if key not in expert_1_scheduler_params:
+                        expert_1_scheduler_params[key] = default_value
+                # Set total_iters for expert scheduler
+                if 'total_iters' not in expert_1_scheduler_params:
+                    expert_1_scheduler_params['total_iters'] = expert_total_iters
+                expert_1_scheduler = get_lr_scheduler(
+                    expert_1_scheduler_name, optimizer, **expert_1_scheduler_params
+                )
+                print_acc(f"Created expert_1 (high-noise) LR scheduler: {expert_1_scheduler_name} "
+                         f"with total_iters={expert_total_iters}")
+            else:
+                expert_1_scheduler = None
+                print_acc("No LR scheduler configured for expert_1 (high-noise)")
+
+            # Build scheduler for expert 2
+            if expert_2_scheduler_name and expert_2_scheduler_name.lower() != 'none':
+                # Apply default parameters
+                scheduler_defaults = SCHEDULER_DEFAULT_PARAMS.get(expert_2_scheduler_name, {})
+                for key, default_value in scheduler_defaults.items():
+                    if key not in expert_2_scheduler_params:
+                        expert_2_scheduler_params[key] = default_value
+                # Set total_iters for expert scheduler
+                if 'total_iters' not in expert_2_scheduler_params:
+                    expert_2_scheduler_params['total_iters'] = expert_total_iters
+                expert_2_scheduler = get_lr_scheduler(
+                    expert_2_scheduler_name, optimizer, **expert_2_scheduler_params
+                )
+                print_acc(f"Created expert_2 (low-noise) LR scheduler: {expert_2_scheduler_name} "
+                         f"with total_iters={expert_total_iters}")
+            else:
+                expert_2_scheduler = None
+                print_acc("No LR scheduler configured for expert_2 (low-noise)")
+
+            self.expert_lr_schedulers["transformer_1"] = expert_1_scheduler
+            self.expert_lr_schedulers["transformer_2"] = expert_2_scheduler
+
+            # Keep lr_scheduler as None to indicate we're using per-expert schedulers
+            self.lr_scheduler = None
+        else:
+            # ============================================================
+            # SINGLE-EXPERT MODE: Use global scheduler (existing behavior)
+            # ============================================================
+            self.use_per_expert_schedulers = False
+            self.expert_lr_schedulers = None
+            self.expert_step_counts = None
+
+            # Only set up lr scheduler if it is not 'none'
+            if self.train_config.lr_scheduler and self.train_config.lr_scheduler.lower() != 'none':
+                lr_scheduler_params = self.train_config.lr_scheduler_params or {}
+
+                # Apply default parameters for the selected scheduler type
+                scheduler_defaults = SCHEDULER_DEFAULT_PARAMS.get(self.train_config.lr_scheduler, {})
+                for key, default_value in scheduler_defaults.items():
+                    if key not in lr_scheduler_params:
+                        lr_scheduler_params[key] = default_value
+
+                # make sure it had bare minimum
+                if 'max_iterations' not in lr_scheduler_params:
+                    # Adjust total_iters to account for gradient accumulation
+                    # The scheduler should step once per optimizer step, not per training iteration
+                    gradient_accumulation_steps = max(1, self.train_config.gradient_accumulation_steps)
+                    if gradient_accumulation_steps == -1:
+                        # -1 means accumulate for entire epoch, difficult to predict step count
+                        # Use total steps as fallback (will step more frequently than ideal)
+                        lr_scheduler_params['total_iters'] = self.train_config.steps
+                    else:
+                        # Calculate actual number of optimizer steps
+                        lr_scheduler_params['total_iters'] = self.train_config.steps // gradient_accumulation_steps
+
+                lr_scheduler = get_lr_scheduler(
+                    self.train_config.lr_scheduler,
+                    optimizer,
+                    **lr_scheduler_params
+                )
+                self.lr_scheduler = lr_scheduler
 
         ### HOOk ###
         self.before_dataset_load()
@@ -2678,7 +2790,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             elif name == 'low_noise_loras' or name.startswith('low_noise_loras_block_'):
                                 low_noise_lr = group_lr
 
-                    if is_multistage:
+                    if self.use_per_expert_schedulers:
+                        # Per-expert scheduler mode: show LRs and step counts
+                        prog_bar_string = ""
+                        if high_noise_lr is not None:
+                            prog_bar_string += f"lr_high: {high_noise_lr:.1e} "
+                        if low_noise_lr is not None:
+                            prog_bar_string += f"lr_low: {low_noise_lr:.1e} "
+                        if self.expert_step_counts is not None:
+                            h_steps = self.expert_step_counts.get("transformer_1", 0)
+                            l_steps = self.expert_step_counts.get("transformer_2", 0)
+                            prog_bar_string += f"steps_high: {h_steps} steps_low: {l_steps} "
+                        prog_bar_string = prog_bar_string.strip()
+                    elif is_multistage:
                         prog_bar_string = ""
                         if high_noise_lr is not None:
                             prog_bar_string += f"lr_high: {high_noise_lr:.1e} "
@@ -2745,20 +2869,47 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                     if loss_dict is not None:
                                         for key, value in loss_dict.items():
                                             self.writer.add_scalar(f"{key}", value, self.step_num)
-                                        if is_multistage:
-                                            if high_noise_lr is not None:
-                                                self.writer.add_scalar(f"lr_high", high_noise_lr, self.step_num)
-                                            if low_noise_lr is not None:
-                                                self.writer.add_scalar(f"lr_low", low_noise_lr, self.step_num)
-                                        else:
-                                            self.writer.add_scalar(f"lr", learning_rate, self.step_num)
+                                    if self.use_per_expert_schedulers:
+                                        # Log per-expert LRs and step counts
+                                        if high_noise_lr is not None:
+                                            self.writer.add_scalar(f"lr_high", high_noise_lr, self.step_num)
+                                        if low_noise_lr is not None:
+                                            self.writer.add_scalar(f"lr_low", low_noise_lr, self.step_num)
+                                        # Log per-expert step counts
+                                        if self.expert_step_counts is not None:
+                                            self.writer.add_scalar(
+                                                "expert_steps/high_noise", 
+                                                self.expert_step_counts.get("transformer_1", 0), 
+                                                self.step_num
+                                            )
+                                            self.writer.add_scalar(
+                                                "expert_steps/low_noise", 
+                                                self.expert_step_counts.get("transformer_2", 0), 
+                                                self.step_num
+                                            )
+                                    elif is_multistage:
+                                        if high_noise_lr is not None:
+                                            self.writer.add_scalar(f"lr_high", high_noise_lr, self.step_num)
+                                        if low_noise_lr is not None:
+                                            self.writer.add_scalar(f"lr_low", low_noise_lr, self.step_num)
+                                    else:
+                                        self.writer.add_scalar(f"lr", learning_rate, self.step_num)
                                 if self.progress_bar is not None:
                                     self.progress_bar.unpause()
                         
                         if self.accelerator.is_main_process:
                             # log to logger
                             log_dict = {}
-                            if is_multistage:
+                            if self.use_per_expert_schedulers:
+                                if high_noise_lr is not None:
+                                    log_dict['learning_rate_high'] = high_noise_lr
+                                if low_noise_lr is not None:
+                                    log_dict['learning_rate_low'] = low_noise_lr
+                                # Log per-expert step counts
+                                if self.expert_step_counts is not None:
+                                    log_dict['expert_steps_high_noise'] = self.expert_step_counts.get("transformer_1", 0)
+                                    log_dict['expert_steps_low_noise'] = self.expert_step_counts.get("transformer_2", 0)
+                            elif is_multistage:
                                 if high_noise_lr is not None:
                                     log_dict['learning_rate_high'] = high_noise_lr
                                 if low_noise_lr is not None:
@@ -2781,7 +2932,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         if self.accelerator.is_main_process:
                             # log every step
                             log_dict = {}
-                            if is_multistage:
+                            if self.use_per_expert_schedulers:
+                                if high_noise_lr is not None:
+                                    log_dict['learning_rate_high'] = high_noise_lr
+                                if low_noise_lr is not None:
+                                    log_dict['learning_rate_low'] = low_noise_lr
+                                # Log per-expert step counts
+                                if self.expert_step_counts is not None:
+                                    log_dict['expert_steps_high_noise'] = self.expert_step_counts.get("transformer_1", 0)
+                                    log_dict['expert_steps_low_noise'] = self.expert_step_counts.get("transformer_2", 0)
+                            elif is_multistage:
                                 if high_noise_lr is not None:
                                     log_dict['learning_rate_high'] = high_noise_lr
                                 if low_noise_lr is not None:

@@ -2791,8 +2791,19 @@ class SDTrainer(BaseSDTrainProcess):
             # Step LR scheduler only when optimizer steps (not during gradient accumulation)
             # Scheduler total_iters is adjusted for gradient accumulation in BaseSDTrainProcess
             with self.timer('scheduler_step'):
-                if self.lr_scheduler is not None:
-                    self.lr_scheduler.step()
+                if self.use_per_expert_schedulers:
+                    # Dual-expert mode: step only the active expert's scheduler
+                    # and track per-expert step counts.
+                    if active_experts is not None:
+                        for expert in active_experts:
+                            expert_scheduler = self.expert_lr_schedulers.get(expert)
+                            if expert_scheduler is not None:
+                                expert_scheduler.step()
+                                self.expert_step_counts[expert] += 1
+                else:
+                    # Single-expert or non-multistage mode: use global scheduler
+                    if self.lr_scheduler is not None:
+                        self.lr_scheduler.step()
             
             # Rank gate annealing updates (after optimizer step)
             # Uses active_experts from above (same as used for EMA and LoRA freezing).

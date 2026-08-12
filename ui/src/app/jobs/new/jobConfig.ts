@@ -85,6 +85,11 @@ export const defaultJobConfig: JobConfig = {
           optimizer: 'adamw8bit',
           lr_scheduler: 'none',
           lr_scheduler_params: {},
+          // Per-expert LR schedulers for Wan 2.2 14B dual-expert models
+          expert_1_lr_scheduler: undefined,
+          expert_1_lr_scheduler_params: undefined,
+          expert_2_lr_scheduler: undefined,
+          expert_2_lr_scheduler_params: undefined,
           timestep_type: 'sigmoid',
           content_or_style: 'balanced',
           optimizer_params: {

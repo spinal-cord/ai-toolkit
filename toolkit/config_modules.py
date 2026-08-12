@@ -880,6 +880,16 @@ class TrainConfig:
         self.optimizer_params = kwargs.get('optimizer_params', {})
         self.lr_scheduler = kwargs.get('lr_scheduler', 'none')
         self.lr_scheduler_params = kwargs.get('lr_scheduler_params', {})
+        # Per-expert learning rate schedulers for dual-expert models (e.g., Wan 2.2 14B).
+        # Each expert gets its own scheduler that tracks steps based on how many times
+        # that expert was active (not global step count).
+        # If not specified, each expert will get its own copy of the global scheduler
+        # configured to work on expert-specific step counts.
+        # If specified, the per-expert scheduler config overwrites the global scheduler for that expert.
+        self.expert_1_lr_scheduler = kwargs.get('expert_1_lr_scheduler', None)  # high-noise expert
+        self.expert_1_lr_scheduler_params = kwargs.get('expert_1_lr_scheduler_params', None)
+        self.expert_2_lr_scheduler = kwargs.get('expert_2_lr_scheduler', None)  # low-noise expert
+        self.expert_2_lr_scheduler_params = kwargs.get('expert_2_lr_scheduler_params', None)
         self.min_denoising_steps: int = kwargs.get('min_denoising_steps', 0)
         self.max_denoising_steps: int = kwargs.get('max_denoising_steps', 999)
         self.batch_size: int = kwargs.get('batch_size', 1)
