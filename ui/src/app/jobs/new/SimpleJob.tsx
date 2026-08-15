@@ -2153,62 +2153,282 @@ export default function SimpleJob({
                         </p>
                       </div>
                     )}
-                    <div className="grid grid-cols-3 gap-3">
-                      <NumberInput
-                        label="Low Freq Weight"
-                        className="pt-1"
-                        value={jobConfig.config.process[0].train.spectral_low_weight ?? 1.0}
-                        onChange={value => setJobConfig(value, 'config.process[0].train.spectral_low_weight')}
-                        placeholder="1.0"
-                        docKey={'train.spectral_low_weight'}
-                        min={0}
-                        step={0.1}
-                      />
-                      <NumberInput
-                        label="Mid Freq Weight"
-                        className="pt-1"
-                        value={jobConfig.config.process[0].train.spectral_mid_weight ?? 1.0}
-                        onChange={value => setJobConfig(value, 'config.process[0].train.spectral_mid_weight')}
-                        placeholder="1.0"
-                        docKey={'train.spectral_mid_weight'}
-                        min={0}
-                        step={0.1}
-                      />
-                      <NumberInput
-                        label="High Freq Weight"
-                        className="pt-1"
-                        value={jobConfig.config.process[0].train.spectral_high_weight ?? 2.0}
-                        onChange={value => setJobConfig(value, 'config.process[0].train.spectral_high_weight')}
-                        placeholder="2.0"
-                        docKey={'train.spectral_high_weight'}
-                        min={0}
-                        step={0.1}
-                      />
+                    {/* Global Spectral Weights */}
+                    <div className="border-t border-blue-900 pt-3 mt-2">
+                      <p className="text-xs text-blue-300 mb-2">Spectral Frequency Weights (Global)</p>
+                      <div className="grid grid-cols-3 gap-3">
+                        <NumberInput
+                          label="Low Freq (structure)"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.spectral_low_weight ?? 1.0}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.spectral_low_weight')}
+                          placeholder="1.0"
+                          docKey={'train.spectral_low_weight'}
+                          min={0}
+                          step={0.1}
+                        />
+                        <NumberInput
+                          label="Mid Freq"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.spectral_mid_weight ?? 1.0}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.spectral_mid_weight')}
+                          placeholder="1.0"
+                          docKey={'train.spectral_mid_weight'}
+                          min={0}
+                          step={0.1}
+                        />
+                        <NumberInput
+                          label="High Freq (texture)"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.spectral_high_weight ?? 2.0}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.spectral_high_weight')}
+                          placeholder="2.0"
+                          docKey={'train.spectral_high_weight'}
+                          min={0}
+                          step={0.1}
+                        />
+                      </div>
                     </div>
-                    <div className="grid grid-cols-2 gap-3">
-                      <NumberInput
-                        label="Low Cutoff (0-1)"
-                        className="pt-1"
-                        value={jobConfig.config.process[0].train.spectral_low_cutoff ?? 0.15}
-                        onChange={value => setJobConfig(value, 'config.process[0].train.spectral_low_cutoff')}
-                        placeholder="0.15"
-                        docKey={'train.spectral_low_cutoff'}
-                        min={0}
-                        max={1}
-                        step={0.01}
-                      />
-                      <NumberInput
-                        label="High Cutoff (0-1)"
-                        className="pt-1"
-                        value={jobConfig.config.process[0].train.spectral_high_cutoff ?? 0.5}
-                        onChange={value => setJobConfig(value, 'config.process[0].train.spectral_high_cutoff')}
-                        placeholder="0.5"
-                        docKey={'train.spectral_high_cutoff'}
-                        min={0}
-                        max={1}
-                        step={0.01}
-                      />
+                    {/* Spectral Weight for Combined Losses */}
+                    <div className="border-t border-purple-900 pt-3 mt-2">
+                      <p className="text-xs text-purple-300 mb-2">Spectral Loss Weight (for spectral_flow / mse_spectral_flow)</p>
+                      <p className="text-xs text-gray-500 mb-2">Overall spectral component weight. Controls magnitude relative to MSE/flow. Internal band weights (above) only affect frequency balance.</p>
+                      <div className="grid grid-cols-3 gap-3">
+                        <NumberInput
+                          label="Global"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.spectral_weight ?? 1.0}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.spectral_weight')}
+                          placeholder="1.0"
+                          docKey={'train.spectral_weight'}
+                          min={0}
+                          step={0.1}
+                        />
+                        <NumberInput
+                          label="High-Noise Expert"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.spectral_weight_high ?? null}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.spectral_weight_high')}
+                          placeholder="Use global"
+                          min={0}
+                          step={0.1}
+                        />
+                        <NumberInput
+                          label="Low-Noise Expert"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.spectral_weight_low ?? null}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.spectral_weight_low')}
+                          placeholder="Use global"
+                          min={0}
+                          step={0.1}
+                        />
+                      </div>
+                      <p className="text-xs text-gray-500 mt-1">
+                        Tip: For Wan 2.2 I2V, try high-noise: 1.5 (structure), low-noise: 2.0 (texture). Use 0 to disable spectral for an expert.
+                      </p>
                     </div>
+                    {/* Per-Expert Spectral Weights */}
+                    <div className="border-t border-purple-900 pt-3 mt-2">
+                      <p className="text-xs text-purple-300 mb-2">Per-Expert Spectral Weights (MoE models like Wan 2.2 14B)</p>
+                      <p className="text-xs text-gray-500 mb-2">Override global weights per expert. Leave empty to use global weight.</p>
+                      <div className="grid grid-cols-2 gap-3">
+                        {/* High-noise expert */}
+                        <div className="border border-orange-900 rounded-lg p-3">
+                          <p className="text-xs text-orange-400 mb-2">High-Noise Expert (structure/motion)</p>
+                          <div className="space-y-2">
+                            <NumberInput
+                              label="Low Freq"
+                              className="pt-1"
+                              value={jobConfig.config.process[0].train.spectral_low_weight_high ?? null}
+                              onChange={value => setJobConfig(value, 'config.process[0].train.spectral_low_weight_high')}
+                              placeholder="Use global"
+                              docKey={'train.spectral_low_weight_high'}
+                              min={0}
+                              step={0.1}
+                            />
+                            <NumberInput
+                              label="Mid Freq"
+                              className="pt-1"
+                              value={jobConfig.config.process[0].train.spectral_mid_weight_high ?? null}
+                              onChange={value => setJobConfig(value, 'config.process[0].train.spectral_mid_weight_high')}
+                              placeholder="Use global"
+                              docKey={'train.spectral_mid_weight_high'}
+                              min={0}
+                              step={0.1}
+                            />
+                            <NumberInput
+                              label="High Freq"
+                              className="pt-1"
+                              value={jobConfig.config.process[0].train.spectral_high_weight_high ?? null}
+                              onChange={value => setJobConfig(value, 'config.process[0].train.spectral_high_weight_high')}
+                              placeholder="Use global"
+                              docKey={'train.spectral_high_weight_high'}
+                              min={0}
+                              step={0.1}
+                            />
+                          </div>
+                        </div>
+                        {/* Low-noise expert */}
+                        <div className="border border-green-900 rounded-lg p-3">
+                          <p className="text-xs text-green-400 mb-2">Low-Noise Expert (texture/details)</p>
+                          <div className="space-y-2">
+                            <NumberInput
+                              label="Low Freq"
+                              className="pt-1"
+                              value={jobConfig.config.process[0].train.spectral_low_weight_low ?? null}
+                              onChange={value => setJobConfig(value, 'config.process[0].train.spectral_low_weight_low')}
+                              placeholder="Use global"
+                              docKey={'train.spectral_low_weight_low'}
+                              min={0}
+                              step={0.1}
+                            />
+                            <NumberInput
+                              label="Mid Freq"
+                              className="pt-1"
+                              value={jobConfig.config.process[0].train.spectral_mid_weight_low ?? null}
+                              onChange={value => setJobConfig(value, 'config.process[0].train.spectral_mid_weight_low')}
+                              placeholder="Use global"
+                              docKey={'train.spectral_mid_weight_low'}
+                              min={0}
+                              step={0.1}
+                            />
+                            <NumberInput
+                              label="High Freq"
+                              className="pt-1"
+                              value={jobConfig.config.process[0].train.spectral_high_weight_low ?? null}
+                              onChange={value => setJobConfig(value, 'config.process[0].train.spectral_high_weight_low')}
+                              placeholder="Use global"
+                              docKey={'train.spectral_high_weight_low'}
+                              min={0}
+                              step={0.1}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                      <p className="text-xs text-gray-500 mt-2">
+                        Tip: For Wan 2.2 I2V, try high-noise: low=1.5, high=0.5 (structure-first). Low-noise: low=1.0, high=2.5 (texture-first).
+                      </p>
+                    </div>
+                    {/* Frequency Cutoffs */}
+                    <div className="border-t border-blue-900 pt-3 mt-2">
+                      <p className="text-xs text-blue-300 mb-2">Frequency Band Cutoffs (Global)</p>
+                      <div className="grid grid-cols-2 gap-3">
+                        <NumberInput
+                          label="Low Cutoff (0-1)"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.spectral_low_cutoff ?? 0.15}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.spectral_low_cutoff')}
+                          placeholder="0.15"
+                          docKey={'train.spectral_low_cutoff'}
+                          min={0}
+                          max={1}
+                          step={0.01}
+                        />
+                        <NumberInput
+                          label="High Cutoff (0-1)"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.spectral_high_cutoff ?? 0.5}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.spectral_high_cutoff')}
+                          placeholder="0.5"
+                          docKey={'train.spectral_high_cutoff'}
+                          min={0}
+                          max={1}
+                          step={0.01}
+                        />
+                      </div>
+                      {/* Per-Expert Cutoffs */}
+                      <div className="grid grid-cols-2 gap-3 mt-2">
+                        <div className="border border-orange-900 rounded-lg p-3">
+                          <p className="text-xs text-orange-400 mb-2">High-Noise Expert Cutoffs</p>
+                          <div className="grid grid-cols-2 gap-2">
+                            <NumberInput
+                              label="Low"
+                              className="pt-1"
+                              value={jobConfig.config.process[0].train.spectral_low_cutoff_high ?? null}
+                              onChange={value => setJobConfig(value, 'config.process[0].train.spectral_low_cutoff_high')}
+                              placeholder="Global"
+                              min={0}
+                              max={1}
+                              step={0.01}
+                            />
+                            <NumberInput
+                              label="High"
+                              className="pt-1"
+                              value={jobConfig.config.process[0].train.spectral_high_cutoff_high ?? null}
+                              onChange={value => setJobConfig(value, 'config.process[0].train.spectral_high_cutoff_high')}
+                              placeholder="Global"
+                              min={0}
+                              max={1}
+                              step={0.01}
+                            />
+                          </div>
+                        </div>
+                        <div className="border border-green-900 rounded-lg p-3">
+                          <p className="text-xs text-green-400 mb-2">Low-Noise Expert Cutoffs</p>
+                          <div className="grid grid-cols-2 gap-2">
+                            <NumberInput
+                              label="Low"
+                              className="pt-1"
+                              value={jobConfig.config.process[0].train.spectral_low_cutoff_low ?? null}
+                              onChange={value => setJobConfig(value, 'config.process[0].train.spectral_low_cutoff_low')}
+                              placeholder="Global"
+                              min={0}
+                              max={1}
+                              step={0.01}
+                            />
+                            <NumberInput
+                              label="High"
+                              className="pt-1"
+                              value={jobConfig.config.process[0].train.spectral_high_cutoff_low ?? null}
+                              onChange={value => setJobConfig(value, 'config.process[0].train.spectral_high_cutoff_low')}
+                              placeholder="Global"
+                              min={0}
+                              max={1}
+                              step={0.01}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                    {/* Temporal Scale */}
+                    <div className="border-t border-blue-900 pt-3 mt-2">
+                      <p className="text-xs text-blue-300 mb-2">Temporal Scale (Video)</p>
+                      <div className="grid grid-cols-3 gap-3">
+                        <NumberInput
+                          label="Global"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.spectral_temporal_scale ?? 0.3}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.spectral_temporal_scale')}
+                          placeholder="0.3"
+                          docKey={'train.spectral_temporal_scale'}
+                          min={0}
+                          max={1}
+                          step={0.1}
+                        />
+                        <NumberInput
+                          label="High-Noise Expert"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.spectral_temporal_scale_high ?? null}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.spectral_temporal_scale_high')}
+                          placeholder="Use global"
+                          min={0}
+                          max={1}
+                          step={0.1}
+                        />
+                        <NumberInput
+                          label="Low-Noise Expert"
+                          className="pt-1"
+                          value={jobConfig.config.process[0].train.spectral_temporal_scale_low ?? null}
+                          onChange={value => setJobConfig(value, 'config.process[0].train.spectral_temporal_scale_low')}
+                          placeholder="Use global"
+                          min={0}
+                          max={1}
+                          step={0.1}
+                        />
+                      </div>
+                      <p className="text-xs text-gray-500 mt-1">Controls temporal frequency contribution. 0.3 = recommended. Lower = less temporal penalty (less jitter). Higher = more temporal smoothness.</p>
+                    </div>
+                    {/* Phase checkbox */}
                     <div className="flex items-center space-x-2 pt-1">
                       <input
                         type="checkbox"

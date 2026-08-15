@@ -340,11 +340,15 @@ def spectral_loss(
     Returns:
         Loss tensor with same shape as input latents
     """
+    # Early exit: if all weights are zero, skip computation entirely
+    if low_weight == 0 and mid_weight == 0 and high_weight == 0:
+        return torch.zeros_like(latents)
+
     # Convert to float32 for FFT stability
     model_pred = model_pred.float()
     latents = latents.float()
     noise = noise.float()
-    
+
     # Reconstruct predicted clean latents based on prediction target:
     # - velocity: model_pred = ε - x₀ ⇒ x₀ = ε - model_pred = noise - model_pred
     # - x0: model_pred = x₀ directly
@@ -909,6 +913,7 @@ def spectral_flow_loss(
     spectral_transform='dct',  # 'dct' (default, SSVAE-compliant) or 'fft'
     prediction_target='velocity',  # 'velocity' or 'x0'
     temporal_scale=0.3,  # Scale temporal frequency for video (0.0-1.0)
+    spectral_weight=1.0,  # Overall spectral component weight (scales entire spectral loss)
     # Flow params
     flow_weight=0.1,
     flow_max_timestep=800,
@@ -978,7 +983,10 @@ def spectral_flow_loss(
     #
     # The 2D implementation is preserved in comments below for reference.
 
-    if is_video:
+    # Early exit for spectral component if all weights are zero
+    if low_weight == 0 and mid_weight == 0 and high_weight == 0:
+        loss_spatial = torch.zeros_like(latents)
+    elif is_video:
         # Choose transform based on config
         if spectral_transform == 'dct':
             loss_spatial = _spectral_loss_3d_video_dct(
@@ -1178,7 +1186,7 @@ def spectral_flow_loss(
 
     # Keep spectral and flow components separate so rejection can zero only
     # the flow gradient without killing the spectral learning signal.
-    spectral_component = loss_spatial
+    spectral_component = loss_spatial * spectral_weight
     flow_component = flow_loss * effective_flow_weight
     total_loss = spectral_component + flow_component
 
@@ -1188,7 +1196,7 @@ def spectral_flow_loss(
     flow_component = flow_component.to(original_dtype)
     total_loss = total_loss.to(original_dtype)
 
-    return (total_loss, flow_deviation, loss_spatial.mean().item(),
+    return (total_loss, flow_deviation, loss_spatial.mean().item() * spectral_weight,
             flow_loss.item() * effective_flow_weight,
             spectral_component, flow_component)
 
@@ -1215,6 +1223,7 @@ def mse_spectral_flow_loss(
     spectral_transform='dct',  # 'dct' (default, SSVAE-compliant) or 'fft'
     prediction_target='velocity',  # 'velocity' or 'x0'
     temporal_scale=0.3,  # Scale temporal frequency for video (0.0-1.0)
+    spectral_weight=1.0,  # Overall spectral component weight (scales entire spectral loss)
     # Flow params
     flow_weight=0.1,
     flow_max_timestep=800,
@@ -1267,10 +1276,17 @@ def mse_spectral_flow_loss(
 
     # === MSE LOSS ===
     # Standard MSE between predicted and target latents
-    mse_loss = F.mse_loss(pred_latents, latents, reduction='none')  # (B, C, T, H, W) or (B, C, H, W)
+    # Early exit if weight is zero to skip unnecessary computation
+    if mse_weight == 0:
+        mse_loss = torch.zeros_like(latents)
+    else:
+        mse_loss = F.mse_loss(pred_latents, latents, reduction='none')  # (B, C, T, H, W) or (B, C, H, W)
 
     # === SPECTRAL LOSS ===
-    if is_video:
+    # Early exit for spectral component if all weights are zero
+    if low_weight == 0 and mid_weight == 0 and high_weight == 0:
+        loss_spatial = torch.zeros_like(latents)
+    elif is_video:
         # Choose transform based on config
         if spectral_transform == 'dct':
             loss_spatial = _spectral_loss_3d_video_dct(
@@ -1409,7 +1425,7 @@ def mse_spectral_flow_loss(
 
     # Keep all three components separate so PCGrad can project all three gradients
     mse_component = mse_loss * mse_weight
-    spectral_component = loss_spatial
+    spectral_component = loss_spatial * spectral_weight
     flow_component = flow_loss * effective_flow_weight
     total_loss = mse_component + spectral_component + flow_component
 
@@ -1422,6 +1438,6 @@ def mse_spectral_flow_loss(
 
     return (total_loss, flow_deviation,
             mse_loss.mean().item() * mse_weight,
-            loss_spatial.mean().item(),
+            loss_spatial.mean().item() * spectral_weight,
             flow_loss.item() * effective_flow_weight,
             mse_component, spectral_component, flow_component)

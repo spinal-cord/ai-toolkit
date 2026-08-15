@@ -255,7 +255,7 @@ export interface TrainConfig {
   switch_boundary_every: number;
   loss_type: 'mse' | 'mae' | 'wavelet' | 'spectral' | 'spectral_flow' | 'stepped' | 'mean_flow' | 'pseudo_huber';
   pseudo_huber_c?: number;
-  // Spectral loss config
+  // Spectral loss config - global weights (fallback for single-expert models)
   spectral_low_weight?: number;
   spectral_mid_weight?: number;
   spectral_high_weight?: number;
@@ -263,8 +263,31 @@ export interface TrainConfig {
   spectral_high_cutoff?: number;
   spectral_use_phase?: boolean;
   spectral_lcr_weight?: number;
+  spectral_transform?: string;
+  spectral_temporal_scale?: number;
+  // Spectral loss config - per-expert weights (MoE models like Wan 2.2 14B)
+  spectral_low_weight_high?: number | null;
+  spectral_mid_weight_high?: number | null;
+  spectral_high_weight_high?: number | null;
+  spectral_low_weight_low?: number | null;
+  spectral_mid_weight_low?: number | null;
+  spectral_high_weight_low?: number | null;
+  // Per-expert frequency cutoffs (optional override)
+  spectral_low_cutoff_high?: number | null;
+  spectral_high_cutoff_high?: number | null;
+  spectral_low_cutoff_low?: number | null;
+  spectral_high_cutoff_low?: number | null;
+  // Per-expert temporal scale (optional override)
+  spectral_temporal_scale_high?: number | null;
+  spectral_temporal_scale_low?: number | null;
+  // Spectral loss weight for combined losses (spectral_flow, mse_spectral_flow)
+  spectral_weight?: number;
+  spectral_weight_high?: number | null;
+  spectral_weight_low?: number | null;
   // Spectral flow loss config
   spectral_flow_weight?: number;
+  spectral_flow_weight_low?: number | null;
+  spectral_flow_weight_high?: number | null;
   spectral_flow_max_timestep?: number;
   spectral_flow_reverse_gate?: boolean;
   spectral_flow_motion_weighted?: boolean;

@@ -1029,11 +1029,32 @@ class TrainConfig:
         # Spectral loss config - frequency dissociation and balancing
         # Low freq = structure/motion, High freq = texture/details
         # Inspired by SSVAE research on latent spectral biasing for superior diffusability
+        # GLOBAL weights (used for single-expert models or as fallback)
         self.spectral_low_weight = kwargs.get('spectral_low_weight', 1.0)   # structure/motion weight
         self.spectral_mid_weight = kwargs.get('spectral_mid_weight', 1.0)   # mid frequencies weight
         self.spectral_high_weight = kwargs.get('spectral_high_weight', 2.0) # texture/details weight (emphasize)
+        
+        # PER-EXPERT spectral weights (Wan 2.2 14B and other MoE models)
+        # For high-noise expert (t > boundary): focus on structure/motion
+        self.spectral_low_weight_high = kwargs.get('spectral_low_weight_high', None)
+        self.spectral_mid_weight_high = kwargs.get('spectral_mid_weight_high', None)
+        self.spectral_high_weight_high = kwargs.get('spectral_high_weight_high', None)
+        # For low-noise expert (t <= boundary): focus on texture/details
+        self.spectral_low_weight_low = kwargs.get('spectral_low_weight_low', None)
+        self.spectral_mid_weight_low = kwargs.get('spectral_mid_weight_low', None)
+        self.spectral_high_weight_low = kwargs.get('spectral_high_weight_low', None)
+        
+        # PER-EXPERT frequency cutoffs (optional override)
+        # Allow different band boundaries per expert if desired
+        self.spectral_low_cutoff_high = kwargs.get('spectral_low_cutoff_high', None)
+        self.spectral_high_cutoff_high = kwargs.get('spectral_high_cutoff_high', None)
+        self.spectral_low_cutoff_low = kwargs.get('spectral_low_cutoff_low', None)
+        self.spectral_high_cutoff_low = kwargs.get('spectral_high_cutoff_low', None)
+        
+        # Global frequency cutoffs (fallback)
         self.spectral_low_cutoff = kwargs.get('spectral_low_cutoff', 0.15)  # radius separating low/mid freq
         self.spectral_high_cutoff = kwargs.get('spectral_high_cutoff', 0.5) # radius separating mid/high freq
+        
         self.spectral_use_phase = kwargs.get('spectral_use_phase', True)    # use phase info (more accurate)
         self.spectral_lcr_weight = kwargs.get('spectral_lcr_weight', 0.0)   # SSVAE LCR weight (0.0 = disabled)
         self.spectral_transform = kwargs.get('spectral_transform', 'dct')   # 'dct' (default, SSVAE-compliant) or 'fft'
@@ -1044,7 +1065,20 @@ class TrainConfig:
         # 1.0 = pure spherical (all dims equal, can cause motion artifacts)
         # 0.3 = recommended for video (temporal down-weighted)
         # 0.0 = spatial-only (ignores temporal frequency)
+        # PER-EXPERT temporal scale (optional)
+        self.spectral_temporal_scale_high = kwargs.get('spectral_temporal_scale_high', None)
+        self.spectral_temporal_scale_low = kwargs.get('spectral_temporal_scale_low', None)
+        # Global temporal scale (fallback)
         self.spectral_temporal_scale = kwargs.get('spectral_temporal_scale', 0.3)
+
+        # Spectral loss weight for combined losses (spectral_flow, mse_spectral_flow)
+        # Controls overall spectral component magnitude relative to MSE/flow
+        # Note: spectral_low/mid/high_weight control internal frequency balance only
+        # GLOBAL spectral weight (used for single-expert models or as fallback)
+        self.spectral_weight = kwargs.get('spectral_weight', 1.0)  # global spectral weight (fallback)
+        # PER-EXPERT spectral weights (MoE models like Wan 2.2 14B)
+        self.spectral_weight_high = kwargs.get('spectral_weight_high', None)  # per-expert spectral weight for high noise
+        self.spectral_weight_low = kwargs.get('spectral_weight_low', None)    # per-expert spectral weight for low noise
 
         # Spectral flow loss config - combines spectral (spatial frequency) + optical flow (temporal motion)
         # Flow loss weight: 0.05-0.15 recommended for Wan 2.2 I2V LoRA

@@ -629,6 +629,73 @@ class SDTrainer(BaseSDTrainProcess):
                 return "high" if active == "transformer_1" else "low"
         return "single"
 
+    def _get_expert_spectral_params(self):
+        """
+        Get spectral loss parameters for the currently active expert.
+        
+        Returns per-expert weights if configured, otherwise falls back to global weights.
+        This allows different frequency emphasis for high-noise (structure) vs
+        low-noise (texture) experts in MoE models like Wan 2.2 14B.
+        
+        Returns:
+            dict with keys: low_weight, mid_weight, high_weight,
+                           low_cutoff, high_cutoff, temporal_scale,
+                           spectral_weight
+        """
+        expert = self._get_active_expert_label()
+        tc = self.train_config
+        
+        # Determine overall spectral weight (scales entire spectral component)
+        if expert == "low":
+            spectral_w = tc.spectral_weight_low if tc.spectral_weight_low is not None else tc.spectral_weight
+        elif expert == "high":
+            spectral_w = tc.spectral_weight_high if tc.spectral_weight_high is not None else tc.spectral_weight
+        else:  # single
+            spectral_w = tc.spectral_weight
+        
+        # Determine per-band weights
+        if expert == "low":
+            low_w = tc.spectral_low_weight_low if tc.spectral_low_weight_low is not None else tc.spectral_low_weight
+            mid_w = tc.spectral_mid_weight_low if tc.spectral_mid_weight_low is not None else tc.spectral_mid_weight
+            high_w = tc.spectral_high_weight_low if tc.spectral_high_weight_low is not None else tc.spectral_high_weight
+        elif expert == "high":
+            low_w = tc.spectral_low_weight_high if tc.spectral_low_weight_high is not None else tc.spectral_low_weight
+            mid_w = tc.spectral_mid_weight_high if tc.spectral_mid_weight_high is not None else tc.spectral_mid_weight
+            high_w = tc.spectral_high_weight_high if tc.spectral_high_weight_high is not None else tc.spectral_high_weight
+        else:  # single
+            low_w = tc.spectral_low_weight
+            mid_w = tc.spectral_mid_weight
+            high_w = tc.spectral_high_weight
+        
+        # Determine cutoffs
+        if expert == "low":
+            low_c = tc.spectral_low_cutoff_low if tc.spectral_low_cutoff_low is not None else tc.spectral_low_cutoff
+            high_c = tc.spectral_high_cutoff_low if tc.spectral_high_cutoff_low is not None else tc.spectral_high_cutoff
+        elif expert == "high":
+            low_c = tc.spectral_low_cutoff_high if tc.spectral_low_cutoff_high is not None else tc.spectral_low_cutoff
+            high_c = tc.spectral_high_cutoff_high if tc.spectral_high_cutoff_high is not None else tc.spectral_high_cutoff
+        else:  # single
+            low_c = tc.spectral_low_cutoff
+            high_c = tc.spectral_high_cutoff
+        
+        # Determine temporal scale
+        if expert == "low":
+            t_scale = tc.spectral_temporal_scale_low if tc.spectral_temporal_scale_low is not None else tc.spectral_temporal_scale
+        elif expert == "high":
+            t_scale = tc.spectral_temporal_scale_high if tc.spectral_temporal_scale_high is not None else tc.spectral_temporal_scale
+        else:  # single
+            t_scale = tc.spectral_temporal_scale
+        
+        return {
+            'low_weight': low_w,
+            'mid_weight': mid_w,
+            'high_weight': high_w,
+            'low_cutoff': low_c,
+            'high_cutoff': high_c,
+            'temporal_scale': t_scale,
+            'spectral_weight': spectral_w,
+        }
+
     def _gradient_projection_backward(self, spectral_loss, flow_loss, mse_loss=None):
         """Compute gradients for losses separately, then project (PCGrad).
         
@@ -1367,20 +1434,22 @@ class SDTrainer(BaseSDTrainProcess):
             elif self.train_config.loss_type == "wavelet":
                 loss = wavelet_loss(pred, batch.latents, noise)
             elif self.train_config.loss_type == "spectral":
+                # Get per-expert spectral parameters
+                spec_params = self._get_expert_spectral_params()
                 loss = spectral_loss(
                     pred,
                     batch.latents,
                     noise,
-                    low_weight=self.train_config.spectral_low_weight,
-                    mid_weight=self.train_config.spectral_mid_weight,
-                    high_weight=self.train_config.spectral_high_weight,
-                    low_cutoff=self.train_config.spectral_low_cutoff,
-                    high_cutoff=self.train_config.spectral_high_cutoff,
+                    low_weight=spec_params['low_weight'],
+                    mid_weight=spec_params['mid_weight'],
+                    high_weight=spec_params['high_weight'],
+                    low_cutoff=spec_params['low_cutoff'],
+                    high_cutoff=spec_params['high_cutoff'],
                     use_phase=self.train_config.spectral_use_phase,
                     lcr_weight=self.train_config.spectral_lcr_weight,
                     spectral_transform=self.train_config.spectral_transform,
                     prediction_target=self.train_config.prediction_target,
-                    temporal_scale=self.train_config.spectral_temporal_scale,
+                    temporal_scale=spec_params['temporal_scale'],
                 )
             elif self.train_config.loss_type == "spectral_flow":
                 # Combined spectral (spatial frequency) + optical flow (temporal motion) loss
@@ -1395,20 +1464,22 @@ class SDTrainer(BaseSDTrainProcess):
                     if self.accelerator.is_main_process:
                         print_acc("[WARN] spectral_flow loss is incompatible with x0_pred mode. "
                                   "Falling back to spectral loss.")
+                    # Get per-expert spectral parameters
+                    spec_params = self._get_expert_spectral_params()
                     loss = spectral_loss(
                         pred,
                         batch.latents,
                         noise,
-                        low_weight=self.train_config.spectral_low_weight,
-                        mid_weight=self.train_config.spectral_mid_weight,
-                        high_weight=self.train_config.spectral_high_weight,
-                        low_cutoff=self.train_config.spectral_low_cutoff,
-                        high_cutoff=self.train_config.spectral_high_cutoff,
+                        low_weight=spec_params['low_weight'],
+                        mid_weight=spec_params['mid_weight'],
+                        high_weight=spec_params['high_weight'],
+                        low_cutoff=spec_params['low_cutoff'],
+                        high_cutoff=spec_params['high_cutoff'],
                         use_phase=self.train_config.spectral_use_phase,
                         lcr_weight=self.train_config.spectral_lcr_weight,
                         spectral_transform=self.train_config.spectral_transform,
                         prediction_target=self.train_config.prediction_target,
-                        temporal_scale=self.train_config.spectral_temporal_scale,
+                        temporal_scale=spec_params['temporal_scale'],
                     )
                     # Continue with standard loss handling below (falls through)
                 else:
@@ -1428,6 +1499,9 @@ class SDTrainer(BaseSDTrainProcess):
                     # Issue #1 fix: use per-expert current_flow_weight (adaptive adjustment)
                     expert_flow_weight = self.current_flow_weight.get(expert, base_flow_weight)
 
+                    # Get per-expert spectral parameters
+                    spec_params = self._get_expert_spectral_params()
+
                     (total_loss, flow_dev, spatial_val, flow_val,
                      spectral_component, flow_component) = spectral_flow_loss(
                         model_pred=pred,
@@ -1438,16 +1512,17 @@ class SDTrainer(BaseSDTrainProcess):
                         flow_loss_module=self.flow_loss_module,
                         vae_temporal_stride=vae_ts,
                         vae_spatial_stride=vae_ss,
-                        low_weight=self.train_config.spectral_low_weight,
-                        mid_weight=self.train_config.spectral_mid_weight,
-                        high_weight=self.train_config.spectral_high_weight,
-                        low_cutoff=self.train_config.spectral_low_cutoff,
-                        high_cutoff=self.train_config.spectral_high_cutoff,
+                        low_weight=spec_params['low_weight'],
+                        mid_weight=spec_params['mid_weight'],
+                        high_weight=spec_params['high_weight'],
+                        low_cutoff=spec_params['low_cutoff'],
+                        high_cutoff=spec_params['high_cutoff'],
                         use_phase=self.train_config.spectral_use_phase,
                         lcr_weight=self.train_config.spectral_lcr_weight,
                         spectral_transform=self.train_config.spectral_transform,
                         prediction_target=self.train_config.prediction_target,
-                        temporal_scale=self.train_config.spectral_temporal_scale,
+                        temporal_scale=spec_params['temporal_scale'],
+                        spectral_weight=spec_params['spectral_weight'],
                         flow_weight=base_flow_weight,
                         flow_max_timestep=self.train_config.spectral_flow_max_timestep,
                         motion_weighted=self.train_config.spectral_flow_motion_weighted,
@@ -1636,20 +1711,22 @@ class SDTrainer(BaseSDTrainProcess):
                     if self.accelerator.is_main_process:
                         print_acc("[WARN] mse_spectral_flow loss is incompatible with x0_pred mode. "
                                   "Falling back to spectral loss.")
+                    # Get per-expert spectral parameters
+                    spec_params = self._get_expert_spectral_params()
                     loss = spectral_loss(
                         pred=pred,
                         latents=batch.latents,
                         noise=noise,
-                        low_weight=self.train_config.spectral_low_weight,
-                        mid_weight=self.train_config.spectral_mid_weight,
-                        high_weight=self.train_config.spectral_high_weight,
-                        low_cutoff=self.train_config.spectral_low_cutoff,
-                        high_cutoff=self.train_config.spectral_high_cutoff,
+                        low_weight=spec_params['low_weight'],
+                        mid_weight=spec_params['mid_weight'],
+                        high_weight=spec_params['high_weight'],
+                        low_cutoff=spec_params['low_cutoff'],
+                        high_cutoff=spec_params['high_cutoff'],
                         use_phase=self.train_config.spectral_use_phase,
                         lcr_weight=self.train_config.spectral_lcr_weight,
                         spectral_transform=self.train_config.spectral_transform,
                         prediction_target=self.train_config.prediction_target,
-                        temporal_scale=self.train_config.spectral_temporal_scale,
+                        temporal_scale=spec_params['temporal_scale'],
                     )
                 else:
                     vae_ts = self.flow_loss_module.vae_temporal_stride if self.flow_loss_module else 4
@@ -1675,6 +1752,9 @@ class SDTrainer(BaseSDTrainProcess):
                     # Issue #1 fix: use per-expert current_flow_weight (adaptive adjustment)
                     expert_flow_weight = self.current_flow_weight.get(expert, base_flow_weight)
 
+                    # Get per-expert spectral parameters
+                    spec_params = self._get_expert_spectral_params()
+
                     (total_loss, flow_dev, mse_val, spatial_val, flow_val,
                      mse_component, spectral_component, flow_component) = mse_spectral_flow_loss(
                         model_pred=pred,
@@ -1686,16 +1766,17 @@ class SDTrainer(BaseSDTrainProcess):
                         vae_temporal_stride=vae_ts,
                         vae_spatial_stride=vae_ss,
                         mse_weight=base_mse_weight,
-                        low_weight=self.train_config.spectral_low_weight,
-                        mid_weight=self.train_config.spectral_mid_weight,
-                        high_weight=self.train_config.spectral_high_weight,
-                        low_cutoff=self.train_config.spectral_low_cutoff,
-                        high_cutoff=self.train_config.spectral_high_cutoff,
+                        low_weight=spec_params['low_weight'],
+                        mid_weight=spec_params['mid_weight'],
+                        high_weight=spec_params['high_weight'],
+                        low_cutoff=spec_params['low_cutoff'],
+                        high_cutoff=spec_params['high_cutoff'],
                         use_phase=self.train_config.spectral_use_phase,
                         lcr_weight=self.train_config.spectral_lcr_weight,
                         spectral_transform=self.train_config.spectral_transform,
                         prediction_target=self.train_config.prediction_target,
-                        temporal_scale=self.train_config.spectral_temporal_scale,
+                        temporal_scale=spec_params['temporal_scale'],
+                        spectral_weight=spec_params['spectral_weight'],
                         flow_weight=base_flow_weight,
                         flow_max_timestep=self.train_config.spectral_flow_max_timestep,
                         motion_weighted=self.train_config.spectral_flow_motion_weighted,
