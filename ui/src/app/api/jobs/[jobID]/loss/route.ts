@@ -10,6 +10,23 @@ export const runtime = 'nodejs';
 
 const prisma = new PrismaClient();
 
+// Metrics to exclude from the loss graph API (internal counters, not useful for visualization)
+const HIDDEN_METRICS = new Set([
+  'expert_steps_low_noise',
+  'expert_steps_high_noise',
+  'grad_proj/step_projections',
+  'grad_proj/total_conflicts',
+  'grad_proj/step_conflicts',
+  'grad_proj/total_projections',
+  'loss_high/flow_weight',
+  'loss_low/flow_weight',
+  'loss_high/mse_weight',
+  'loss_low/mse_weight',
+  'loss_high/flow_rejections',
+  'loss_low/flow_rejections',
+  'loss_low/step_rejections',
+]);
+
 function openDb(filename: string) {
   const db = new sqlite3.Database(filename);
   db.configure('busyTimeout', 30_000);
@@ -59,7 +76,10 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
 
   try {
     const keysRows = await all<{ key: string }>(db, `SELECT key FROM metric_keys ORDER BY key ASC`);
-    const keys = keysRows.map((r) => r.key);
+    // Filter out hidden metrics server-side to reduce data transfer
+    const keys = keysRows
+      .map((r) => r.key)
+      .filter((k) => !HIDDEN_METRICS.has(k));
 
     const points = await all<{
       step: number;

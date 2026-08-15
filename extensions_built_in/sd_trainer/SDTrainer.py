@@ -35,7 +35,7 @@ from diffusers import EMAModel
 import math
 from toolkit.train_tools import precondition_model_outputs_flow_match
 from toolkit.models.diffusion_feature_extraction import DiffusionFeatureExtractor, load_dfe
-from toolkit.util.losses import wavelet_loss, stepped_loss, spectral_loss, spectral_flow_loss
+from toolkit.util.losses import wavelet_loss, stepped_loss, spectral_loss, spectral_flow_loss, mse_spectral_flow_loss
 import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
 from PIL import Image
@@ -64,6 +64,13 @@ class SDTrainer(BaseSDTrainProcess):
         self.batch_negative_prompt: Union[List[str], None] = None
 
         self.is_bfloat = self.train_config.dtype == "bfloat16" or self.train_config.dtype == "bf16"
+        
+        # Disable donated buffers when using gradient projection with compiled models.
+        # PyTorch's compiler uses donated buffers for memory optimization, but
+        # retain_graph=True in backward() conflicts with this optimization.
+        if (self.train_config.spectral_flow_gradient_projection_enabled or
+            self.train_config.mse_spectral_flow_gradient_projection_enabled):
+            torch._functorch.config.donated_buffer = False
         
         # Rank gate annealing (SparseForge-inspired)
         self.rank_gates_scheduler: Optional[QuenchSchedule] = None
@@ -97,6 +104,27 @@ class SDTrainer(BaseSDTrainProcess):
         self.flow_deviation_history = {}      # {expert_label: [...]}
         self.current_flow_weight = {}         # {expert_label: float}
         self.flow_rejection_count = {}        # {expert_label: int}
+        # Step loss rejection state
+        self.prev_expert_loss = {}            # {expert_label: float} - previous step loss per expert
+        self.prev_expert_spatial_loss = {}    # {expert_label: float} - previous step spectral loss
+        self.prev_expert_flow_loss = {}       # {expert_label: float} - previous step flow loss
+        self.prev_expert_mse_loss = {}        # {expert_label: float} - previous step MSE loss
+        self.step_rejection_count = {}        # {expert_label: int} - cumulative step rejections
+        self.current_step_expert_loss = {}    # {expert_label: float} - accumulated loss for current step
+        self.current_step_expert_spatial = {} # {expert_label: float} - accumulated spectral loss
+        self.current_step_expert_flow = {}    # {expert_label: float} - accumulated flow loss
+        self.current_step_expert_mse = {}     # {expert_label: float} - accumulated MSE loss
+        # Gradient projection state
+        self.gradient_projection_stats = {
+            'total_conflicts': 0,      # cumulative conflicts detected
+            'total_projections': 0,    # cumulative projections applied
+            'step_conflicts': 0,       # conflicts in current step (reset each step)
+            'step_projections': 0      # projections in current step (reset each step)
+        }
+        # Temporary storage for gradient projection
+        self._mse_loss_tensor = None       # Loss tensor for MSE component (for gradient projection)
+        self._spectral_loss_tensor = None  # Loss tensor for spectral component (for gradient projection)
+        self._flow_loss_tensor = None      # Loss tensor for flow component (for gradient projection)
         
         if self.train_config.diff_output_preservation:
             if self.trigger_word is None:
@@ -601,6 +629,310 @@ class SDTrainer(BaseSDTrainProcess):
                 return "high" if active == "transformer_1" else "low"
         return "single"
 
+    def _gradient_projection_backward(self, spectral_loss, flow_loss, mse_loss=None):
+        """Compute gradients for losses separately, then project (PCGrad).
+        
+        This implements gradient projection (PCGrad) to resolve conflicts between
+        loss objectives. When gradients conflict, each gradient is projected to remove
+        the component that would worsen other losses.
+        
+        Supports both 2-loss (spectral+flow) and 3-loss (mse+spectral+flow) modes.
+        
+        Uses torch.autograd.grad() instead of .backward() to avoid in-place modifications
+        to shared computation graph intermediates (critical for compiled models).
+        
+        Handles gradient accumulation correctly by preserving accumulated gradients from
+        previous batches while computing per-batch projected gradients.
+        
+        Args:
+            spectral_loss: scalar loss tensor for spectral component
+            flow_loss: scalar loss tensor for flow component
+            mse_loss: scalar loss tensor for MSE component (optional, for mse_spectral_flow)
+        """
+        # Collect all parameters that need gradients
+        params = []
+        for param_group in self.optimizer.param_groups:
+            for param in param_group['params']:
+                if param.requires_grad:
+                    params.append(param)
+        
+        if not params:
+            # Fallback to normal backward
+            if mse_loss is not None:
+                self.accelerator.backward(spectral_loss + flow_loss + mse_loss)
+            else:
+                self.accelerator.backward(spectral_loss + flow_loss)
+            return
+        
+        # Save currently accumulated gradients (from previous batches in accumulation loop)
+        # These must be preserved - we only want to compute and project THIS batch's gradients
+        saved_grads = {}
+        for p in params:
+            if p.grad is not None:
+                saved_grads[p] = p.grad.clone()
+            else:
+                saved_grads[p] = None
+        
+        # Helper function: compute gradient of a loss w.r.t. params using autograd.grad()
+        # This avoids in-place modifications to shared computation graph intermediates
+        def compute_grad(loss_tensor):
+            """Compute gradient dict for a loss using torch.autograd.grad()."""
+            grads = torch.autograd.grad(
+                loss_tensor, params, retain_graph=True, allow_unused=True
+            )
+            grad_dict = {}
+            for p, g in zip(params, grads):
+                if g is not None:
+                    grad_dict[p] = g.clone()
+            return grad_dict
+        
+        is_three_loss = mse_loss is not None
+        
+        if is_three_loss:
+            # === 3-LOSS MODE: MSE + Spectral + Flow ===
+            # Use autograd.grad() for each loss - no shared state issues
+            grad_mse = compute_grad(mse_loss)
+            grad_spectral = compute_grad(spectral_loss)
+            grad_flow = compute_grad(flow_loss)
+            
+            # Project gradients (PCGrad: symmetric projection of all three)
+            projected_mse = self._project_gradient_3way(grad_mse, grad_spectral, grad_flow)
+            projected_spectral = self._project_gradient_3way(grad_spectral, grad_mse, grad_flow)
+            projected_flow = self._project_gradient_3way(grad_flow, grad_mse, grad_spectral)
+            
+            # Set combined projected gradients into parameters
+            for p in params:
+                base_grad = saved_grads[p].clone() if saved_grads[p] is not None else torch.zeros_like(p)
+                
+                if p in projected_mse and p in projected_spectral and p in projected_flow:
+                    p.grad = base_grad + projected_mse[p] + projected_spectral[p] + projected_flow[p]
+                elif p in projected_mse and p in projected_spectral:
+                    p.grad = base_grad + projected_mse[p] + projected_spectral[p]
+                elif p in projected_mse and p in projected_flow:
+                    p.grad = base_grad + projected_mse[p] + projected_flow[p]
+                elif p in projected_spectral and p in projected_flow:
+                    p.grad = base_grad + projected_spectral[p] + projected_flow[p]
+                elif p in projected_mse:
+                    p.grad = base_grad + projected_mse[p]
+                elif p in projected_spectral:
+                    p.grad = base_grad + projected_spectral[p]
+                elif p in projected_flow:
+                    p.grad = base_grad + projected_flow[p]
+                else:
+                    p.grad = base_grad
+        else:
+            # === 2-LOSS MODE: Spectral + Flow ===
+            grad_spectral = compute_grad(spectral_loss)
+            grad_flow = compute_grad(flow_loss)
+            
+            # Project gradients (PCGrad: symmetric projection of both)
+            projected_spectral = self._project_gradients(grad_spectral, grad_flow)
+            projected_flow = self._project_gradients(grad_flow, grad_spectral)
+            
+            # Set combined projected gradients into parameters
+            for p in params:
+                base_grad = saved_grads[p].clone() if saved_grads[p] is not None else torch.zeros_like(p)
+                
+                if p in projected_spectral and p in projected_flow:
+                    p.grad = base_grad + projected_spectral[p] + projected_flow[p]
+                elif p in projected_spectral:
+                    p.grad = base_grad + projected_spectral[p]
+                elif p in projected_flow:
+                    p.grad = base_grad + projected_flow[p]
+                else:
+                    p.grad = base_grad
+
+    def _project_gradients(self, grad_spatial_dict, grad_flow_dict):
+        """Project spectral gradient to remove component that conflicts with flow gradient.
+        
+        Implements PCGrad-style projection: when ∇L_spatial and ∇L_flow conflict
+        (one wants to increase what other wants to decrease), project ∇L_spatial
+        onto the direction that doesn't worsen flow loss.
+        
+        Args:
+            grad_spatial_dict: dict of {param: gradient} for spectral loss
+            grad_flow_dict: dict of {param: gradient} for flow loss
+        
+        Returns:
+            projected_grad_spatial_dict: modified gradients for spectral loss
+        """
+        def gradient_dot(grad_a, grad_b):
+            """Compute dot product of two gradient dictionaries."""
+            dot = 0.0
+            for param in grad_a:
+                if param in grad_b:
+                    dot += (grad_a[param] * grad_b[param]).sum().item()
+            return dot
+        
+        def gradient_norm_sq(grad):
+            """Compute squared L2 norm of gradient dictionary."""
+            norm_sq = 0.0
+            for param in grad:
+                norm_sq += (grad[param] * grad[param]).sum().item()
+            return norm_sq
+        
+        # Check for conflict: dot product < 0 means gradients oppose each other
+        dot_product = gradient_dot(grad_spatial_dict, grad_flow_dict)
+        
+        # Track conflict statistics (both cumulative and per-step)
+        if dot_product < 0:
+            self.gradient_projection_stats['total_conflicts'] += 1
+            self.gradient_projection_stats['step_conflicts'] += 1
+        
+        if dot_product >= 0:
+            # No conflict - gradients align, return unchanged
+            return grad_spatial_dict
+        
+        # Conflict detected: project grad_spatial to remove component that conflicts with grad_flow
+        # g_proj = g_spatial - (g_spatial · g_flow / ||g_flow||²) * g_flow
+        flow_norm_sq = gradient_norm_sq(grad_flow_dict)
+        
+        if flow_norm_sq < 1e-10:
+            return grad_spatial_dict
+        
+        proj_coef = dot_product / flow_norm_sq
+        self.gradient_projection_stats['total_projections'] += 1
+        self.gradient_projection_stats['step_projections'] += 1
+        
+        # Apply projection
+        projected_grad_spatial = {}
+        for param in grad_spatial_dict:
+            if param in grad_flow_dict:
+                projected_grad_spatial[param] = grad_spatial_dict[param] - proj_coef * grad_flow_dict[param]
+            else:
+                projected_grad_spatial[param] = grad_spatial_dict[param].clone()
+        
+        return projected_grad_spatial
+
+    def _project_gradient_3way(self, grad_target, grad_other1, grad_other2):
+        """Project target gradient against two other gradients sequentially (3-way PCGrad).
+        
+        For mse_spectral_flow loss, projects one gradient (e.g., MSE) against the other two
+        (e.g., spectral and flow) by sequential projection. This removes components that
+        conflict with either of the other gradients.
+        
+        Algorithm:
+        1. Project g_target onto plane orthogonal to g_other1 (if conflicting)
+        2. Project result onto plane orthogonal to g_other2 (if conflicting)
+        
+        Args:
+            grad_target: dict of {param: gradient} for the loss to project
+            grad_other1: dict of {param: gradient} for first constraint loss
+            grad_other2: dict of {param: gradient} for second constraint loss
+        
+        Returns:
+            projected_grad_target: modified gradients for target loss
+        """
+        def gradient_dot(grad_a, grad_b):
+            dot = 0.0
+            for param in grad_a:
+                if param in grad_b:
+                    dot += (grad_a[param] * grad_b[param]).sum().item()
+            return dot
+        
+        def gradient_norm_sq(grad):
+            norm_sq = 0.0
+            for param in grad:
+                norm_sq += (grad[param] * grad[param]).sum().item()
+            return norm_sq
+        
+        def project_onto_normal(grad_to_project, grad_constraint):
+            """Project grad_to_project onto normal plane of grad_constraint if conflicting."""
+            dot_product = gradient_dot(grad_to_project, grad_constraint)
+            
+            if dot_product >= 0:
+                # No conflict
+                return grad_to_project
+            
+            # Track conflict
+            self.gradient_projection_stats['total_conflicts'] += 1
+            self.gradient_projection_stats['step_conflicts'] += 1
+            
+            constraint_norm_sq = gradient_norm_sq(grad_constraint)
+            if constraint_norm_sq < 1e-10:
+                return grad_to_project
+            
+            proj_coef = dot_product / constraint_norm_sq
+            
+            # Track projection
+            self.gradient_projection_stats['total_projections'] += 1
+            self.gradient_projection_stats['step_projections'] += 1
+            
+            projected = {}
+            for param in grad_to_project:
+                if param in grad_constraint:
+                    projected[param] = grad_to_project[param] - proj_coef * grad_constraint[param]
+                else:
+                    projected[param] = grad_to_project[param].clone()
+            
+            return projected
+        
+        # Sequential projection: first against other1, then against other2
+        result = project_onto_normal(grad_target, grad_other1)
+        result = project_onto_normal(result, grad_other2)
+        
+        return result
+
+    def _should_reject_step(self, expert_label, current_loss, current_spatial_loss, current_flow_loss):
+        """Check if optimizer step should be rejected based on loss thresholds.
+        
+        Supports two modes:
+        1. Basic threshold mode: reject steps with excessive loss or spikes
+        2. Constraint mode: enforce spectral loss decrease while bounding flow loss increase
+        
+        Returns:
+            tuple: (should_reject: bool, reason: str)
+        """
+        # Mode 1: Basic threshold checks
+        if self.train_config.spectral_flow_loss_rejection_enabled:
+            # Get threshold for this expert
+            if expert_label == "low":
+                max_loss = self.train_config.spectral_flow_loss_rejection_max_low
+            elif expert_label == "high":
+                max_loss = self.train_config.spectral_flow_loss_rejection_max_high
+            else:
+                # Single expert: use average of both thresholds
+                max_loss = (self.train_config.spectral_flow_loss_rejection_max_low + 
+                           self.train_config.spectral_flow_loss_rejection_max_high) / 2
+            
+            max_increase_pct = self.train_config.spectral_flow_loss_rejection_max_increase_pct
+            
+            # Check absolute threshold
+            if current_loss > max_loss:
+                return True, f"loss {current_loss:.4f} > max {max_loss:.1f}"
+            
+            # Check % increase from previous step
+            prev_loss = self.prev_expert_loss.get(expert_label)
+            if prev_loss is not None and prev_loss > 0:
+                increase_pct = ((current_loss - prev_loss) / prev_loss) * 100
+                if increase_pct > max_increase_pct:
+                    return True, f"increase {increase_pct:.1f}% > max {max_increase_pct:.0f}%"
+        
+        # Mode 2: Constraint-based rejection (spectral primary, flow constraint)
+        if self.train_config.spectral_flow_constraint_rejection_enabled:
+            prev_spatial = self.prev_expert_spatial_loss.get(expert_label)
+            prev_flow = self.prev_expert_flow_loss.get(expert_label)
+            
+            if prev_spatial is not None and prev_flow is not None:
+                # Calculate changes
+                spatial_change = current_spatial_loss - prev_spatial
+                flow_change = current_flow_loss - prev_flow
+                flow_increase_pct = (flow_change / prev_flow * 100) if prev_flow > 0 else 0
+                
+                # Constraint: flow loss should not increase significantly
+                max_flow_increase_pct = self.train_config.spectral_flow_constraint_flow_max_increase_pct
+                
+                # Case: spectral improved but flow got worse → reject (wrong direction)
+                if spatial_change < 0 and flow_increase_pct > max_flow_increase_pct:
+                    return True, f"constraint: spectral↓ but flow↑ {flow_increase_pct:.1f}% (max {max_flow_increase_pct:.0f}%)"
+                
+                # Optional: require spectral to actually decrease
+                if (self.train_config.spectral_flow_constraint_spectral_must_decrease and
+                    spatial_change > 0):
+                    return True, f"constraint: spectral didn't decrease (+{spatial_change:.4f})"
+        
+        return False, ""
+
     def process_output_for_turbo(self, pred, noisy_latents, timesteps, noise, batch):
         # to process turbo learning, we make one big step from our current timestep to the end
         # we then denoise the prediction on that remaining step and target our loss to our target latents
@@ -1048,6 +1380,7 @@ class SDTrainer(BaseSDTrainProcess):
                     lcr_weight=self.train_config.spectral_lcr_weight,
                     spectral_transform=self.train_config.spectral_transform,
                     prediction_target=self.train_config.prediction_target,
+                    temporal_scale=self.train_config.spectral_temporal_scale,
                 )
             elif self.train_config.loss_type == "spectral_flow":
                 # Combined spectral (spatial frequency) + optical flow (temporal motion) loss
@@ -1075,6 +1408,7 @@ class SDTrainer(BaseSDTrainProcess):
                         lcr_weight=self.train_config.spectral_lcr_weight,
                         spectral_transform=self.train_config.spectral_transform,
                         prediction_target=self.train_config.prediction_target,
+                        temporal_scale=self.train_config.spectral_temporal_scale,
                     )
                     # Continue with standard loss handling below (falls through)
                 else:
@@ -1113,6 +1447,7 @@ class SDTrainer(BaseSDTrainProcess):
                         lcr_weight=self.train_config.spectral_lcr_weight,
                         spectral_transform=self.train_config.spectral_transform,
                         prediction_target=self.train_config.prediction_target,
+                        temporal_scale=self.train_config.spectral_temporal_scale,
                         flow_weight=base_flow_weight,
                         flow_max_timestep=self.train_config.spectral_flow_max_timestep,
                         motion_weighted=self.train_config.spectral_flow_motion_weighted,
@@ -1148,6 +1483,8 @@ class SDTrainer(BaseSDTrainProcess):
                                 )
 
                     # Issue #1 fix: per-expert rejection budget
+                    # NOTE: If gradient projection is enabled, DON'T detach flow_component
+                    # because we need its gradient for projection.
                     if expert not in self.flow_rejection_count:
                         self.flow_rejection_count[expert] = 0
                     max_rejections = self.train_config.spectral_flow_max_rejections
@@ -1158,9 +1495,10 @@ class SDTrainer(BaseSDTrainProcess):
                             print_acc(f"[FLOW REJECT] Expert={expert} Deviation={flow_dev:.4f} > "
                                       f"{self.train_config.spectral_flow_rejection_threshold}. "
                                       f"Rejecting step {self.flow_rejection_count[expert]}/{max_rejections}")
-                        # Only detach flow gradients — keep spectral learning signal alive.
+                        # Only detach flow gradients if gradient projection is NOT enabled
                         # Previously this did total_loss.detach() which killed ALL learning.
-                        flow_component = flow_component.detach()
+                        if not self.train_config.spectral_flow_gradient_projection_enabled:
+                            flow_component = flow_component.detach()
 
                     # Bug 2.1 fix: apply mask BEFORE mean reduction, with proper time dim
                     # Build per-video expansion of mask_multiplier (B,1,H,W) -> (B,C,T,H,W) for video
@@ -1199,6 +1537,29 @@ class SDTrainer(BaseSDTrainProcess):
                     self.additional_logs[f'loss_{expert}/spatial'] = spatial_val
                     self.additional_logs[f'loss_{expert}/flow'] = flow_val
                     self.additional_logs[f'loss_{expert}/flow_weight'] = expert_flow_weight
+                    self.additional_logs[f'loss_{expert}/flow_rejections'] = self.flow_rejection_count.get(expert, 0)
+                    self.additional_logs[f'loss_{expert}/step_rejections'] = self.step_rejection_count.get(expert, 0)
+                    
+                    # Gradient projection stats logging (per-step, not cumulative)
+                    if self.train_config.spectral_flow_gradient_projection_enabled:
+                        self.additional_logs['grad_proj/step_conflicts'] = self.gradient_projection_stats['step_conflicts']
+                        self.additional_logs['grad_proj/step_projections'] = self.gradient_projection_stats['step_projections']
+                        self.additional_logs['grad_proj/total_conflicts'] = self.gradient_projection_stats['total_conflicts']
+                        self.additional_logs['grad_proj/total_projections'] = self.gradient_projection_stats['total_projections']
+
+                    # Track per-expert losses separately for step rejection
+                    expert_spatial_val = loss.mean().item()
+                    expert_flow_val = flow_component.item()
+                    expert_total_val = expert_spatial_val + expert_flow_val
+                    
+                    if expert not in self.current_step_expert_loss:
+                        self.current_step_expert_loss[expert] = 0.0
+                        self.current_step_expert_spatial[expert] = 0.0
+                        self.current_step_expert_flow[expert] = 0.0
+                    
+                    self.current_step_expert_loss[expert] += expert_total_val
+                    self.current_step_expert_spatial[expert] += expert_spatial_val
+                    self.current_step_expert_flow[expert] += expert_flow_val
 
                     # SNR weighting on (B,) loss, THEN final mean
                     if not self.train_config.train_turbo:
@@ -1214,6 +1575,12 @@ class SDTrainer(BaseSDTrainProcess):
                                                     self.train_config.min_snr_gamma)
 
                     loss = loss.mean()  # scalar spectral loss after SNR
+
+                    # Store separate loss tensors for gradient projection (if enabled)
+                    # These are the final scalar losses for each component with computation graph intact
+                    if self.train_config.spectral_flow_gradient_projection_enabled:
+                        self._spectral_loss_tensor = loss
+                        self._flow_loss_tensor = flow_component
 
                     # Combine with flow component (scalar, already fully reduced).
                     # Added here after all per-pixel masking/scaling so its weight is not
@@ -1257,6 +1624,272 @@ class SDTrainer(BaseSDTrainProcess):
                         loss = torch.clamp(loss, max=self.train_config.max_loss)
 
                     # Skip the rest of the function for spectral_flow
+                    return loss
+            elif self.train_config.loss_type == "mse_spectral_flow":
+                # Combined MSE + spectral (spatial frequency) + optical flow (temporal motion) loss
+
+                # BUG FIX: guard against x0_pred mode (e.g. turbo or any x0-predicting model).
+                # mse_spectral_flow loss assumes velocity prediction (model_pred = ε - x0), so
+                # x0 reconstruction uses: pred_latents = noise - model_pred.
+                if getattr(self.sd, 'x0_pred', False):
+                    if self.accelerator.is_main_process:
+                        print_acc("[WARN] mse_spectral_flow loss is incompatible with x0_pred mode. "
+                                  "Falling back to spectral loss.")
+                    loss = spectral_loss(
+                        pred=pred,
+                        latents=batch.latents,
+                        noise=noise,
+                        low_weight=self.train_config.spectral_low_weight,
+                        mid_weight=self.train_config.spectral_mid_weight,
+                        high_weight=self.train_config.spectral_high_weight,
+                        low_cutoff=self.train_config.spectral_low_cutoff,
+                        high_cutoff=self.train_config.spectral_high_cutoff,
+                        use_phase=self.train_config.spectral_use_phase,
+                        lcr_weight=self.train_config.spectral_lcr_weight,
+                        spectral_transform=self.train_config.spectral_transform,
+                        prediction_target=self.train_config.prediction_target,
+                        temporal_scale=self.train_config.spectral_temporal_scale,
+                    )
+                else:
+                    vae_ts = self.flow_loss_module.vae_temporal_stride if self.flow_loss_module else 4
+                    vae_ss = self.flow_loss_module.vae_spatial_stride if self.flow_loss_module else 8
+
+                    expert = self._get_active_expert_label()
+
+                    # Determine base weights: per-expert config overrides global
+                    if expert == "low" and self.train_config.mse_spectral_flow_mse_weight_low is not None:
+                        base_mse_weight = self.train_config.mse_spectral_flow_mse_weight_low
+                    elif expert == "high" and self.train_config.mse_spectral_flow_mse_weight_high is not None:
+                        base_mse_weight = self.train_config.mse_spectral_flow_mse_weight_high
+                    else:
+                        base_mse_weight = self.train_config.mse_spectral_flow_mse_weight
+
+                    if expert == "low" and self.train_config.spectral_flow_weight_low is not None:
+                        base_flow_weight = self.train_config.spectral_flow_weight_low
+                    elif expert == "high" and self.train_config.spectral_flow_weight_high is not None:
+                        base_flow_weight = self.train_config.spectral_flow_weight_high
+                    else:
+                        base_flow_weight = self.train_config.spectral_flow_weight
+
+                    # Issue #1 fix: use per-expert current_flow_weight (adaptive adjustment)
+                    expert_flow_weight = self.current_flow_weight.get(expert, base_flow_weight)
+
+                    (total_loss, flow_dev, mse_val, spatial_val, flow_val,
+                     mse_component, spectral_component, flow_component) = mse_spectral_flow_loss(
+                        model_pred=pred,
+                        latents=batch.latents,
+                        noise=noise,
+                        batch_flow=getattr(batch, 'flow', None),
+                        timesteps=timesteps,
+                        flow_loss_module=self.flow_loss_module,
+                        vae_temporal_stride=vae_ts,
+                        vae_spatial_stride=vae_ss,
+                        mse_weight=base_mse_weight,
+                        low_weight=self.train_config.spectral_low_weight,
+                        mid_weight=self.train_config.spectral_mid_weight,
+                        high_weight=self.train_config.spectral_high_weight,
+                        low_cutoff=self.train_config.spectral_low_cutoff,
+                        high_cutoff=self.train_config.spectral_high_cutoff,
+                        use_phase=self.train_config.spectral_use_phase,
+                        lcr_weight=self.train_config.spectral_lcr_weight,
+                        spectral_transform=self.train_config.spectral_transform,
+                        prediction_target=self.train_config.prediction_target,
+                        temporal_scale=self.train_config.spectral_temporal_scale,
+                        flow_weight=base_flow_weight,
+                        flow_max_timestep=self.train_config.spectral_flow_max_timestep,
+                        motion_weighted=self.train_config.spectral_flow_motion_weighted,
+                        adaptive=self.train_config.spectral_flow_adaptive,
+                        current_flow_weight=expert_flow_weight,
+                    )
+
+                    # Issue #1 fix: per-expert flow deviation tracking
+                    if expert not in self.flow_deviation_history:
+                        self.flow_deviation_history[expert] = []
+                    self.flow_deviation_history[expert].append(flow_dev)
+
+                    # Issue #1 fix: per-expert adaptive weight adjustment
+                    if self.train_config.spectral_flow_adaptive:
+                        if expert not in self.current_flow_weight:
+                            self.current_flow_weight[expert] = base_flow_weight
+
+                        # Use last N steps to compute moving average
+                        window = min(len(self.flow_deviation_history[expert]), 20)
+                        recent = self.flow_deviation_history[expert][-window:]
+                        recent_avg = sum(recent) / len(recent) if recent else 0
+
+                        # Increase weight if flow deviation is too high (motion not consistent)
+                        # Decrease weight if flow deviation is very low (already consistent)
+                        threshold = self.train_config.spectral_flow_rejection_threshold
+
+                        if expert not in self.current_flow_weight:
+                            self.current_flow_weight[expert] = base_flow_weight
+
+                        if recent_avg > threshold:
+                            self.current_flow_weight[expert] = min(
+                                self.current_flow_weight[expert] * 1.2,
+                                base_flow_weight * 5.0
+                            )
+                        elif recent_avg < threshold * 0.3:
+                            self.current_flow_weight[expert] = max(
+                                self.current_flow_weight[expert] * 0.95,
+                                base_flow_weight * 0.1
+                            )
+
+                    # Issue #1 fix: per-expert rejection budget
+                    # NOTE: If gradient projection is enabled, DON'T detach flow_component
+                    # because we need its gradient for projection.
+                    if expert not in self.flow_rejection_count:
+                        self.flow_rejection_count[expert] = 0
+                    max_rejections = self.train_config.spectral_flow_max_rejections
+                    if (flow_dev > self.train_config.spectral_flow_rejection_threshold
+                            and self.flow_rejection_count[expert] < max_rejections):
+                        self.flow_rejection_count[expert] += 1
+                        if self.accelerator.is_main_process:
+                            print_acc(f"[FLOW REJECT] Expert={expert} Deviation={flow_dev:.4f} > "
+                                      f"{self.train_config.spectral_flow_rejection_threshold}. "
+                                      f"Rejecting step {self.flow_rejection_count[expert]}/{max_rejections}")
+                        # Only detach flow gradients if gradient projection is NOT enabled
+                        if not self.train_config.mse_spectral_flow_gradient_projection_enabled:
+                            flow_component = flow_component.detach()
+
+                    # Bug 2.1 fix: apply mask BEFORE mean reduction, with proper time dim
+                    # Build per-video expansion of mask_multiplier (B,1,H,W) -> (B,C,T,H,W) for video
+                    loss_multiplier_batch = mask_multiplier
+                    if len(noise_pred.shape) == 5:
+                        # video B,C,T,H,W — expand mask to match
+                        loss_multiplier_batch = loss_multiplier_batch.unsqueeze(2)
+                        loss_multiplier_batch = loss_multiplier_batch.repeat(
+                            1, 1, noise_pred.shape[2], 1, 1
+                        )
+
+                    # Apply mask to all three components
+                    mse_loss = mse_component * loss_multiplier_batch
+                    spectral_loss = spectral_component * loss_multiplier_batch
+                    flow_loss = flow_component * loss_multiplier_batch
+
+                    # Apply model-specific loss scaling (e.g., I2V conditioning mask via _i2v_loss_mask).
+                    mse_loss = self.sd.scale_loss(mse_loss)
+                    spectral_loss = self.sd.scale_loss(spectral_loss)
+                    flow_loss = self.sd.scale_loss(flow_loss)
+
+                    # Reduce each component to (B,)
+                    if len(noise_pred.shape) == 5:
+                        mse_loss = mse_loss.mean([1, 2, 3, 4])  # (B,)
+                        spectral_loss = spectral_loss.mean([1, 2, 3, 4])  # (B,)
+                        flow_loss = flow_loss.mean([1, 2, 3, 4])  # (B,)
+                    else:
+                        mse_loss = mse_loss.mean([1, 2, 3])     # (B,)
+                        spectral_loss = spectral_loss.mean([1, 2, 3])     # (B,)
+                        flow_loss = flow_loss.mean([1, 2, 3])     # (B,)
+
+                    # Apply per-batch loss_multiplier (reg weight)
+                    mse_loss = mse_loss * loss_multiplier
+                    spectral_loss = spectral_loss * loss_multiplier
+                    flow_loss = flow_loss * loss_multiplier
+
+                    # Per-expert loss logging
+                    self.additional_logs[f'loss_{expert}/mse'] = mse_val
+                    self.additional_logs[f'loss_{expert}/spatial'] = spatial_val
+                    self.additional_logs[f'loss_{expert}/flow'] = flow_val
+                    self.additional_logs[f'loss_{expert}/flow_weight'] = expert_flow_weight
+                    self.additional_logs[f'loss_{expert}/mse_weight'] = base_mse_weight
+                    self.additional_logs[f'loss_{expert}/flow_rejections'] = self.flow_rejection_count.get(expert, 0)
+                    self.additional_logs[f'loss_{expert}/step_rejections'] = self.step_rejection_count.get(expert, 0)
+                    
+                    # Gradient projection stats logging (per-step, not cumulative)
+                    if self.train_config.mse_spectral_flow_gradient_projection_enabled:
+                        self.additional_logs['grad_proj/step_conflicts'] = self.gradient_projection_stats['step_conflicts']
+                        self.additional_logs['grad_proj/step_projections'] = self.gradient_projection_stats['step_projections']
+                        self.additional_logs['grad_proj/total_conflicts'] = self.gradient_projection_stats['total_conflicts']
+                        self.additional_logs['grad_proj/total_projections'] = self.gradient_projection_stats['total_projections']
+
+                    # Track per-expert losses separately for step rejection
+                    expert_mse_val = mse_loss.mean().item()
+                    expert_spatial_val = spectral_loss.mean().item()
+                    expert_flow_val = flow_loss.mean().item()
+                    expert_total_val = expert_mse_val + expert_spatial_val + expert_flow_val
+                    
+                    if expert not in self.current_step_expert_loss:
+                        self.current_step_expert_loss[expert] = 0.0
+                        self.current_step_expert_spatial[expert] = 0.0
+                        self.current_step_expert_flow[expert] = 0.0
+                        self.current_step_expert_mse[expert] = 0.0
+                    
+                    self.current_step_expert_loss[expert] += expert_total_val
+                    self.current_step_expert_spatial[expert] += expert_spatial_val
+                    self.current_step_expert_flow[expert] += expert_flow_val
+                    self.current_step_expert_mse[expert] += expert_mse_val
+
+                    # SNR weighting on (B,) loss, THEN final mean
+                    if not self.train_config.train_turbo:
+                        if self.train_config.learnable_snr_gos:
+                            mse_loss = apply_learnable_snr_gos(mse_loss, timesteps, self.snr_gos)
+                            spectral_loss = apply_learnable_snr_gos(spectral_loss, timesteps, self.snr_gos)
+                        elif (self.train_config.snr_gamma is not None and
+                              self.train_config.snr_gamma > 0.000001 and not ignore_snr):
+                            mse_loss = apply_snr_weight(mse_loss, timesteps, self.sd.noise_scheduler,
+                                                        self.train_config.snr_gamma, fixed=True)
+                            spectral_loss = apply_snr_weight(spectral_loss, timesteps, self.sd.noise_scheduler,
+                                                             self.train_config.snr_gamma, fixed=True)
+                        elif (self.train_config.min_snr_gamma is not None and
+                              self.train_config.min_snr_gamma > 0.000001 and not ignore_snr):
+                            mse_loss = apply_snr_weight(mse_loss, timesteps, self.sd.noise_scheduler,
+                                                        self.train_config.min_snr_gamma)
+                            spectral_loss = apply_snr_weight(spectral_loss, timesteps, self.sd.noise_scheduler,
+                                                             self.train_config.min_snr_gamma)
+
+                    loss_mse = mse_loss.mean()  # scalar MSE loss after SNR
+                    loss_spatial = spectral_loss.mean()  # scalar spectral loss after SNR
+
+                    # Store separate loss tensors for gradient projection (if enabled)
+                    # These are the final scalar losses for each component with computation graph intact
+                    if self.train_config.mse_spectral_flow_gradient_projection_enabled:
+                        self._mse_loss_tensor = loss_mse
+                        self._spectral_loss_tensor = loss_spatial
+                        self._flow_loss_tensor = flow_loss.mean()
+
+                    # Combine all three components (scalar, already fully reduced).
+                    # Added here after all per-pixel masking/scaling so weights are not
+                    # attenuated by I2V conditioning masks or renormalization.
+                    loss = loss_mse + loss_spatial + flow_loss.mean()
+
+                    # Check for audio loss
+                    if batch.audio_pred is not None and batch.audio_target is not None:
+                        audio_loss = torch.nn.functional.mse_loss(
+                            batch.audio_pred.float(), batch.audio_target.float(), reduction="mean"
+                        )
+                        audio_loss = audio_loss * self.train_config.audio_loss_multiplier
+                        loss = loss + audio_loss
+
+                    # Check for additional losses from adapter
+                    if (self.adapter is not None and hasattr(self.adapter, "additional_loss")
+                            and self.adapter.additional_loss is not None):
+                        loss = loss + self.adapter.additional_loss.mean()
+                        self.adapter.additional_loss = None
+
+                    if self.train_config.target_norm_std:
+                        pred_std = noise_pred.std([2, 3], keepdim=True)
+                        norm_std_loss = torch.abs(self.train_config.target_norm_std_value - pred_std).mean()
+                        loss = loss + norm_std_loss
+
+                    loss = loss + additional_loss
+
+                    if hasattr(self.sd, "get_additional_loss"):
+                        additional_model_loss = self.sd.get_additional_loss(pred, target)
+                        if additional_model_loss is not None:
+                            loss = loss + additional_model_loss
+                            self.additional_logs["additional_model_loss"] = additional_model_loss.item()
+
+                    if self.train_config.max_loss_debug and self.train_config.max_loss is not None:
+                        if loss.item() > self.train_config.max_loss:
+                            print_acc(f"Loss {loss.item()} is greater than max loss {self.train_config.max_loss}. "
+                                      f"Clipping to max loss.")
+                            print_acc(f"timesteps: {timesteps}")
+
+                    if self.train_config.max_loss is not None:
+                        loss = torch.clamp(loss, max=self.train_config.max_loss)
+
+                    # Skip the rest of the function for mse_spectral_flow
                     return loss
             elif self.train_config.loss_type == "stepped":
                 loss = stepped_loss(pred, batch.latents, noise, noisy_latents, timesteps, self.sd.noise_scheduler)
@@ -2701,7 +3334,34 @@ class SDTrainer(BaseSDTrainProcess):
                     # if self.is_bfloat:
                     # loss.backward()
                     # else:
-                    self.accelerator.backward(loss)
+                    
+                    # Gradient projection for spectral_flow/mse_spectral_flow loss: compute gradients
+                    # separately and project to resolve conflicts between loss objectives
+                    if (self.train_config.mse_spectral_flow_gradient_projection_enabled and
+                        self._mse_loss_tensor is not None and
+                        self._spectral_loss_tensor is not None and
+                        self._flow_loss_tensor is not None):
+                        # 3-loss mode: MSE + Spectral + Flow
+                        self._gradient_projection_backward(
+                            self._spectral_loss_tensor, self._flow_loss_tensor,
+                            self._mse_loss_tensor
+                        )
+                        # Clear stored tensors
+                        self._mse_loss_tensor = None
+                        self._spectral_loss_tensor = None
+                        self._flow_loss_tensor = None
+                    elif (self.train_config.spectral_flow_gradient_projection_enabled and
+                          self._spectral_loss_tensor is not None and
+                          self._flow_loss_tensor is not None):
+                        # 2-loss mode: Spectral + Flow
+                        self._gradient_projection_backward(
+                            self._spectral_loss_tensor, self._flow_loss_tensor
+                        )
+                        # Clear stored tensors
+                        self._spectral_loss_tensor = None
+                        self._flow_loss_tensor = None
+                    else:
+                        self.accelerator.backward(loss)
 
         return loss.detach()
         # flush()
@@ -2769,41 +3429,92 @@ class SDTrainer(BaseSDTrainProcess):
             # Freeze inactive expert LoRAs before optimizer.step()
             frozen_inactive_loras = self._freeze_inactive_expert_loras(active_experts)
 
-            # only step if we are not accumulating
-            with self.timer('optimizer_step'):
-                self.optimizer.step()
-
+            # Step loss rejection: check if any expert's loss exceeds thresholds
+            step_rejected = False
+            rejection_reasons = []
+            if not self.is_grad_accumulation_step:
+                # Normalize per-expert loss by number of batches in this step
+                num_batches = len(batch_list) if batch_list else 1
+                for expert_label, accum_loss in self.current_step_expert_loss.items():
+                    avg_expert_loss = accum_loss / num_batches
+                    avg_spatial_loss = self.current_step_expert_spatial.get(expert_label, 0.0) / num_batches
+                    avg_flow_loss = self.current_step_expert_flow.get(expert_label, 0.0) / num_batches
+                    should_reject, reason = self._should_reject_step(
+                        expert_label, avg_expert_loss, avg_spatial_loss, avg_flow_loss
+                    )
+                    if should_reject:
+                        step_rejected = True
+                        rejection_reasons.append(f"{expert_label}: {reason}")
+            
+            if step_rejected:
+                # Reject this step: zero gradients, skip optimizer step
+                if self.accelerator.is_main_process:
+                    print_acc(f"[STEP REJECTED] {'; '.join(rejection_reasons)}")
+                
+                # Track rejection count
+                for expert_label in self.current_step_expert_loss.keys():
+                    if expert_label not in self.step_rejection_count:
+                        self.step_rejection_count[expert_label] = 0
+                    self.step_rejection_count[expert_label] += 1
+                
+                # Zero gradients without stepping
                 self.optimizer.zero_grad(set_to_none=True)
-
-                # Unfreeze inactive expert LoRAs after optimizer.step()
                 self._unfreeze_inactive_expert_loras(frozen_inactive_loras)
+                
+                # Reset current step tracking
+                self.current_step_expert_loss = {}
+            else:
+                # only step if we are not accumulating
+                with self.timer('optimizer_step'):
+                    self.optimizer.step()
 
-                if self.adapter and isinstance(self.adapter, CustomAdapter):
-                    self.adapter.post_weight_update()
-            if self.ema is not None:
-                with self.timer('ema_update'):
-                    # Determine active experts for per-expert EMA updates.
-                    # For Wan 2.2 multistage models, only the expert that processed
-                    # this batch should have its EMA updated. The other expert's EMA
-                    # must remain completely frozen.
-                    self.ema.update(active_experts=active_experts)
+                    self.optimizer.zero_grad(set_to_none=True)
 
-            # Step LR scheduler only when optimizer steps (not during gradient accumulation)
-            # Scheduler total_iters is adjusted for gradient accumulation in BaseSDTrainProcess
-            with self.timer('scheduler_step'):
-                if self.use_per_expert_schedulers:
-                    # Dual-expert mode: step only the active expert's scheduler
-                    # and track per-expert step counts.
-                    if active_experts is not None:
-                        for expert in active_experts:
-                            expert_scheduler = self.expert_lr_schedulers.get(expert)
-                            if expert_scheduler is not None:
-                                expert_scheduler.step()
-                                self.expert_step_counts[expert] += 1
-                else:
-                    # Single-expert or non-multistage mode: use global scheduler
-                    if self.lr_scheduler is not None:
-                        self.lr_scheduler.step()
+                    # Update previous loss tracking for next step's rejection check
+                    num_batches = len(batch_list) if batch_list else 1
+                    for expert_label, accum_loss in self.current_step_expert_loss.items():
+                        self.prev_expert_loss[expert_label] = accum_loss / num_batches
+                        self.prev_expert_spatial_loss[expert_label] = self.current_step_expert_spatial.get(expert_label, 0.0) / num_batches
+                        self.prev_expert_flow_loss[expert_label] = self.current_step_expert_flow.get(expert_label, 0.0) / num_batches
+                        self.prev_expert_mse_loss[expert_label] = self.current_step_expert_mse.get(expert_label, 0.0) / num_batches
+                    self.current_step_expert_loss = {}  # Reset for next step
+                    self.current_step_expert_spatial = {}
+                    self.current_step_expert_flow = {}
+                    self.current_step_expert_mse = {}
+                    
+                    # Reset per-step gradient projection stats for next step
+                    self.gradient_projection_stats['step_conflicts'] = 0
+                    self.gradient_projection_stats['step_projections'] = 0
+
+                    # Unfreeze inactive expert LoRAs after optimizer.step()
+                    self._unfreeze_inactive_expert_loras(frozen_inactive_loras)
+
+                    if self.adapter and isinstance(self.adapter, CustomAdapter):
+                        self.adapter.post_weight_update()
+                if self.ema is not None:
+                    with self.timer('ema_update'):
+                        # Determine active experts for per-expert EMA updates.
+                        # For Wan 2.2 multistage models, only the expert that processed
+                        # this batch should have its EMA updated. The other expert's EMA
+                        # must remain completely frozen.
+                        self.ema.update(active_experts=active_experts)
+
+                # Step LR scheduler only when optimizer steps (not during gradient accumulation)
+                # Scheduler total_iters is adjusted for gradient accumulation in BaseSDTrainProcess
+                with self.timer('scheduler_step'):
+                    if self.use_per_expert_schedulers:
+                        # Dual-expert mode: step only the active expert's scheduler
+                        # and track per-expert step counts.
+                        if active_experts is not None:
+                            for expert in active_experts:
+                                expert_scheduler = self.expert_lr_schedulers.get(expert)
+                                if expert_scheduler is not None:
+                                    expert_scheduler.step()
+                                    self.expert_step_counts[expert] += 1
+                    else:
+                        # Single-expert or non-multistage mode: use global scheduler
+                        if self.lr_scheduler is not None:
+                            self.lr_scheduler.step()
             
             # Rank gate annealing updates (after optimizer step)
             # Uses active_experts from above (same as used for EMA and LoRA freezing).

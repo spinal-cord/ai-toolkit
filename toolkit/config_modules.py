@@ -1038,6 +1038,13 @@ class TrainConfig:
         self.spectral_lcr_weight = kwargs.get('spectral_lcr_weight', 0.0)   # SSVAE LCR weight (0.0 = disabled)
         self.spectral_transform = kwargs.get('spectral_transform', 'dct')   # 'dct' (default, SSVAE-compliant) or 'fft'
         self.prediction_target = kwargs.get('prediction_target', 'velocity')  # 'velocity' (default) or 'x0'
+        
+        # Spectral temporal scale for video: controls how much temporal frequency
+        # contributes to the 3D frequency mask.
+        # 1.0 = pure spherical (all dims equal, can cause motion artifacts)
+        # 0.3 = recommended for video (temporal down-weighted)
+        # 0.0 = spatial-only (ignores temporal frequency)
+        self.spectral_temporal_scale = kwargs.get('spectral_temporal_scale', 0.3)
 
         # Spectral flow loss config - combines spectral (spatial frequency) + optical flow (temporal motion)
         # Flow loss weight: 0.05-0.15 recommended for Wan 2.2 I2V LoRA
@@ -1049,6 +1056,32 @@ class TrainConfig:
         self.spectral_flow_adaptive = kwargs.get('spectral_flow_adaptive', False)  # dynamic weight adjustment
         self.spectral_flow_rejection_threshold = kwargs.get('spectral_flow_rejection_threshold', 5.0)  # deviation threshold
         self.spectral_flow_max_rejections = kwargs.get('spectral_flow_max_rejections', 100)  # per-expert rejection budget
+        
+        # Step loss rejection config - reject optimizer steps that exceed loss thresholds
+        self.spectral_flow_loss_rejection_enabled = kwargs.get('spectral_flow_loss_rejection_enabled', False)
+        self.spectral_flow_loss_rejection_max_low = kwargs.get('spectral_flow_loss_rejection_max_low', 7.0)  # max loss for low noise expert
+        self.spectral_flow_loss_rejection_max_high = kwargs.get('spectral_flow_loss_rejection_max_high', 14.0)  # max loss for high noise expert
+        self.spectral_flow_loss_rejection_max_increase_pct = kwargs.get('spectral_flow_loss_rejection_max_increase_pct', 20.0)  # max % increase from prev step
+        self.spectral_flow_loss_rejection_max_retries = kwargs.get('spectral_flow_loss_rejection_max_retries', 5)  # max retries per step
+        
+        # Constraint-based rejection: require spectral loss decrease while bounding flow loss increase
+        self.spectral_flow_constraint_rejection_enabled = kwargs.get('spectral_flow_constraint_rejection_enabled', False)
+        self.spectral_flow_constraint_flow_max_increase_pct = kwargs.get('spectral_flow_constraint_flow_max_increase_pct', 5.0)  # max flow loss increase allowed
+        self.spectral_flow_constraint_spectral_must_decrease = kwargs.get('spectral_flow_constraint_spectral_must_decrease', True)  # require spectral to decrease
+        
+        # Gradient projection (PCGrad-style): when spectral and flow gradients conflict,
+        # project spectral gradient to remove component that worsens flow loss
+        self.spectral_flow_gradient_projection_enabled = kwargs.get('spectral_flow_gradient_projection_enabled', False)
+        
+        # MSE + Spectral + Flow loss config - combines all three loss types
+        # MSE weight: 0.5-2.0 recommended for Wan 2.2 I2V LoRA
+        self.mse_spectral_flow_mse_weight = kwargs.get('mse_spectral_flow_mse_weight', 1.0)  # global MSE weight (fallback)
+        self.mse_spectral_flow_mse_weight_low = kwargs.get('mse_spectral_flow_mse_weight_low', None)  # per-expert MSE weight for low noise
+        self.mse_spectral_flow_mse_weight_high = kwargs.get('mse_spectral_flow_mse_weight_high', None)  # per-expert MSE weight for high noise
+        
+        # Gradient projection (PCGrad-style) for MSE+Spectral+Flow: when any gradients conflict,
+        # project them to remove components that worsen other losses
+        self.mse_spectral_flow_gradient_projection_enabled = kwargs.get('mse_spectral_flow_gradient_projection_enabled', False)
         
         # do the loss on a timestep to 0 prediction
         self.t0_loss_target = kwargs.get('t0_loss_target', False)

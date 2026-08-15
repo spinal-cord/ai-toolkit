@@ -301,6 +301,7 @@ def spectral_loss(
     lcr_weight=0.0,
     spectral_transform='dct',  # 'dct' (default, SSVAE-compliant) or 'fft'
     prediction_target='velocity',  # 'velocity' or 'x0'
+    temporal_scale=0.3,  # Scale temporal frequency for video (0.0-1.0)
 ):
     """
     Spectral Training Loss with frequency dissociation and balancing.
@@ -331,6 +332,10 @@ def spectral_loss(
                    Encourages low-frequency bias in latents for better diffusability
         spectral_transform: 'dct' for DCT-based (SSVAE-compliant, default), 'fft' for FFT-based
         prediction_target: 'velocity' (model predicts ε - x₀) or 'x0' (model predicts x₀ directly)
+        temporal_scale: For video, weight for temporal frequency in 3D mask (0.0-1.0).
+                       1.0 = all dims equal (can cause motion artifacts)
+                       0.3 = recommended for video (temporal down-weighted)
+                       0.0 = spatial-only (no temporal frequency penalty)
     
     Returns:
         Loss tensor with same shape as input latents
@@ -584,14 +589,20 @@ def _create_spherical_frequency_masks(
     low_cutoff: float = 0.15,
     high_cutoff: float = 0.5,
     device=None,
+    temporal_scale: float = 0.3,  # Scale temporal frequency (lower = less temporal penalty)
 ):
     """
-    Create 3D spherical frequency masks for spatio-temporal FFT.
+    Create 3D frequency masks for spatio-temporal FFT with separate temporal scaling.
 
     Uses proper frequency coordinates accounting for FFT wraparound:
     - Full FFT dims (t, h): frequencies wrap around; index 0 is DC, then positive,
       then negative (high freq). Use |fftfreq| for radial distance.
     - Real FFT dim (w): frequencies are [0, ..., 0.5]; no wraparound.
+    
+    Key improvement over pure spherical: temporal_scale down-weights temporal
+    frequency in the radius calculation. This prevents moving objects (high temporal
+    freq, low spatial freq) from being incorrectly classified as "high frequency"
+    and penalized.
 
     Args:
         fft_t: Temporal FFT size (T for full FFT)
@@ -600,6 +611,10 @@ def _create_spherical_frequency_masks(
         low_cutoff: Inner radius (0-1) for low-frequency band
         high_cutoff: Outer radius (0-1) for mid-frequency band
         device: Device for tensors
+        temporal_scale: Weight for temporal frequency (0-1). 
+                       1.0 = pure spherical (all dims equal)
+                       0.3 = temporal down-weighted (recommended for video)
+                       0.0 = spatial-only (ignores temporal frequency)
 
     Returns:
         low_mask, mid_mask, high_mask: each (fft_t, fft_h, fft_w)
@@ -617,8 +632,10 @@ def _create_spherical_frequency_masks(
     # Meshgrid: (fft_t, fft_h, fft_w)
     t_grid, h_grid, w_grid = torch.meshgrid(t_freqs, h_freqs, w_freqs, indexing='ij')
 
-    # Radial frequency (magnitude)
-    radius = torch.sqrt(t_grid**2 + h_grid**2 + w_grid**2)
+    # Scaled radial frequency: temporal_scale reduces temporal frequency contribution
+    # This prevents motion (high temporal freq) from being classified as "high frequency"
+    scaled_t = t_grid * temporal_scale
+    radius = torch.sqrt(scaled_t**2 + h_grid**2 + w_grid**2)
     max_radius = radius.max().clamp(min=1e-8)
     radius_norm = radius / max_radius
 
@@ -636,13 +653,17 @@ def _create_dct_frequency_masks(
     low_cutoff: float = 0.15,
     high_cutoff: float = 0.5,
     device=None,
+    temporal_scale: float = 0.3,  # Scale temporal frequency (lower = less temporal penalty)
 ):
     """
-    Create 3D spherical frequency masks for spatio-temporal DCT.
+    Create 3D frequency masks for spatio-temporal DCT with separate temporal scaling.
 
     Per SSVAE paper: "we adopt a 3D DCT to analyze the spatio-temporal
     frequency spectrum." DCT frequencies are monotonically increasing
     from DC (0,0,0) to Nyquist, with no wraparound.
+    
+    Key improvement: temporal_scale down-weights temporal frequency to prevent
+    moving objects from being incorrectly penalized.
 
     Args:
         dct_t: Temporal DCT size (T)
@@ -651,6 +672,10 @@ def _create_dct_frequency_masks(
         low_cutoff: Inner radius (0-1) for low-frequency band
         high_cutoff: Outer radius (0-1) for mid-frequency band
         device: Device for tensors
+        temporal_scale: Weight for temporal frequency (0-1). 
+                       1.0 = pure spherical (all dims equal)
+                       0.3 = temporal down-weighted (recommended for video)
+                       0.0 = spatial-only (ignores temporal frequency)
 
     Returns:
         low_mask, mid_mask, high_mask: each (dct_t, dct_h, dct_w)
@@ -664,8 +689,9 @@ def _create_dct_frequency_masks(
     # Meshgrid: (dct_t, dct_h, dct_w)
     t_grid, h_grid, w_grid = torch.meshgrid(t_freqs, h_freqs, w_freqs, indexing='ij')
 
-    # Radial frequency
-    radius = torch.sqrt(t_grid**2 + h_grid**2 + w_grid**2)
+    # Scaled radial frequency: temporal_scale reduces temporal frequency contribution
+    scaled_t = t_grid * temporal_scale
+    radius = torch.sqrt(scaled_t**2 + h_grid**2 + w_grid**2)
     max_radius = radius.max().clamp(min=1e-8)
     radius_norm = radius / max_radius
 
@@ -685,6 +711,7 @@ def _spectral_loss_3d_video(
     low_cutoff: float,
     high_cutoff: float,
     use_phase: bool,
+    temporal_scale: float = 0.3,
 ) -> torch.Tensor:
     """
     3D spatio-temporal spectral loss for video (B, C, T, H, W).
@@ -722,11 +749,12 @@ def _spectral_loss_3d_video(
 
     fft_t, fft_h, fft_w = pred_fft.shape[-3], pred_fft.shape[-2], pred_fft.shape[-1]
 
-    # Create 3D spherical masks
+    # Create 3D masks with temporal scaling
     low_mask, mid_mask, high_mask = _create_spherical_frequency_masks(
         fft_t, fft_h, fft_w,
         low_cutoff, high_cutoff,
-        device=pred_fft.device
+        device=pred_fft.device,
+        temporal_scale=temporal_scale
     )
 
     # Expand masks: (1, fft_t, fft_h, fft_w)
@@ -779,6 +807,7 @@ def _spectral_loss_3d_video_dct(
     low_cutoff: float,
     high_cutoff: float,
     use_phase: bool,
+    temporal_scale: float = 0.3,
 ) -> torch.Tensor:
     """
     3D spatio-temporal spectral loss for video using DCT (SSVAE-compliant).
@@ -816,11 +845,12 @@ def _spectral_loss_3d_video_dct(
                                  n=H, dim=-2, norm='ortho'),
                          n=W, dim=-1, norm='ortho')
 
-    # Create 3D spherical masks using DCT frequency coordinates
+    # Create 3D masks with temporal scaling
     low_mask, mid_mask, high_mask = _create_dct_frequency_masks(
         T, H, W,
         low_cutoff, high_cutoff,
-        device=pred_dct.device
+        device=pred_dct.device,
+        temporal_scale=temporal_scale
     )
 
     # Expand masks: (1, T, H, W)
@@ -878,6 +908,7 @@ def spectral_flow_loss(
     lcr_weight=0.0,
     spectral_transform='dct',  # 'dct' (default, SSVAE-compliant) or 'fft'
     prediction_target='velocity',  # 'velocity' or 'x0'
+    temporal_scale=0.3,  # Scale temporal frequency for video (0.0-1.0)
     # Flow params
     flow_weight=0.1,
     flow_max_timestep=800,
@@ -1151,3 +1182,228 @@ def spectral_flow_loss(
     return (total_loss, flow_deviation, loss_spatial.mean().item(),
             flow_loss.item() * effective_flow_weight,
             spectral_component, flow_component)
+
+
+def mse_spectral_flow_loss(
+    model_pred,
+    latents,
+    noise,
+    batch_flow=None,
+    timesteps=None,
+    flow_loss_module=None,
+    vae_temporal_stride=4,
+    vae_spatial_stride=8,
+    # MSE params
+    mse_weight=1.0,
+    # Spectral params
+    low_weight=1.0,
+    mid_weight=1.0,
+    high_weight=2.0,
+    low_cutoff=0.15,
+    high_cutoff=0.5,
+    use_phase=True,
+    lcr_weight=0.0,
+    spectral_transform='dct',  # 'dct' (default, SSVAE-compliant) or 'fft'
+    prediction_target='velocity',  # 'velocity' or 'x0'
+    temporal_scale=0.3,  # Scale temporal frequency for video (0.0-1.0)
+    # Flow params
+    flow_weight=0.1,
+    flow_max_timestep=800,
+    motion_weighted=True,
+    adaptive=False,
+    current_flow_weight=None,
+):
+    """
+    Combined MSE + spectral + optical flow loss for video diffusion training.
+
+    MSE loss provides standard diffusion training signal.
+    Spectral loss handles spatial frequency distribution (structure vs texture).
+    Flow loss handles temporal motion consistency via latent-space flow warping.
+
+    Args:
+        mse_weight: Weight for the MSE component
+        spectral_transform: 'dct' for DCT-based (SSVAE-compliant, default), 'fft' for FFT-based
+        prediction_target: 'velocity' (model predicts ε - x₀) or 'x0' (model predicts x₀ directly)
+        flow_loss_module: Pre-cached FlowConsistencyLoss from SDTrainer.
+                          If None, creates a new one (fallback for testing).
+        current_flow_weight: Adaptive weight override. None = use flow_weight.
+
+    Returns:
+        tuple: (total_loss, flow_deviation, mse_loss_val, spatial_loss_val, flow_loss_val,
+                mse_component, spectral_component, flow_component)
+        - total_loss: combined loss tensor (per-pixel)
+        - flow_deviation: scalar raw flow loss for rejection/adaptive logic
+        - mse_loss_val: scalar MSE loss for logging
+        - spatial_loss_val: scalar spectral loss for logging
+        - flow_loss_val: scalar weighted flow loss (with flow_weight applied) for logging
+        - mse_component: MSE loss tensor (for gradient-selective rejection)
+        - spectral_component: spectral loss tensor (for gradient-selective rejection)
+        - flow_component: flow loss tensor (for gradient-selective rejection)
+    """
+    # Convert to float32 for precision
+    model_pred = model_pred.float()
+    latents = latents.float()
+    noise = noise.float()
+
+    # Reconstruct predicted clean latents based on prediction target
+    if prediction_target == 'x0':
+        pred_latents = model_pred
+    else:
+        pred_latents = noise - model_pred
+
+    is_video = len(latents.shape) == 5
+
+    # === MSE LOSS ===
+    # Standard MSE between predicted and target latents
+    mse_loss = F.mse_loss(pred_latents, latents, reduction='none')  # (B, C, T, H, W) or (B, C, H, W)
+
+    # === SPECTRAL LOSS ===
+    if is_video:
+        # Choose transform based on config
+        if spectral_transform == 'dct':
+            loss_spatial = _spectral_loss_3d_video_dct(
+                pred_latents, latents,
+                low_weight, mid_weight, high_weight,
+                low_cutoff, high_cutoff,
+                use_phase,
+                temporal_scale
+            )
+        else:
+            # Default: FFT
+            loss_spatial = _spectral_loss_3d_video(
+                pred_latents, latents,
+                low_weight, mid_weight, high_weight,
+                low_cutoff, high_cutoff,
+                use_phase,
+                temporal_scale
+            )
+    else:
+        # Image case: 2D FFT is correct
+        B, C, H, W = latents.shape
+        pred_reshaped = pred_latents
+        target_reshaped = latents
+
+        pred_fft = torch.fft.rfft2(pred_reshaped, norm='ortho')
+        target_fft = torch.fft.rfft2(target_reshaped, norm='ortho')
+
+        fft_h, fft_w = pred_fft.shape[-2], pred_fft.shape[-1]
+        low_mask, mid_mask, high_mask = _create_radial_frequency_masks(
+            fft_h, fft_w, low_cutoff, high_cutoff
+        )
+
+        band_losses = []
+        weights = [low_weight, mid_weight, high_weight]
+
+        for mask, weight in zip([low_mask, mid_mask, high_mask], weights):
+            mask_exp = mask.unsqueeze(0).unsqueeze(0).to(pred_fft.device)
+            pred_band = pred_fft * mask_exp
+            target_band = target_fft * mask_exp
+
+            if use_phase:
+                band_loss = F.mse_loss(pred_band.real, target_band.real, reduction='none') + \
+                           F.mse_loss(pred_band.imag, target_band.imag, reduction='none')
+            else:
+                band_loss = F.mse_loss(pred_band.abs(), target_band.abs(), reduction='none')
+
+            band_losses.append(band_loss * weight)
+
+        total_fft_loss = torch.stack(band_losses, dim=1).sum(dim=1)
+        loss_fft_complex = torch.view_as_complex(
+            torch.stack([total_fft_loss, torch.zeros_like(total_fft_loss)], dim=-1)
+        )
+        loss_spatial = torch.fft.irfft2(loss_fft_complex, s=(H, W), norm='ortho').abs()
+
+    # LCR loss
+    if lcr_weight > 0.0:
+        lcr_loss_scalar = _calculate_lcr_loss_ssvae_style(
+            pred_latents,
+            patch_size=2,
+            alpha=0.75
+        )
+        spectral_mean = loss_spatial.mean()
+        lcr_loss_scaled = lcr_loss_scalar * lcr_weight * spectral_mean
+        lcr_loss_uniform = lcr_loss_scaled * torch.ones_like(loss_spatial)
+        loss_spatial = loss_spatial + lcr_loss_uniform
+
+    # === OPTICAL FLOW LOSS (temporal motion) ===
+    flow_loss = torch.tensor(0.0, device=model_pred.device, dtype=model_pred.dtype)
+    flow_deviation = 0.0
+
+    if (is_video and batch_flow is not None and flow_weight > 0
+            and timesteps is not None):
+        B, C, T_lat, H_lat, W_lat = model_pred.shape
+
+        if T_lat >= 2:
+            from toolkit.optical_flow.flow_loss import FlowConsistencyLoss
+
+            # Handle expand_timesteps (Wan22 5B): timesteps may be (B, seq_len)
+            # instead of (B,). Use scalar timesteps for the timestep gate.
+            if timesteps.dim() == 2:
+                # Per-pixel timesteps — use first token's timestep as representative
+                t = timesteps[:, 0].float()
+            else:
+                t = timesteps.float()
+            gate = torch.clamp(1.0 - (t / flow_max_timestep), min=0.0)
+
+            if gate.sum() > 1e-6:
+                # x0 reconstruction for flow loss
+                sigma = (t / 1000.0).view(B, 1, 1, 1, 1).to(latents.dtype)
+                x_t = (1.0 - sigma) * latents + sigma * noise  # (B, C, T_lat, H_lat, W_lat)
+
+                if flow_loss_module is None:
+                    flow_module = FlowConsistencyLoss(
+                        vae_temporal_stride=vae_temporal_stride,
+                        vae_spatial_stride=vae_spatial_stride
+                    ).to(model_pred.device, dtype=model_pred.dtype)
+                else:
+                    # Only move if device/dtype differs
+                    param = next(flow_loss_module.parameters(), None)
+                    if param is None or param.device != model_pred.device or param.dtype != model_pred.dtype:
+                        flow_module = flow_loss_module.to(model_pred.device, dtype=model_pred.dtype)
+                    else:
+                        flow_module = flow_loss_module
+
+                # Handle prediction_target: convert x0 prediction to velocity form if needed
+                if prediction_target == 'x0':
+                    # model_pred is x0; convert to equivalent velocity
+                    flow_noise_pred = (x_t - model_pred) / sigma.clamp(min=1e-8)
+                else:
+                    flow_noise_pred = model_pred
+
+                flow_loss = flow_module(
+                    noise_pred=flow_noise_pred,
+                    noisy_latents=x_t,
+                    timesteps=t,
+                    batch_flow=batch_flow.float().to(model_pred.device),
+                    max_timestep=flow_max_timestep,
+                    motion_weighted=motion_weighted
+                )
+                flow_deviation = flow_loss.item()
+
+    # === COMBINE ===
+    if adaptive:
+        # When adaptive, use the dynamically-adjusted weight.
+        # current_flow_weight defaults to None, falling back to flow_weight.
+        effective_flow_weight = current_flow_weight if current_flow_weight is not None else flow_weight
+    else:
+        # When not adaptive, use the configured base weight
+        effective_flow_weight = flow_weight
+
+    # Keep all three components separate so PCGrad can project all three gradients
+    mse_component = mse_loss * mse_weight
+    spectral_component = loss_spatial
+    flow_component = flow_loss * effective_flow_weight
+    total_loss = mse_component + spectral_component + flow_component
+
+    # Return in original dtype for mixed precision compatibility
+    original_dtype = latents.dtype
+    mse_component = mse_component.to(original_dtype)
+    spectral_component = spectral_component.to(original_dtype)
+    flow_component = flow_component.to(original_dtype)
+    total_loss = total_loss.to(original_dtype)
+
+    return (total_loss, flow_deviation,
+            mse_loss.mean().item() * mse_weight,
+            loss_spatial.mean().item(),
+            flow_loss.item() * effective_flow_weight,
+            mse_component, spectral_component, flow_component)

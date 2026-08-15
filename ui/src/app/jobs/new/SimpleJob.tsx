@@ -2070,6 +2070,7 @@ export default function SimpleJob({
                     { value: 'wavelet', label: 'Wavelet' },
                     { value: 'spectral', label: 'Spectral (Frequency Balancing)' },
                     { value: 'spectral_flow', label: 'Spectral + Flow (Video Motion)' },
+                    { value: 'mse_spectral_flow', label: 'MSE + Spectral + Flow (Video)' },
                     { value: 'stepped', label: 'Stepped Recovery' },
                     { value: 'pseudo_huber', label: 'Pseudo Huber (Smooth L1)' },
                     { value: 'mean_flow', label: 'Mean Flow (Experimental)' },
@@ -2101,14 +2102,57 @@ export default function SimpleJob({
                     step={0.001}
                   />
                 )}
-                {(jobConfig.config.process[0].train.loss_type === 'spectral_flow' || jobConfig.config.process[0].train.loss_type === 'spectral') && (
+                {(jobConfig.config.process[0].train.loss_type === 'spectral_flow' || jobConfig.config.process[0].train.loss_type === 'spectral' || jobConfig.config.process[0].train.loss_type === 'mse_spectral_flow') && (
                   <div className="border border-blue-900 rounded-lg p-4 mt-2 space-y-3">
                     <p className="text-xs text-blue-300">
-                      {jobConfig.config.process[0].train.loss_type === 'spectral_flow'
-                        ? 'Spectral+Flow loss combines spectral (spatial frequency) with optical flow (temporal motion) consistency. '
-                        : ''}Spectral loss dissociates low frequencies (structure/motion) from high frequencies (texture/details).
-                      {jobConfig.config.process[0].train.loss_type === 'spectral_flow' && 'Requires cache_optical_flow_to_disk enabled on video datasets.'}
+                      {jobConfig.config.process[0].train.loss_type === 'mse_spectral_flow'
+                        ? 'MSE+Spectral+Flow loss combines standard MSE, spectral (spatial frequency), and optical flow (temporal motion) consistency. '
+                        : jobConfig.config.process[0].train.loss_type === 'spectral_flow'
+                          ? 'Spectral+Flow loss combines spectral (spatial frequency) with optical flow (temporal motion) consistency. '
+                          : ''}Spectral loss dissociates low frequencies (structure/motion) from high frequencies (texture/details).
+                      {(jobConfig.config.process[0].train.loss_type === 'spectral_flow' || jobConfig.config.process[0].train.loss_type === 'mse_spectral_flow') && 'Requires cache_optical_flow_to_disk enabled on video datasets.'}
                     </p>
+                    {jobConfig.config.process[0].train.loss_type === 'mse_spectral_flow' && (
+                      <div className="border-t border-blue-900 pt-3 mt-2">
+                        <p className="text-xs text-blue-300 mb-2">MSE Loss Weights (per-expert)</p>
+                        <div className="grid grid-cols-3 gap-3">
+                          <NumberInput
+                            label="MSE Weight (global)"
+                            className="pt-1"
+                            value={jobConfig.config.process[0].train.mse_spectral_flow_mse_weight ?? 1.0}
+                            onChange={value => setJobConfig(value, 'config.process[0].train.mse_spectral_flow_mse_weight')}
+                            placeholder="1.0"
+                            docKey={'train.mse_spectral_flow_mse_weight'}
+                            min={0}
+                            step={0.1}
+                          />
+                          <NumberInput
+                            label="MSE Weight (low noise)"
+                            className="pt-1"
+                            value={jobConfig.config.process[0].train.mse_spectral_flow_mse_weight_low ?? 1.0}
+                            onChange={value => setJobConfig(value, 'config.process[0].train.mse_spectral_flow_mse_weight_low')}
+                            placeholder="1.0"
+                            docKey={'train.mse_spectral_flow_mse_weight_low'}
+                            min={0}
+                            step={0.1}
+                          />
+                          <NumberInput
+                            label="MSE Weight (high noise)"
+                            className="pt-1"
+                            value={jobConfig.config.process[0].train.mse_spectral_flow_mse_weight_high ?? 1.0}
+                            onChange={value => setJobConfig(value, 'config.process[0].train.mse_spectral_flow_mse_weight_high')}
+                            placeholder="1.0"
+                            docKey={'train.mse_spectral_flow_mse_weight_high'}
+                            min={0}
+                            step={0.1}
+                          />
+                        </div>
+                        <p className="text-xs text-gray-500 mt-1">
+                          Per-expert weights override global. MSE provides standard diffusion training signal.
+                          Recommended: 0.5-2.0 for Wan 2.2 I2V LoRA.
+                        </p>
+                      </div>
+                    )}
                     <div className="grid grid-cols-3 gap-3">
                       <NumberInput
                         label="Low Freq Weight"
@@ -2211,7 +2255,7 @@ export default function SimpleJob({
                     </div>
                   </div>
                 )}
-                {jobConfig.config.process[0].train.loss_type === 'spectral_flow' && (
+                {(jobConfig.config.process[0].train.loss_type === 'spectral_flow' || jobConfig.config.process[0].train.loss_type === 'mse_spectral_flow') && (
                   <div className="border border-blue-800 rounded-lg p-4 mt-2 space-y-3">
                     <p className="text-xs text-blue-400">
                       Flow Loss Settings (temporal motion consistency)
@@ -2313,6 +2357,151 @@ export default function SimpleJob({
                       min={0}
                       step={10}
                     />
+                    <div className="border-t border-blue-900 pt-3 mt-3">
+                      <div className="flex items-center space-x-2 mb-2">
+                        <input
+                          type="checkbox"
+                          id="spectral_flow_gradient_projection_enabled"
+                          checked={jobConfig.config.process[0].train.spectral_flow_gradient_projection_enabled ?? false}
+                          onChange={e => setJobConfig(e.target.checked, 'config.process[0].train.spectral_flow_gradient_projection_enabled')}
+                          className="rounded border-gray-600"
+                        />
+                        <label htmlFor="spectral_flow_gradient_projection_enabled" className="text-sm text-blue-300 font-medium">
+                          Gradient Projection (PCGrad-style)
+                        </label>
+                      </div>
+                      {jobConfig.config.process[0].train.spectral_flow_gradient_projection_enabled && (
+                        <div className="ml-4 mb-3">
+                          <p className="text-xs text-gray-500">
+                            Computes spectral and flow gradients separately. When they conflict (one improves while other worsens),
+                            projects spectral gradient to remove the conflicting component. This directly nudges optimization
+                            toward directions that improve spectral loss without hurting flow loss. More effective than step rejection
+                            but adds computational overhead (~2x backward cost).
+                          </p>
+                        </div>
+                      )}
+                      {jobConfig.config.process[0].train.loss_type === 'mse_spectral_flow' && (
+                        <div className="border-t border-blue-900 pt-3 mt-3">
+                          <div className="flex items-center space-x-2 mb-2">
+                            <input
+                              type="checkbox"
+                              id="mse_spectral_flow_gradient_projection_enabled"
+                              checked={jobConfig.config.process[0].train.mse_spectral_flow_gradient_projection_enabled ?? false}
+                              onChange={e => setJobConfig(e.target.checked, 'config.process[0].train.mse_spectral_flow_gradient_projection_enabled')}
+                              className="rounded border-gray-600"
+                            />
+                            <label htmlFor="mse_spectral_flow_gradient_projection_enabled" className="text-sm text-blue-300 font-medium">
+                              Gradient Projection (PCGrad-style, 3-way)
+                            </label>
+                          </div>
+                          {jobConfig.config.process[0].train.mse_spectral_flow_gradient_projection_enabled && (
+                            <div className="ml-4 mb-3">
+                              <p className="text-xs text-gray-500">
+                                Computes MSE, spectral, and flow gradients separately. When any gradients conflict, projects them
+                                to remove conflicting components. This allows all three losses to contribute without destructive
+                                interference. More effective than step rejection but adds computational overhead (~3x backward cost).
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      <div className="flex items-center space-x-2 mb-2">
+                        <input
+                          type="checkbox"
+                          id="spectral_flow_loss_rejection_enabled"
+                          checked={jobConfig.config.process[0].train.spectral_flow_loss_rejection_enabled ?? false}
+                          onChange={e => setJobConfig(e.target.checked, 'config.process[0].train.spectral_flow_loss_rejection_enabled')}
+                          className="rounded border-gray-600"
+                        />
+                        <label htmlFor="spectral_flow_loss_rejection_enabled" className="text-sm text-blue-300 font-medium">
+                          Enable Step Loss Rejection (trust region)
+                        </label>
+                      </div>
+                      {jobConfig.config.process[0].train.spectral_flow_loss_rejection_enabled && (
+                        <div className="space-y-2 ml-4">
+                          <div className="grid grid-cols-2 gap-3">
+                            <NumberInput
+                              label="Max Loss (low noise)"
+                              className="pt-1"
+                              value={jobConfig.config.process[0].train.spectral_flow_loss_rejection_max_low ?? 7.0}
+                              onChange={value => setJobConfig(value, 'config.process[0].train.spectral_flow_loss_rejection_max_low')}
+                              placeholder="7.0"
+                              docKey={'train.spectral_flow_loss_rejection_max_low'}
+                              min={0}
+                              step={0.5}
+                            />
+                            <NumberInput
+                              label="Max Loss (high noise)"
+                              className="pt-1"
+                              value={jobConfig.config.process[0].train.spectral_flow_loss_rejection_max_high ?? 14.0}
+                              onChange={value => setJobConfig(value, 'config.process[0].train.spectral_flow_loss_rejection_max_high')}
+                              placeholder="14.0"
+                              docKey={'train.spectral_flow_loss_rejection_max_high'}
+                              min={0}
+                              step={0.5}
+                            />
+                          </div>
+                          <NumberInput
+                            label="Max Loss Increase (%)"
+                            className="pt-1"
+                            value={jobConfig.config.process[0].train.spectral_flow_loss_rejection_max_increase_pct ?? 20.0}
+                            onChange={value => setJobConfig(value, 'config.process[0].train.spectral_flow_loss_rejection_max_increase_pct')}
+                            placeholder="20.0"
+                            docKey={'train.spectral_flow_loss_rejection_max_increase_pct'}
+                            min={0}
+                            step={5}
+                          />
+                          <p className="text-xs text-gray-500">
+                            Rejects optimizer steps where loss exceeds thresholds or increases too much.
+                            Prevents catastrophic loss spikes and training collapse. Rejected steps skip parameter updates.
+                          </p>
+                        </div>
+                      )}
+                      <div className="border-t border-blue-900 pt-3 mt-3">
+                        <div className="flex items-center space-x-2 mb-2">
+                          <input
+                            type="checkbox"
+                            id="spectral_flow_constraint_rejection_enabled"
+                            checked={jobConfig.config.process[0].train.spectral_flow_constraint_rejection_enabled ?? false}
+                            onChange={e => setJobConfig(e.target.checked, 'config.process[0].train.spectral_flow_constraint_rejection_enabled')}
+                            className="rounded border-gray-600"
+                          />
+                          <label htmlFor="spectral_flow_constraint_rejection_enabled" className="text-sm text-blue-300 font-medium">
+                            Constraint Mode: Prioritize Spectral, Protect Flow
+                          </label>
+                        </div>
+                        {jobConfig.config.process[0].train.spectral_flow_constraint_rejection_enabled && (
+                          <div className="space-y-2 ml-4">
+                            <NumberInput
+                              label="Max Flow Loss Increase (%)"
+                              className="pt-1"
+                              value={jobConfig.config.process[0].train.spectral_flow_constraint_flow_max_increase_pct ?? 5.0}
+                              onChange={value => setJobConfig(value, 'config.process[0].train.spectral_flow_constraint_flow_max_increase_pct')}
+                              placeholder="5.0"
+                              docKey={'train.spectral_flow_constraint_flow_max_increase_pct'}
+                              min={0}
+                              step={1}
+                            />
+                            <div className="flex items-center space-x-2">
+                              <input
+                                type="checkbox"
+                                id="spectral_flow_constraint_spectral_must_decrease"
+                                checked={jobConfig.config.process[0].train.spectral_flow_constraint_spectral_must_decrease ?? true}
+                                onChange={e => setJobConfig(e.target.checked, 'config.process[0].train.spectral_flow_constraint_spectral_must_decrease')}
+                                className="rounded border-gray-600"
+                              />
+                              <label htmlFor="spectral_flow_constraint_spectral_must_decrease" className="text-xs text-gray-300">
+                                Require spectral loss to decrease each step
+                              </label>
+                            </div>
+                            <p className="text-xs text-gray-500">
+                              Rejects steps that reduce spectral loss while increasing flow loss beyond threshold.
+                              Enforces multi-objective balance — flow loss constrains optimization without dominating.
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
                     <p className="text-xs text-gray-500">
                       Flow loss enforces temporal motion consistency by warping predicted frames with ground truth optical flow.
                       Only active at timesteps &lt; Flow Max Timestep (low-noise regime where motion is meaningful).
@@ -2798,7 +2987,7 @@ export default function SimpleJob({
                           />
                         )}
                         {/* Optical flow caching options for video datasets */}
-                        {(dataset.num_frames > 1 || dataset.auto_frame_count || jobConfig.config.process[0].train.loss_type === 'spectral_flow') && (
+                        {(dataset.num_frames > 1 || dataset.auto_frame_count || jobConfig.config.process[0].train.loss_type === 'spectral_flow' || jobConfig.config.process[0].train.loss_type === 'mse_spectral_flow') && (
                           <div className="mt-2 space-y-2">
                             <div className="flex items-center justify-between">
                               <span className="text-sm font-medium text-gray-300">Optical Flow Caching</span>

@@ -148,6 +148,9 @@ function dulledColor(rgba: string): string {
   return `rgba(${r},${g},${b},1)`;
 }
 
+// Metrics are filtered server-side in the loss route API.
+// Server removes internal counters before sending to client.
+
 export default function JobLossGraph({ job }: Props) {
   const { series, lossKeys, status, refreshLoss } = useJobLossLog(job.id, 2000);
 
