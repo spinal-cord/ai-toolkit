@@ -111,7 +111,8 @@ class FlowConsistencyLoss(nn.Module):
     def forward(self, noise_pred: torch.Tensor, noisy_latents: torch.Tensor,
                 timesteps: torch.Tensor, batch_flow: torch.Tensor,
                 max_timestep: int = 800,
-                motion_weighted: bool = True) -> torch.Tensor:
+                motion_weighted: bool = True,
+                reverse_gate: bool = False) -> torch.Tensor:
         """
         Compute flow consistency loss.
 
@@ -120,8 +121,13 @@ class FlowConsistencyLoss(nn.Module):
             noisy_latents: (B, C, T_lat, H_lat, W_lat)
             timesteps: (B,) in [0, 1000]
             batch_flow: (B, T-1, 2, H, W) fp16 pixel-space flow from cache
-            max_timestep: only enforce motion at t < max_timestep
+            max_timestep: only enforce motion at t < max_timestep (normal gate)
+                         or t > max_timestep (reverse gate)
             motion_weighted: weight by flow magnitude
+            reverse_gate: if True, flow loss is weighted higher at high-noise timesteps
+                         (t > max_timestep gets full weight, t < max_timestep fades to 0)
+                         Normal gate: weight = 1.0 - t/max_timestep (max weight at low noise)
+                         Reverse gate: weight = t/max_timestep (max weight at high noise)
 
         Returns:
             Scalar flow consistency loss
@@ -131,9 +137,16 @@ class FlowConsistencyLoss(nn.Module):
         if T_lat < 2 or batch_flow is None:
             return torch.tensor(0.0, device=noise_pred.device, dtype=noise_pred.dtype)
 
-        # Timestep gate: only enforce motion at low-noise steps (pred_x0 meaningful)
+        # Timestep gate: controls where flow loss is applied
         t = timesteps.float()
-        gate = torch.clamp(1.0 - (t / max_timestep), min=0.0)  # (B,), 1 at t=0, 0 at t>=max
+        if reverse_gate:
+            # Reverse gate: full weight at high noise (t >= max_timestep), zero at low noise (t = 0)
+            # Useful when you want flow consistency enforced even in high-noise regime
+            gate = torch.clamp(t / max_timestep, min=0.0, max=1.0)  # (B,), 0 at t=0, 1 at t>=max
+        else:
+            # Normal gate: full weight at low noise (t = 0), zero at high noise (t >= max_timestep)
+            # Default: pred_x0 is most meaningful at low noise
+            gate = torch.clamp(1.0 - (t / max_timestep), min=0.0)  # (B,), 1 at t=0, 0 at t>=max
 
         if gate.sum() < 1e-6:
             return torch.tensor(0.0, device=noise_pred.device, dtype=noise_pred.dtype)

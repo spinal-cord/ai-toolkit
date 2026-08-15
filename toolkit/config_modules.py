@@ -1052,6 +1052,7 @@ class TrainConfig:
         self.spectral_flow_weight_low = kwargs.get('spectral_flow_weight_low', None)  # per-expert weight for low noise
         self.spectral_flow_weight_high = kwargs.get('spectral_flow_weight_high', None)  # per-expert weight for high noise
         self.spectral_flow_max_timestep = kwargs.get('spectral_flow_max_timestep', 800)  # timestep gate for flow loss
+        self.spectral_flow_reverse_gate = kwargs.get('spectral_flow_reverse_gate', False)  # reverse gate: more weight at high noise
         self.spectral_flow_motion_weighted = kwargs.get('spectral_flow_motion_weighted', True)  # weight by motion magnitude
         self.spectral_flow_adaptive = kwargs.get('spectral_flow_adaptive', False)  # dynamic weight adjustment
         self.spectral_flow_rejection_threshold = kwargs.get('spectral_flow_rejection_threshold', 5.0)  # deviation threshold

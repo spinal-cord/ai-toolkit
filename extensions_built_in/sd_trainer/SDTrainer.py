@@ -1451,6 +1451,7 @@ class SDTrainer(BaseSDTrainProcess):
                         flow_weight=base_flow_weight,
                         flow_max_timestep=self.train_config.spectral_flow_max_timestep,
                         motion_weighted=self.train_config.spectral_flow_motion_weighted,
+                        reverse_gate=self.train_config.spectral_flow_reverse_gate,
                         adaptive=self.train_config.spectral_flow_adaptive,
                         current_flow_weight=expert_flow_weight,
                     )
@@ -1698,6 +1699,7 @@ class SDTrainer(BaseSDTrainProcess):
                         flow_weight=base_flow_weight,
                         flow_max_timestep=self.train_config.spectral_flow_max_timestep,
                         motion_weighted=self.train_config.spectral_flow_motion_weighted,
+                        reverse_gate=self.train_config.spectral_flow_reverse_gate,
                         adaptive=self.train_config.spectral_flow_adaptive,
                         current_flow_weight=expert_flow_weight,
                     )

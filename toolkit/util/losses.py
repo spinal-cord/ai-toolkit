@@ -913,6 +913,7 @@ def spectral_flow_loss(
     flow_weight=0.1,
     flow_max_timestep=800,
     motion_weighted=True,
+    reverse_gate=False,  # if True, flow loss weighted higher at high-noise timesteps
     adaptive=False,
     current_flow_weight=None,
 ):
@@ -927,6 +928,8 @@ def spectral_flow_loss(
         prediction_target: 'velocity' (model predicts ε - x₀) or 'x0' (model predicts x₀ directly)
         flow_loss_module: Pre-cached FlowConsistencyLoss from SDTrainer.
                           If None, creates a new one (fallback for testing).
+        reverse_gate: if True, flow loss is weighted higher at high-noise timesteps
+                     (useful for enforcing motion consistency even in high-noise regime)
         current_flow_weight: Adaptive weight override. None = use flow_weight.
 
     Returns:
@@ -1109,7 +1112,12 @@ def spectral_flow_loss(
                 t = timesteps[:, 0].float()
             else:
                 t = timesteps.float()
-            gate = torch.clamp(1.0 - (t / flow_max_timestep), min=0.0)
+
+            # Compute gate for early-exit check (same logic as FlowConsistencyLoss.forward)
+            if reverse_gate:
+                gate = torch.clamp(t / flow_max_timestep, min=0.0, max=1.0)
+            else:
+                gate = torch.clamp(1.0 - (t / flow_max_timestep), min=0.0)
 
             if gate.sum() > 1e-6:
                 # x0 reconstruction for flow loss:
@@ -1154,7 +1162,8 @@ def spectral_flow_loss(
                     timesteps=t,
                     batch_flow=batch_flow.float().to(model_pred.device),
                     max_timestep=flow_max_timestep,
-                    motion_weighted=motion_weighted
+                    motion_weighted=motion_weighted,
+                    reverse_gate=reverse_gate
                 )
                 flow_deviation = flow_loss.item()
 
@@ -1210,6 +1219,7 @@ def mse_spectral_flow_loss(
     flow_weight=0.1,
     flow_max_timestep=800,
     motion_weighted=True,
+    reverse_gate=False,  # if True, flow loss weighted higher at high-noise timesteps
     adaptive=False,
     current_flow_weight=None,
 ):
@@ -1226,6 +1236,8 @@ def mse_spectral_flow_loss(
         prediction_target: 'velocity' (model predicts ε - x₀) or 'x0' (model predicts x₀ directly)
         flow_loss_module: Pre-cached FlowConsistencyLoss from SDTrainer.
                           If None, creates a new one (fallback for testing).
+        reverse_gate: if True, flow loss is weighted higher at high-noise timesteps
+                     (useful for enforcing motion consistency even in high-noise regime)
         current_flow_weight: Adaptive weight override. None = use flow_weight.
 
     Returns:
@@ -1343,7 +1355,12 @@ def mse_spectral_flow_loss(
                 t = timesteps[:, 0].float()
             else:
                 t = timesteps.float()
-            gate = torch.clamp(1.0 - (t / flow_max_timestep), min=0.0)
+
+            # Compute gate for early-exit check (same logic as FlowConsistencyLoss.forward)
+            if reverse_gate:
+                gate = torch.clamp(t / flow_max_timestep, min=0.0, max=1.0)
+            else:
+                gate = torch.clamp(1.0 - (t / flow_max_timestep), min=0.0)
 
             if gate.sum() > 1e-6:
                 # x0 reconstruction for flow loss
@@ -1376,7 +1393,8 @@ def mse_spectral_flow_loss(
                     timesteps=t,
                     batch_flow=batch_flow.float().to(model_pred.device),
                     max_timestep=flow_max_timestep,
-                    motion_weighted=motion_weighted
+                    motion_weighted=motion_weighted,
+                    reverse_gate=reverse_gate
                 )
                 flow_deviation = flow_loss.item()
 

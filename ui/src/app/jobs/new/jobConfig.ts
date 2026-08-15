@@ -125,6 +125,7 @@ export const defaultJobConfig: JobConfig = {
           // Spectral flow loss config
           spectral_flow_weight: 0.1,
           spectral_flow_max_timestep: 800,
+          spectral_flow_reverse_gate: false,
           spectral_flow_motion_weighted: true,
           spectral_flow_adaptive: false,
           spectral_flow_rejection_threshold: 5.0,

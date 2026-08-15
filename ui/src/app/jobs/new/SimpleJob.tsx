@@ -2327,6 +2327,23 @@ export default function SimpleJob({
                       <div className="flex items-center space-x-2">
                         <input
                           type="checkbox"
+                          id="spectral_flow_reverse_gate"
+                          checked={jobConfig.config.process[0].train.spectral_flow_reverse_gate ?? false}
+                          onChange={e => setJobConfig(e.target.checked, 'config.process[0].train.spectral_flow_reverse_gate')}
+                          className="rounded border-gray-600"
+                        />
+                        <label htmlFor="spectral_flow_reverse_gate" className="text-sm text-gray-300">
+                          Reverse Flow Timestamp Gate
+                        </label>
+                      </div>
+                    </div>
+                    <p className="text-xs text-gray-500">
+                      Normal gate: flow loss applies at low-noise steps (t &lt; max_timestep). Reverse gate: flow loss applies at high-noise steps (t &gt; max_timestep), useful for enforcing motion consistency early in denoising.
+                    </p>
+                    <div className="flex items-center space-x-4 pt-1">
+                      <div className="flex items-center space-x-2">
+                        <input
+                          type="checkbox"
                           id="spectral_flow_adaptive"
                           checked={jobConfig.config.process[0].train.spectral_flow_adaptive ?? false}
                           onChange={e => setJobConfig(e.target.checked, 'config.process[0].train.spectral_flow_adaptive')}

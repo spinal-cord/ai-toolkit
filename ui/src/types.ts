@@ -266,6 +266,7 @@ export interface TrainConfig {
   // Spectral flow loss config
   spectral_flow_weight?: number;
   spectral_flow_max_timestep?: number;
+  spectral_flow_reverse_gate?: boolean;
   spectral_flow_motion_weighted?: boolean;
   spectral_flow_adaptive?: boolean;
   spectral_flow_rejection_threshold?: number;
