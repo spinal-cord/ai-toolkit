@@ -365,6 +365,429 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'train.timestep_range_overrides': {
+    title: 'Per-Timestep Range Loss Overrides',
+    description: (
+      <>
+        <strong>Overview</strong>
+        <br />
+        Per-Timestep Range Loss Overrides allow you to dynamically adjust loss weights during training based on
+        the current timestep. This gives you fine-grained control over what the model learns at different stages
+        of the denoising process.
+        <br />
+        <br />
+        <strong>How Ranges Work</strong>
+        <br />
+        Ranges are specified in <strong>absolute model timesteps (0-1000)</strong>. No scaling or mapping is applied —
+        ranges are used exactly as written.
+        <br />
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li>Range is <code>[start, end)</code> — inclusive of start, exclusive of end</li>
+          <li>Descending ranges (e.g., 1000-500) match timesteps from start down to end+1</li>
+          <li>Ascending ranges (e.g., 0-500) also work — match timesteps from start up to end-1</li>
+          <li>First matching range wins (order matters if ranges overlap)</li>
+        </ul>
+        <br />
+        <strong>Dual-Expert Models (e.g., Wan 2.2 14B)</strong>
+        <br />
+        For dual-expert models, each expert operates in its own timestep range. Your overrides automatically
+        apply only when the active expert's timestep falls within a specified range:
+        <br />
+        <br />
+        <table className="w-full text-xs border-collapse border border-gray-600">
+          <thead>
+            <tr className="bg-gray-700">
+              <th className="border border-gray-600 px-2 py-1 text-left">Model</th>
+              <th className="border border-gray-600 px-2 py-1 text-left">High-Noise Expert</th>
+              <th className="border border-gray-600 px-2 py-1 text-left">Low-Noise Expert</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1">Wan 2.2 14B I2V</td>
+              <td className="border border-gray-600 px-2 py-1">timesteps 901-1000</td>
+              <td className="border border-gray-600 px-2 py-1">timesteps 0-900</td>
+            </tr>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1">Wan 2.2 14B T2V</td>
+              <td className="border border-gray-600 px-2 py-1">timesteps 876-1000</td>
+              <td className="border border-gray-600 px-2 py-1">timesteps 0-875</td>
+            </tr>
+          </tbody>
+        </table>
+        <br />
+        <strong>Targeting Specific Experts</strong>
+        <br />
+        Because each expert only sees its own timesteps, you can target experts by choosing ranges within their
+        operating window:
+        <br />
+        <br />
+        <table className="w-full text-xs border-collapse border border-gray-600">
+          <thead>
+            <tr className="bg-gray-700">
+              <th className="border border-gray-600 px-2 py-1 text-left">Range</th>
+              <th className="border border-gray-600 px-2 py-1 text-left">Affects</th>
+              <th className="border border-gray-600 px-2 py-1 text-left">Use Case</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1"><code>1000-900</code></td>
+              <td className="border border-gray-600 px-2 py-1">High-noise only</td>
+              <td className="border border-gray-600 px-2 py-1">Structure/motion learning</td>
+            </tr>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1"><code>800-400</code></td>
+              <td className="border border-gray-600 px-2 py-1">Low-noise only</td>
+              <td className="border border-gray-600 px-2 py-1">Mid-range refinement</td>
+            </tr>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1"><code>100-0</code></td>
+              <td className="border border-gray-600 px-2 py-1">Low-noise only</td>
+              <td className="border border-gray-600 px-2 py-1">Final detail polish</td>
+            </tr>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1"><code>950-850</code></td>
+              <td className="border border-gray-600 px-2 py-1">Both (crosses boundary)</td>
+              <td className="border border-gray-600 px-2 py-1">Transition region</td>
+            </tr>
+          </tbody>
+        </table>
+        <br />
+        <strong>Boundary Behavior</strong>
+        <br />
+        The boundary timestep itself belongs to the <strong>low-noise expert</strong> (t ≤ boundary).
+        For example, at boundary=900:
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li>Range <code>1000-900</code>: matches timesteps 901-1000 (high-noise)</li>
+          <li>Range <code>900-800</code>: matches timesteps 801-900, <strong>including 900</strong> (low-noise)</li>
+          <li>Timestep 900 → uses the <code>900-800</code> range, not <code>1000-900</code></li>
+        </ul>
+        <br />
+        <strong>Precedence (What Takes Priority)</strong>
+        <br />
+        When determining which weight to use, the system checks in this order:
+        <br />
+        <ol className="list-decimal list-inside ml-4 space-y-1">
+          <li><strong>Per-Range Override</strong> (if timestep matches AND field is explicitly set)</li>
+          <li><strong>Per-Expert Config</strong> (e.g., spectral_low_weight_low)</li>
+          <li><strong>Global Config</strong> (e.g., spectral_low_weight)</li>
+        </ol>
+        <br />
+        <strong>Important:</strong> This is <strong>selective per field</strong>. If you set only <code>flow_weight</code>
+        in a range, all other weights still fall through to per-expert/global config.
+        <br />
+        <br />
+        <strong>Available Overrides Per Range</strong>
+        <br />
+        <table className="w-full text-xs border-collapse border border-gray-600">
+          <thead>
+            <tr className="bg-gray-700">
+              <th className="border border-gray-600 px-2 py-1 text-left">Category</th>
+              <th className="border border-gray-600 px-2 py-1 text-left">Fields</th>
+              <th className="border border-gray-600 px-2 py-1 text-left">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1 font-medium">Loss Weights</td>
+              <td className="border border-gray-600 px-2 py-1">
+                <code>flow_weight</code>, <code>spectral_weight</code>, <code>mse_weight</code>
+              </td>
+              <td className="border border-gray-600 px-2 py-1">Overall weight for each loss component</td>
+            </tr>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1 font-medium">Frequency Weights</td>
+              <td className="border border-gray-600 px-2 py-1">
+                <code>spectral_low_weight</code>, <code>spectral_mid_weight</code>, <code>spectral_high_weight</code>
+              </td>
+              <td className="border border-gray-600 px-2 py-1">Balance between structure (low) and texture (high)</td>
+            </tr>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1 font-medium">Spectral Filters</td>
+              <td className="border border-gray-600 px-2 py-1">
+                <code>spectral_low_cutoff</code>, <code>spectral_high_cutoff</code>, <code>spectral_lcr_weight</code>, <code>spectral_temporal_scale</code>
+              </td>
+              <td className="border border-gray-600 px-2 py-1">Frequency band boundaries and temporal scaling</td>
+            </tr>
+          </tbody>
+        </table>
+        <br />
+        <strong>Practical Examples</strong>
+        <br />
+        <br />
+        <strong>Example 1: Structure first, then texture</strong>
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li>Range <code>1000-700</code>: <code>spectral_low_weight=2.0</code>, <code>spectral_high_weight=0.5</code></li>
+          <li>Range <code>600-0</code>: <code>spectral_low_weight=0.5</code>, <code>spectral_high_weight=3.0</code></li>
+        </ul>
+        <br />
+        <strong>Example 2: Disable flow loss in low-noise regime</strong>
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li>Range <code>800-0</code>: <code>flow_weight=0</code> (completely disables flow loss below timestep 800)</li>
+        </ul>
+        <br />
+        <strong>Example 3: Fine-tune frequency cutoffs per range</strong>
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li>Range <code>1000-600</code>: <code>spectral_low_cutoff=0.2</code> (wider low-freq band for structure)</li>
+          <li>Range <code>500-0</code>: <code>spectral_low_cutoff=0.1</code>, <code>spectral_high_cutoff=0.6</code> (more high-freq focus)</li>
+        </ul>
+        <br />
+        <strong>Interaction with Global Settings</strong>
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li><code>reverse_gate</code> is <strong>always global</strong> — per-range overrides use the same gate curve</li>
+          <li><code>flow_max_timestep</code> is <strong>always global</strong> — affects the gate calculation</li>
+          <li>Per-range <code>flow_weight</code> scales the gated flow loss (including when reverse_gate is on)</li>
+          <li>Setting <code>flow_weight=0</code> in a range completely disables flow loss for that range</li>
+        </ul>
+        <br />
+        <strong>Quick Tips</strong>
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li>Leave fields empty (null) to use the default per-expert/global value</li>
+          <li>Use adjacent non-overlapping ranges (e.g., 1000-900 and 900-0) for clean expert targeting</li>
+          <li>Start with simple overrides — adjust one weight at a time</li>
+          <li>Monitor training logs to see which ranges are being hit and their effects</li>
+        </ul>
+      </>
+    ),
+  },
+  'train.attention_tanh_softcap_enabled': {
+    title: 'Attention Tanh Softcapping',
+    description: (
+      <>
+        <strong>Overview</strong>
+        <br />
+        Applies tanh softcapping to attention scores before softmax, inspired by Gemma2 and Grok-1.
+        This technique prevents attention scores from becoming too extreme, improving training stability
+        and generalization.
+        <br />
+        <br />
+        <strong>How It Works</strong>
+        <br />
+        Transforms attention scores using: <code className="bg-gray-700 px-1 rounded">soft_cap * tanh(score / soft_cap)</code>
+        <br />
+        <br />
+        <table className="w-full text-xs border-collapse border border-gray-600">
+          <thead>
+            <tr className="bg-gray-700">
+              <th className="border border-gray-600 px-2 py-1 text-left">Score Range</th>
+              <th className="border border-gray-600 px-2 py-1 text-left">Without Softcap</th>
+              <th className="border border-gray-600 px-2 py-1 text-left">With Softcap (30)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1">Normal (-10 to 10)</td>
+              <td className="border border-gray-600 px-2 py-1">Passed through</td>
+              <td className="border border-gray-600 px-2 py-1">Almost unchanged</td>
+            </tr>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1">Extreme (30+)</td>
+              <td className="border border-gray-600 px-2 py-1">Dominates softmax</td>
+              <td className="border border-gray-600 px-2 py-1">Capped at ~30</td>
+            </tr>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1">Very extreme (100+)</td>
+              <td className="border border-gray-600 px-2 py-1">Near-100% attention</td>
+              <td className="border border-gray-600 px-2 py-1">Capped at ~30</td>
+            </tr>
+          </tbody>
+        </table>
+        <br />
+        <strong>Soft Cap Value</strong>
+        <br />
+        Controls how aggressively scores are capped:
+        <br />
+        <br />
+        <table className="w-full text-xs border-collapse border border-gray-600">
+          <thead>
+            <tr className="bg-gray-700">
+              <th className="border border-gray-600 px-2 py-1 text-left">Range</th>
+              <th className="border border-gray-600 px-2 py-1 text-left">Effect</th>
+              <th className="border border-gray-600 px-2 py-1 text-left">Use When</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1"><code>10-20</code></td>
+              <td className="border border-gray-600 px-2 py-1">Strong capping</td>
+              <td className="border border-gray-600 px-2 py-1">Unstable training, very sharp attention</td>
+            </tr>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1"><code>20-30</code></td>
+              <td className="border border-gray-600 px-2 py-1">Moderate capping</td>
+              <td className="border border-gray-600 px-2 py-1">Default recommendation</td>
+            </tr>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1"><code>30-50</code></td>
+              <td className="border border-gray-600 px-2 py-1">Gentle capping</td>
+              <td className="border border-gray-600 px-2 py-1">Subtle stabilization only</td>
+            </tr>
+          </tbody>
+        </table>
+        <br />
+        <strong>Benefits</strong>
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li>Prevents attention from collapsing to single tokens</li>
+          <li>Reduces gradient explosion from extreme attention scores</li>
+          <li>Improves training stability, especially with large batch sizes</li>
+          <li>Helps with long-context training where attention can become too focused</li>
+        </ul>
+        <br />
+        <strong>Attention Mask Support</strong>
+        <br />
+        Softcapping now works correctly with attention masks. Masks are integrated into the
+        flex_attention score_mod function, allowing both features to work together:
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li>Padding masks: masked positions get -inf score (zero attention weight)</li>
+          <li>Causal masks: future positions are masked before softcapping</li>
+          <li>Custom masks: any SDPA-compatible mask format is supported</li>
+        </ul>
+        <br />
+        <strong>Monitoring & Logging</strong>
+        <br />
+        Training logs automatically report softcapping statistics every 500 steps:
+        <br />
+        <br />
+        <table className="w-full text-xs border-collapse border border-gray-600">
+          <thead>
+            <tr className="bg-gray-700">
+              <th className="border border-gray-600 px-2 py-1 text-left">Metric</th>
+              <th className="border border-gray-600 px-2 py-1 text-left">Meaning</th>
+              <th className="border border-gray-600 px-2 py-1 text-left">Good Range</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1"><code>Scores capped</code></td>
+              <td className="border border-gray-600 px-2 py-1">% of attention scores modified by softcap</td>
+              <td className="border border-gray-600 px-2 py-1">0-5% (low = working as safety net)</td>
+            </tr>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1"><code>Max reduction</code></td>
+              <td className="border border-gray-600 px-2 py-1">How much extreme scores were reduced</td>
+              <td className="border border-gray-600 px-2 py-1">0-20% (lower = less intervention needed)</td>
+            </tr>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1"><code>LSE (sharpness)</code></td>
+              <td className="border border-gray-600 px-2 py-1">Attention entropy (lower = softer/more diffuse)</td>
+              <td className="border border-gray-600 px-2 py-1">Depends on seq len, monitor trends</td>
+            </tr>
+          </tbody>
+        </table>
+        <br />
+        <strong>Interpreting the logs:</strong>
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li><strong>0% capped:</strong> Softcapping not needed (attention scores well-behaved)</li>
+          <li><strong>1-5% capped:</strong> Normal - acting as safety net for extreme scores</li>
+          <li><strong>{'>'}10% capped:</strong> Consider lowering soft_cap or investigating attention behavior</li>
+          <li><strong>Falling LSE over time:</strong> Attention becoming softer (softcapping effect increasing)</li>
+        </ul>
+        <br />
+        <strong>Performance Optimizations</strong>
+        <br />
+        The implementation includes several optimizations to minimize overhead:
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li><strong>Hardware-accelerated tanh:</strong> Uses <code className="text-green-400">tanh.approx.f32</code> PTX instruction (same as Gemma2/Grok-1)</li>
+          <li><strong>BlockMask caching:</strong> Reuses pre-computed masks to avoid expensive vmap tracing</li>
+          <li><strong>Block sparsity:</strong> Skips computation for fully-masked blocks (padding, causal)</li>
+        </ul>
+        <br />
+        <strong>Requirements</strong>
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li>Requires PyTorch 2.5+ with flex_attention support</li>
+          <li>Falls back silently to standard attention if unavailable</li>
+          <li>Currently integrated with Wan attention processors</li>
+          <li>Logging overhead: negligible (~0.1% training time)</li>
+        </ul>
+        <br />
+        <strong>Default: Enabled with soft_cap=30</strong>
+        <br />
+        This provides gentle stabilization without noticeably affecting model behavior.
+      </>
+    ),
+  },
+  'train.attention_f32_rope_enabled': {
+    title: 'Attention F32 RoPE Acceleration',
+    description: (
+      <>
+        <strong>Overview</strong>
+        <br />
+        Uses float32 instead of float64 for rotary position embedding (RoPE) computations,
+        providing a significant speedup while maintaining numerical stability.
+        <br />
+        <br />
+        <strong>How It Works</strong>
+        <br />
+        Rotary embeddings apply position-dependent rotations to query/key vectors. The computation involves:
+        <br />
+        <code className="bg-gray-700 px-1 rounded">x_rotated = complex(hidden_states) * freqs</code>
+        <br />
+        <br />
+        <strong>Dtype Comparison</strong>
+        <br />
+        <table className="w-full text-xs border-collapse border border-gray-600">
+          <thead>
+            <tr className="bg-gray-700">
+              <th className="border border-gray-600 px-2 py-1 text-left">Dtype</th>
+              <th className="border border-gray-600 px-2 py-1 text-left">Speed</th>
+              <th className="border border-gray-600 px-2 py-1 text-left">Precision</th>
+              <th className="border border-gray-600 px-2 py-1 text-left">Used By</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1"><code>float64</code></td>
+              <td className="border border-gray-600 px-2 py-1">Slow</td>
+              <td className="border border-gray-600 px-2 py-1">Maximum</td>
+              <td className="border border-gray-600 px-2 py-1">Toolkit default (conservative)</td>
+            </tr>
+            <tr className="bg-blue-900/20">
+              <td className="border border-gray-600 px-2 py-1"><code>float32</code></td>
+              <td className="border border-gray-600 px-2 py-1">~20-40% faster</td>
+              <td className="border border-gray-600 px-2 py-1">Excellent</td>
+              <td className="border border-gray-600 px-2 py-1"><strong>Recommended</strong></td>
+            </tr>
+            <tr>
+              <td className="border border-gray-600 px-2 py-1"><code>bf16/fp16</code></td>
+              <td className="border border-gray-600 px-2 py-1">Fastest</td>
+              <td className="border border-gray-600 px-2 py-1">Reduced</td>
+              <td className="border border-gray-600 px-2 py-1">Diffusers (input dtype)</td>
+            </tr>
+          </tbody>
+        </table>
+        <br />
+        <strong>Performance Impact</strong>
+        <br />
+        For Wan models with many transformer blocks, RoPE computation happens at every attention layer.
+        Switching from F64 to F32 can reduce attention overhead by ~20-40%, which compounds across all blocks.
+        <br />
+        <br />
+        <strong>When to Disable</strong>
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li>You need absolute maximum precision for research/comparison purposes</li>
+          <li>You're debugging numerical instability issues (to rule out dtype as cause)</li>
+        </ul>
+        <br />
+        <strong>Default: Enabled (float32)</strong>
+        <br />
+        Provides the best balance of speed and stability for training.
+      </>
+    ),
+  },
   'datasets.auto_frame_count': {
     title: 'Auto Frame Count',
     description: (

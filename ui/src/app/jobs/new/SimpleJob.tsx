@@ -10,7 +10,7 @@ import {
   SampleTags,
 } from './options';
 import { defaultCompileOptions, defaultDatasetConfig } from './jobConfig';
-import { GroupedSelectOption, JobConfig, SelectOption } from '@/types';
+import { GroupedSelectOption, JobConfig, SelectOption, TimestepRangeOverride } from '@/types';
 import { objectCopy, tagsToObj, objToTags } from '@/utils/basic';
 import {
   TextInput,
@@ -23,7 +23,7 @@ import {
   CreatableSelectInput,
 } from '@/components/formInputs';
 import Card from '@/components/Card';
-import { X, Copy, Wand2, SquareDashed } from 'lucide-react';
+import { X, Copy, Wand2, SquareDashed, CircleHelp } from 'lucide-react';
 import { openUpsamplePromptsModal, toAspectRatio } from '@/components/UpsamplePromptsModal';
 import { openPromptBoxEditor } from '@/components/PromptBoxEditorModal';
 import AddSingleImageModal, { openAddImageModal } from '@/components/AddSingleImageModal';
@@ -32,6 +32,8 @@ import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
 import { handleModelArchChange } from './utils';
 import { IoFlaskSharp } from 'react-icons/io5';
 import { isMac } from '@/helpers/basic';
+import { getDoc } from '@/docs';
+import { openDoc } from '@/components/DocModal';
 
 type Props = {
   jobConfig: JobConfig;
@@ -50,6 +52,141 @@ const isDev = process.env.NODE_ENV === 'development';
 
 // ============================================================================
 // Rank Gate Annealing Configuration Section
+// ============================================================================
+function SoftcapOverridesSection({ jobConfig, setJobConfig }: { jobConfig: JobConfig; setJobConfig: (value: any, key: string) => void }) {
+  const [collapsed, setCollapsed] = useState(true);
+  const train = jobConfig.config.process[0].train;
+
+  return (
+    <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid rgba(74, 222, 128, 0.2)' }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          cursor: 'pointer',
+          padding: '4px 0',
+        }}
+        onClick={() => setCollapsed(!collapsed)}
+      >
+        <div>
+          <div style={{ fontSize: '12px', fontWeight: 500, color: 'var(--accent)' }}>Per-Type/Expert Softcap Overrides</div>
+          <div style={{ fontSize: '10px', color: 'var(--muted)' }}>
+            Set different softcap values for self-attention vs cross-attention, or for high-noise vs low-noise experts.
+          </div>
+        </div>
+        <span style={{ fontSize: '14px', color: 'var(--muted)' }}>{collapsed ? '▸' : '▾'}</span>
+      </div>
+
+      {!collapsed && (
+        <div style={{ marginTop: '8px' }}>
+          {/* Per-attention-type overrides */}
+          <div style={{ marginBottom: '8px' }}>
+            <div style={{ fontSize: '11px', fontWeight: 500, marginBottom: '4px', color: 'var(--accent)' }}>Per-Attention-Type</div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px' }}>
+              <NumberInput
+                label="Self-Attention (attn1)"
+                value={train.attention_tanh_softcap_value_self_attn ?? null}
+                onChange={value => setJobConfig(value || null, 'config.process[0].train.attention_tanh_softcap_value_self_attn')}
+                placeholder="global"
+                min={10}
+                max={100}
+                step={5}
+              />
+              <NumberInput
+                label="Cross-Attention (attn2)"
+                value={train.attention_tanh_softcap_value_cross_attn ?? null}
+                onChange={value => setJobConfig(value || null, 'config.process[0].train.attention_tanh_softcap_value_cross_attn')}
+                placeholder="global"
+                min={10}
+                max={100}
+                step={5}
+              />
+            </div>
+            <div style={{ fontSize: '10px', color: 'var(--muted)', marginTop: '2px' }}>
+              Applies to both experts. Empty = use global.
+            </div>
+          </div>
+
+          {/* Per-expert overrides */}
+          <div style={{ marginBottom: '8px' }}>
+            <div style={{ fontSize: '11px', fontWeight: 500, marginBottom: '4px', color: 'var(--accent)' }}>Per-Expert</div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px' }}>
+              <NumberInput
+                label="High-Noise Expert"
+                value={train.attention_tanh_softcap_value_high_noise ?? null}
+                onChange={value => setJobConfig(value || null, 'config.process[0].train.attention_tanh_softcap_value_high_noise')}
+                placeholder="global"
+                min={10}
+                max={100}
+                step={5}
+              />
+              <NumberInput
+                label="Low-Noise Expert"
+                value={train.attention_tanh_softcap_value_low_noise ?? null}
+                onChange={value => setJobConfig(value || null, 'config.process[0].train.attention_tanh_softcap_value_low_noise')}
+                placeholder="global"
+                min={10}
+                max={100}
+                step={5}
+              />
+            </div>
+            <div style={{ fontSize: '10px', color: 'var(--muted)', marginTop: '2px' }}>
+              Applies to both attention types. Empty = use global/per-type.
+            </div>
+          </div>
+
+          {/* Per-type-per-expert overrides */}
+          <div>
+            <div style={{ fontSize: '11px', fontWeight: 500, marginBottom: '4px', color: 'var(--accent)' }}>Per-Type-Per-Expert (Most Specific)</div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px' }}>
+              <NumberInput
+                label="Self + High-Noise"
+                value={train.attention_tanh_softcap_value_self_attn_high_noise ?? null}
+                onChange={value => setJobConfig(value || null, 'config.process[0].train.attention_tanh_softcap_value_self_attn_high_noise')}
+                placeholder=""
+                min={10}
+                max={100}
+                step={5}
+              />
+              <NumberInput
+                label="Self + Low-Noise"
+                value={train.attention_tanh_softcap_value_self_attn_low_noise ?? null}
+                onChange={value => setJobConfig(value || null, 'config.process[0].train.attention_tanh_softcap_value_self_attn_low_noise')}
+                placeholder=""
+                min={10}
+                max={100}
+                step={5}
+              />
+              <NumberInput
+                label="Cross + High-Noise"
+                value={train.attention_tanh_softcap_value_cross_attn_high_noise ?? null}
+                onChange={value => setJobConfig(value || null, 'config.process[0].train.attention_tanh_softcap_value_cross_attn_high_noise')}
+                placeholder=""
+                min={10}
+                max={100}
+                step={5}
+              />
+              <NumberInput
+                label="Cross + Low-Noise"
+                value={train.attention_tanh_softcap_value_cross_attn_low_noise ?? null}
+                onChange={value => setJobConfig(value || null, 'config.process[0].train.attention_tanh_softcap_value_cross_attn_low_noise')}
+                placeholder=""
+                min={10}
+                max={100}
+                step={5}
+              />
+            </div>
+            <div style={{ fontSize: '10px', color: 'var(--muted)', marginTop: '2px' }}>
+              Empty = inherit from per-type/per-expert/global.
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ============================================================================
 function RankGateConfigSection({ jobConfig, setJobConfig }: { jobConfig: JobConfig; setJobConfig: (value: any, key: string) => void }) {
   const [collapsed, setCollapsed] = useState(true);
@@ -2090,6 +2227,142 @@ export default function SimpleJob({
                   Velocity: model predicts ε - x₀ (standard for pretrained flow-matching models).
                   x0: model predicts x₀ directly (requires compatible backbone; x0 reconstruction changes).
                 </p>
+                {/* Attention Tanh Softcapping */}
+                <div className="border border-green-900 rounded-lg p-3 mt-2 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center space-x-2">
+                      <input
+                        type="checkbox"
+                        id="attention_tanh_softcap_enabled"
+                        checked={jobConfig.config.process[0].train.attention_tanh_softcap_enabled ?? true}
+                        onChange={e => setJobConfig(e.target.checked, 'config.process[0].train.attention_tanh_softcap_enabled')}
+                        className="rounded border-gray-600"
+                      />
+                      <label htmlFor="attention_tanh_softcap_enabled" className="text-sm text-green-300 font-medium">
+                        Attention Tanh Softcapping
+                      </label>
+                    </div>
+                    <span className="text-xs text-gray-500">Gemma2/Grok-1 style</span>
+                  </div>
+                  {jobConfig.config.process[0].train.attention_tanh_softcap_enabled && (
+                    <>
+                      <NumberInput
+                        label="Global Soft Cap Value"
+                        className="pt-1"
+                        value={jobConfig.config.process[0].train.attention_tanh_softcap_value ?? 30.0}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.attention_tanh_softcap_value')}
+                        placeholder="30.0"
+                        min={10}
+                        max={100}
+                        step={5}
+                      />
+                      <p className="text-xs text-gray-500">
+                        Applies <code className="text-green-400">soft_cap * tanh(score / soft_cap)</code> to attention scores before softmax.
+                        Prevents attention from becoming too "sharp", improving training stability.
+                        Lower values (10-20) = stronger capping, higher (30-50) = gentler. Requires PyTorch 2.5+.
+                      </p>
+                      {/* Advanced: Per-type and Per-expert Overrides */}
+                      <SoftcapOverridesSection
+                        jobConfig={jobConfig}
+                        setJobConfig={setJobConfig}
+                      />
+                    </>
+                  )}
+                </div>
+                {/* GELU Acceleration */}
+                <div className="border border-yellow-900 rounded-lg p-3 mt-2">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center space-x-2">
+                      <input
+                        type="checkbox"
+                        id="gelu_acceleration_enabled"
+                        checked={jobConfig.config.process[0].train.gelu_acceleration_enabled ?? true}
+                        onChange={e => setJobConfig(e.target.checked, 'config.process[0].train.gelu_acceleration_enabled')}
+                        className="rounded border-gray-600"
+                      />
+                      <label htmlFor="gelu_acceleration_enabled" className="text-sm text-yellow-300 font-medium">
+                        GELU Acceleration
+                      </label>
+                    </div>
+                    <span className="text-xs text-gray-500">~2-5% FF speedup</span>
+                  </div>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Uses <code className="text-yellow-400">tanh.approx.f32</code> PTX instruction for Wan 2.x FeedForward layers.
+                    Works independently of softcapping. Global monkeypatch - only enable when training Wan 2.x models.
+                  </p>
+                </div>
+                {/* Wan Transformer Eps Override */}
+                <div className="border border-purple-900 rounded-lg p-3 mt-2">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center space-x-2">
+                      <input
+                        type="checkbox"
+                        id="wan_transformer_eps_enabled"
+                        checked={jobConfig.config.process[0].model.wan_transformer_eps !== null && jobConfig.config.process[0].model.wan_transformer_eps !== undefined}
+                        onChange={e => {
+                          if (e.target.checked) {
+                            // Enable with default value only if no value is set
+                            const currentValue = jobConfig.config.process[0].model.wan_transformer_eps;
+                            setJobConfig(currentValue !== null && currentValue !== undefined ? currentValue : 0.0001, 'config.process[0].model.wan_transformer_eps');
+                          } else {
+                            // Disable by clearing the value
+                            setJobConfig(null, 'config.process[0].model.wan_transformer_eps');
+                          }
+                        }}
+                        className="rounded border-gray-600 text-purple-600 focus:ring-purple-500"
+                      />
+                      <label htmlFor="wan_transformer_eps_enabled" className="text-sm text-purple-300 font-medium cursor-pointer">
+                        Wan Transformer Eps Override
+                      </label>
+                    </div>
+                    <span className="text-xs text-gray-500">LayerNorm precision</span>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <input
+                      type="number"
+                      id="wan_transformer_eps"
+                      value={jobConfig.config.process[0].model.wan_transformer_eps ?? ''}
+                      onChange={e => {
+                        const val = e.target.value === '' ? null : parseFloat(e.target.value);
+                        setJobConfig(val, 'config.process[0].model.wan_transformer_eps');
+                      }}
+                      placeholder="e.g. 0.0001 for bf16"
+                      step="any"
+                      min="0"
+                      className="flex-1 px-2 py-1 bg-gray-800 border border-gray-600 rounded text-sm text-gray-300"
+                    />
+                    <span className="text-xs text-gray-500 whitespace-nowrap">
+                      Default: <code className="text-purple-400">1e-6</code> | bf16: <code className="text-purple-400">1e-4</code>
+                    </span>
+                  </div>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Override <code className="text-purple-400">eps</code> for LayerNorm and attention norms in Wan transformer.
+                    For <code className="text-purple-400">bf16</code> training, use larger values like <code className="text-purple-400">1e-4</code> or <code className="text-purple-400">1e-5</code> (bf16 has ~2-3 decimal digits precision).
+                    Uncheck to use model's default. Only applies to Wan 2.x models.
+                  </p>
+                </div>
+                {/* Attention F32 RoPE Acceleration */}
+                <div className="border border-blue-900 rounded-lg p-3 mt-2">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center space-x-2">
+                      <input
+                        type="checkbox"
+                        id="attention_f32_rope_enabled"
+                        checked={jobConfig.config.process[0].train.attention_f32_rope_enabled ?? true}
+                        onChange={e => setJobConfig(e.target.checked, 'config.process[0].train.attention_f32_rope_enabled')}
+                        className="rounded border-gray-600"
+                      />
+                      <label htmlFor="attention_f32_rope_enabled" className="text-sm text-blue-300 font-medium">
+                        Attention F32 RoPE Acceleration
+                      </label>
+                    </div>
+                    <span className="text-xs text-gray-500">~20-40% faster RoPE</span>
+                  </div>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Uses <code className="text-blue-400">float32</code> instead of <code className="text-blue-400">float64</code> for rotary position embeddings.
+                    Significantly faster while maintaining numerical stability. Disable only if you need maximum precision.
+                  </p>
+                </div>
                 {jobConfig.config.process[0].train.loss_type === 'pseudo_huber' && (
                   <NumberInput
                     label="Pseudo Huber C Value"
@@ -2745,6 +3018,230 @@ export default function SimpleJob({
                       Adaptive weighting dynamically adjusts flow weight based on deviation history.
                       Steps with deviation exceeding rejection threshold have their gradients zeroed.
                     </p>
+                  </div>
+                )}
+                {/* Per-Timestep Range Loss Overrides */}
+                {(jobConfig.config.process[0].train.loss_type === 'spectral_flow' || jobConfig.config.process[0].train.loss_type === 'mse_spectral_flow' || jobConfig.config.process[0].train.loss_type === 'spectral') && (
+                  <div className="border border-amber-900 rounded-lg p-4 mt-2 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-1">
+                        <p className="text-xs text-amber-300 font-medium">Per-Timestep Range Loss Overrides</p>
+                        <div
+                          className="inline-block text-xs text-amber-400 cursor-pointer hover:text-amber-300 transition-colors"
+                          onClick={() => {
+                            const doc = getDoc('train.timestep_range_overrides');
+                            if (doc) openDoc(doc);
+                          }}
+                          title="Help"
+                        >
+                          <CircleHelp className="inline-block w-4 h-4" />
+                        </div>
+                      </div>
+                    </div>
+                    <p className="text-xs text-gray-500">
+                      Override loss weights for specific timestep ranges. Ranges are in absolute model timesteps (0-1000).
+                      Each expert dynamically checks if its current timestep falls within a range. First matching range wins.
+                      Example: range 1000-950 only affects high-noise expert (boundary=900); range 800-0 only affects low-noise expert.
+                    </p>
+                    {(() => {
+                      const overrides: TimestepRangeOverride[] = jobConfig.config.process[0].train.timestep_range_overrides || [];
+                      const addOverride = () => {
+                        const newOverrides: TimestepRangeOverride[] = [...overrides, {
+                          start_timestep: 500,
+                          end_timestep: 0,
+                          flow_weight: null,
+                          spectral_weight: null,
+                          spectral_low_weight: null,
+                          spectral_mid_weight: null,
+                          spectral_high_weight: null,
+                          mse_weight: null,
+                          spectral_low_cutoff: null,
+                          spectral_high_cutoff: null,
+                          spectral_lcr_weight: null,
+                          spectral_temporal_scale: null,
+                        }];
+                        setJobConfig(newOverrides, 'config.process[0].train.timestep_range_overrides');
+                      };
+                      const removeOverride = (index: number) => {
+                        const newOverrides = overrides.filter((_override: TimestepRangeOverride, i: number) => i !== index);
+                        setJobConfig(newOverrides, 'config.process[0].train.timestep_range_overrides');
+                      };
+                      const updateOverride = (index: number, field: keyof TimestepRangeOverride, value: number | null) => {
+                        const newOverrides = overrides.map((o: TimestepRangeOverride, i: number) => {
+                          if (i === index) {
+                            return { ...o, [field]: value };
+                          }
+                          return o;
+                        });
+                        setJobConfig(newOverrides, 'config.process[0].train.timestep_range_overrides');
+                      };
+                      return (
+                        <div className="space-y-3">
+                          {overrides.length === 0 && (
+                            <p className="text-xs text-gray-500 italic">No overrides configured. Using global/per-expert weights for all timesteps.</p>
+                          )}
+                          {overrides.map((override: TimestepRangeOverride, index: number) => (
+                            <div key={index} className="border border-amber-800 rounded-lg p-3 space-y-2">
+                              <div className="flex items-center justify-between">
+                                <p className="text-xs text-amber-400 font-medium">Range #{index + 1}</p>
+                                <button
+                                  type="button"
+                                  onClick={() => removeOverride(index)}
+                                  className="text-xs text-red-400 hover:text-red-300"
+                                >
+                                  Remove
+                                </button>
+                              </div>
+                              <div className="grid grid-cols-2 gap-3">
+                                <NumberInput
+                                  label="Start Timestep (absolute)"
+                                  className="pt-1"
+                                  value={override.start_timestep}
+                                  onChange={value => updateOverride(index, 'start_timestep', value)}
+                                  placeholder="1000"
+                                  min={0}
+                                  max={1000}
+                                  step={50}
+                                />
+                                <NumberInput
+                                  label="End Timestep (absolute)"
+                                  className="pt-1"
+                                  value={override.end_timestep}
+                                  onChange={value => updateOverride(index, 'end_timestep', value)}
+                                  placeholder="0"
+                                  min={0}
+                                  max={1000}
+                                  step={50}
+                                />
+                              </div>
+                              <p className="text-xs text-gray-500">
+                                Applies when current timestep is between Start and End (inclusive of Start, exclusive of End).
+                                Timesteps are in absolute model space - each expert only matches ranges within its operating range.
+                              </p>
+                              <div className="border-t border-amber-800 pt-2 mt-2">
+                                <p className="text-xs text-amber-400 mb-2">Weight Overrides (leave empty to use default)</p>
+                                <div className="grid grid-cols-2 gap-2">
+                                  {(jobConfig.config.process[0].train.loss_type === 'spectral_flow' || jobConfig.config.process[0].train.loss_type === 'mse_spectral_flow') && (
+                                    <NumberInput
+                                      label="Flow Weight"
+                                      className="pt-1"
+                                      value={override.flow_weight ?? null}
+                                      onChange={value => updateOverride(index, 'flow_weight', value)}
+                                      placeholder="Use default"
+                                      min={0}
+                                      step={0.01}
+                                    />
+                                  )}
+                                  <NumberInput
+                                    label="Spectral Weight"
+                                    className="pt-1"
+                                    value={override.spectral_weight ?? null}
+                                    onChange={value => updateOverride(index, 'spectral_weight', value)}
+                                    placeholder="Use default"
+                                    min={0}
+                                    step={0.1}
+                                  />
+                                  {jobConfig.config.process[0].train.loss_type === 'mse_spectral_flow' && (
+                                    <NumberInput
+                                      label="MSE Weight"
+                                      className="pt-1"
+                                      value={override.mse_weight ?? null}
+                                      onChange={value => updateOverride(index, 'mse_weight', value)}
+                                      placeholder="Use default"
+                                      min={0}
+                                      step={0.1}
+                                    />
+                                  )}
+                                </div>
+                                <div className="grid grid-cols-3 gap-2 mt-2">
+                                  <NumberInput
+                                    label="Low Freq Weight"
+                                    className="pt-1"
+                                    value={override.spectral_low_weight ?? null}
+                                    onChange={value => updateOverride(index, 'spectral_low_weight', value)}
+                                    placeholder="Use default"
+                                    min={0}
+                                    step={0.1}
+                                  />
+                                  <NumberInput
+                                    label="Mid Freq Weight"
+                                    className="pt-1"
+                                    value={override.spectral_mid_weight ?? null}
+                                    onChange={value => updateOverride(index, 'spectral_mid_weight', value)}
+                                    placeholder="Use default"
+                                    min={0}
+                                    step={0.1}
+                                  />
+                                  <NumberInput
+                                    label="High Freq Weight"
+                                    className="pt-1"
+                                    value={override.spectral_high_weight ?? null}
+                                    onChange={value => updateOverride(index, 'spectral_high_weight', value)}
+                                    placeholder="Use default"
+                                    min={0}
+                                    step={0.1}
+                                  />
+                                </div>
+                                <div className="border-t border-amber-800 pt-2 mt-2">
+                                  <p className="text-xs text-amber-400 mb-2">Spectral Filter Overrides (leave empty to use default)</p>
+                                  <div className="grid grid-cols-2 gap-2">
+                                    <NumberInput
+                                      label="Low Cutoff"
+                                      className="pt-1"
+                                      value={override.spectral_low_cutoff ?? null}
+                                      onChange={value => updateOverride(index, 'spectral_low_cutoff', value)}
+                                      placeholder="Use default"
+                                      min={0}
+                                      step={1}
+                                    />
+                                    <NumberInput
+                                      label="High Cutoff"
+                                      className="pt-1"
+                                      value={override.spectral_high_cutoff ?? null}
+                                      onChange={value => updateOverride(index, 'spectral_high_cutoff', value)}
+                                      placeholder="Use default"
+                                      min={0}
+                                      step={1}
+                                    />
+                                  </div>
+                                  <div className="grid grid-cols-2 gap-2 mt-2">
+                                    <NumberInput
+                                      label="LCR Weight"
+                                      className="pt-1"
+                                      value={override.spectral_lcr_weight ?? null}
+                                      onChange={value => updateOverride(index, 'spectral_lcr_weight', value)}
+                                      placeholder="Use default"
+                                      min={0}
+                                      step={0.1}
+                                    />
+                                    <NumberInput
+                                      label="Temporal Scale"
+                                      className="pt-1"
+                                      value={override.spectral_temporal_scale ?? null}
+                                      onChange={value => updateOverride(index, 'spectral_temporal_scale', value)}
+                                      placeholder="Use default"
+                                      min={0}
+                                      step={0.1}
+                                    />
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                          <button
+                            type="button"
+                            onClick={addOverride}
+                            className="w-full text-xs text-amber-400 hover:text-amber-300 border border-amber-800 rounded-lg px-3 py-2 hover:bg-amber-900/20 transition-colors"
+                          >
+                            + Add Timestep Range Override
+                          </button>
+                          <p className="text-xs text-gray-500">
+                            Example: For low-noise expert (range 0-900), set range 1000-500 to override timesteps 900-450,
+                            and 500-0 to override timesteps 450-0.
+                          </p>
+                        </div>
+                      );
+                    })()}
                   </div>
                 )}
                 {modelArch?.additionalSections?.includes('train.audio_loss_multiplier') && (

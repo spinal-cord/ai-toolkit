@@ -621,6 +621,179 @@ class SDTrainer(BaseSDTrainProcess):
             # silently drop or misalign keys, producing potentially inaccurate flow estimates.
             # Needs additional research against official SEA-RAFT implementation; fix deferred.
 
+        # Initialize attention tanh softcapping (Gemma2/Grok-1 style)
+        # Prevents attention scores from becoming too extreme, improving training stability
+        self._setup_attention_softcapping()
+
+    def _setup_attention_softcapping(self):
+        """Set up attention tanh softcapping, F32 RoPE acceleration, and GELU acceleration."""
+        try:
+            from toolkit.models.wan21.wan_attn import (
+                set_attention_softcapping, set_attention_f32_rope, configure_softcap_logging,
+                enable_gelu_acceleration, is_gelu_acceleration_enabled, update_softcap_step
+            )
+            from toolkit.util.attention_softcapping import check_flex_attention_support
+
+            # Tanh softcapping config
+            softcap_enabled = getattr(self.train_config, 'attention_tanh_softcap_enabled', True)
+            soft_cap = getattr(self.train_config, 'attention_tanh_softcap_value', 30.0)
+            
+            # Per-type overrides
+            soft_cap_self = getattr(self.train_config, 'attention_tanh_softcap_value_self_attn', None)
+            soft_cap_cross = getattr(self.train_config, 'attention_tanh_softcap_value_cross_attn', None)
+            
+            # Per-expert overrides
+            soft_cap_high = getattr(self.train_config, 'attention_tanh_softcap_value_high_noise', None)
+            soft_cap_low = getattr(self.train_config, 'attention_tanh_softcap_value_low_noise', None)
+            
+            # Per-type-per-expert overrides
+            soft_cap_self_high = getattr(self.train_config, 'attention_tanh_softcap_value_self_attn_high_noise', None)
+            soft_cap_self_low = getattr(self.train_config, 'attention_tanh_softcap_value_self_attn_low_noise', None)
+            soft_cap_cross_high = getattr(self.train_config, 'attention_tanh_softcap_value_cross_attn_high_noise', None)
+            soft_cap_cross_low = getattr(self.train_config, 'attention_tanh_softcap_value_cross_attn_low_noise', None)
+
+            if softcap_enabled:
+                support = check_flex_attention_support()
+                if support.get('available', False):
+                    set_attention_softcapping(
+                        enabled=True,
+                        soft_cap=soft_cap,
+                        soft_cap_self_attn=soft_cap_self,
+                        soft_cap_cross_attn=soft_cap_cross,
+                        soft_cap_high_noise=soft_cap_high,
+                        soft_cap_low_noise=soft_cap_low,
+                        soft_cap_self_attn_high_noise=soft_cap_self_high,
+                        soft_cap_self_attn_low_noise=soft_cap_self_low,
+                        soft_cap_cross_attn_high_noise=soft_cap_cross_high,
+                        soft_cap_cross_attn_low_noise=soft_cap_cross_low,
+                    )
+                    # Enable logging - log every 10 training steps (not attention ops)
+                    configure_softcap_logging(enabled=True, sample_every_n_steps=10)
+                    print_acc(f"Attention tanh softcapping enabled. "
+                              f"PyTorch {support.get('torch_version')}, flex_attention available.")
+                    
+                    # Print active softcap configuration summary
+                    has_overrides = any(v is not None for v in [
+                        soft_cap_self, soft_cap_cross, soft_cap_high, soft_cap_low,
+                        soft_cap_self_high, soft_cap_self_low, soft_cap_cross_high, soft_cap_cross_low
+                    ])
+                    
+                    if has_overrides:
+                        from toolkit.models.wan21.wan_attn import resolve_softcap_value
+                        print_acc(f"  Per-type-per-expert softcap values (effective):")
+                        for expert in ['single', 'high_noise', 'low_noise']:
+                            self_val = resolve_softcap_value('self_attn', expert)
+                            cross_val = resolve_softcap_value('cross_attn', expert)
+                            expert_label = expert.replace('_noise', '')
+                            print_acc(f"    {expert_label:8s} expert: self_attn={self_val:.0f}, cross_attn={cross_val:.0f}")
+                    else:
+                        print_acc(f"  Global soft_cap={soft_cap} for all attention types and experts.")
+                    
+                    # Note: stats logging only works when torch.compile is NOT used
+                    # (mutable global state in compiled functions causes recompilation storms)
+                    print_acc(f"Softcapping stats logging enabled - will log per-type per-expert statistics every 10 steps.")
+                    print_acc(f"Note: stats logging requires torch.compile disabled. Check job config 'compile' setting.")
+                else:
+                    print_acc("Attention tanh softcapping requested but flex_attention not available. "
+                              f"Using standard attention. (Requires PyTorch 2.5+) "
+                              f"Support check: {support}")
+                    set_attention_softcapping(enabled=False)
+                    configure_softcap_logging(enabled=False)
+            else:
+                set_attention_softcapping(enabled=False)
+                configure_softcap_logging(enabled=False)
+                print_acc("Attention tanh softcapping disabled.")
+
+            # F32 RoPE acceleration config
+            f32_rope_enabled = getattr(self.train_config, 'attention_f32_rope_enabled', True)
+            set_attention_f32_rope(enabled=f32_rope_enabled)
+            rope_dtype = "float32" if f32_rope_enabled else "float64"
+            print_acc(f"Attention RoPE computation using {rope_dtype}. "
+                      f"F32 is faster than F64 while maintaining numerical stability.")
+
+            # GELU acceleration for Wan 2.2 FeedForward layers (separate config flag)
+            # Wan uses gelu-approximate in all FF layers - patch to use tanh.approx.f32
+            # NOTE: This is a global monkeypatch - only enable if training Wan 2.x models
+            gelu_accel_enabled = getattr(self.train_config, 'gelu_acceleration_enabled', True)
+            if gelu_accel_enabled:
+                if enable_gelu_acceleration():
+                    print_acc("GELU acceleration enabled - using tanh.approx.f32 PTX instruction for FF layers.")
+                else:
+                    print_acc("GELU acceleration requested but not available - using standard PyTorch GELU.")
+            else:
+                print_acc("GELU acceleration disabled (set gelu_acceleration_enabled=True to enable for Wan 2.x).")
+
+        except ImportError as e:
+            print_acc(f"Attention config setup failed: {e}")
+
+    def _log_attention_stats(self):
+        """Log attention softcapping statistics with per-type breakdown."""
+        try:
+            from toolkit.models.wan21.wan_attn import get_softcap_stats
+
+            stats = get_softcap_stats()
+            if not stats['enabled'] or not stats['sample_stats']:
+                return
+
+            # Use grouped stats for per-type breakdown
+            grouped = stats.get('grouped', {})
+            step = stats.get('current_step', 'N/A')
+            expert = stats.get('current_expert', 'single')
+
+            print_acc(f"\n{'='*70}")
+            print_acc(f"Attention Softcapping Stats (step {step}, expert: {expert})")
+            print_acc(f"{'='*70}")
+
+            # Log per attention type
+            for attn_type in ['self_attn', 'cross_attn']:
+                type_label = "Self-Attention (attn1: video→video)" if attn_type == 'self_attn' else "Cross-Attention (attn2: video→text/img)"
+                type_stats = grouped.get(attn_type, {})
+                
+                # Find stats for current expert, or any if none for current expert
+                expert_samples = type_stats.get(expert, [])
+                if not expert_samples:
+                    # Fall back to any expert's samples for this type
+                    for e in ['single', 'high', 'low']:
+                        if type_stats.get(e):
+                            expert_samples = type_stats[e]
+                            break
+                
+                if not expert_samples:
+                    print_acc(f"\n  {type_label}: no samples")
+                    continue
+                
+                # Aggregate from last few samples for stability
+                samples = expert_samples[-3:]  # Last 3 samples
+                avg_pct_capped = sum(s.get('pct_capped', 0) for s in samples) / len(samples)
+                avg_reduction = sum(s.get('max_reduction_pct', 0) for s in samples) / len(samples)
+                avg_lse = sum(s.get('avg_lse', 0) for s in samples) / len(samples)
+                raw_min = min(s.get('raw_min', 0) for s in samples)
+                raw_max = max(s.get('raw_max', 0) for s in samples)
+                capped_min = min(s.get('capped_min', 0) for s in samples)
+                capped_max = max(s.get('capped_max', 0) for s in samples)
+                soft_cap_used = samples[-1].get('soft_cap_used', 30.0)
+                
+                print_acc(f"\n  {type_label} [soft_cap={soft_cap_used:.0f}]:")
+                print_acc(f"    Scores capped:      {avg_pct_capped:.2f}%")
+                print_acc(f"    Max reduction:      {avg_reduction:.1f}%")
+                print_acc(f"    Attention sharpness (LSE): {avg_lse:.2f} (lower=softer)")
+                print_acc(f"    Raw score range:    [{raw_min:.2f}, {raw_max:.2f}]")
+                print_acc(f"    Capped score range: [{capped_min:.2f}, {capped_max:.2f}]")
+                
+                # Tuning hints
+                if avg_pct_capped < 0.1:
+                    print_acc(f"    → soft_cap may be too HIGH (no capping effect). Try lowering.")
+                elif avg_pct_capped > 20:
+                    print_acc(f"    → soft_cap may be too LOW (overly aggressive). Try raising.")
+                elif avg_pct_capped > 1:
+                    print_acc(f"    → soft_cap is actively capping. Distribution looks healthy.")
+
+            print_acc(f"{'='*70}\n")
+
+        except Exception as e:
+            # Don't break training if logging fails
+            pass
+
     def _get_active_expert_label(self):
         """Get the active expert label for per-expert training logging."""
         if hasattr(self.sd, 'model') and hasattr(self.sd.model, '_active_transformer_name'):
@@ -695,6 +868,180 @@ class SDTrainer(BaseSDTrainProcess):
             'temporal_scale': t_scale,
             'spectral_weight': spectral_w,
         }
+
+    def _get_timestep_range_override(self, current_timestep):
+        """
+        Get loss weight overrides for the given timestep based on configured timestep ranges.
+        
+        Ranges are specified in absolute model timesteps (0-1000). Each expert dynamically
+        checks if its current timestep falls within a range. No scaling is applied.
+        
+        For dual-expert models (e.g., Wan 2.2 14B with boundary=900):
+        - High-noise expert handles timesteps 900-1000
+        - Low-noise expert handles timesteps 0-900
+        
+        Examples:
+        - Range 1000-950: Only affects high-noise expert
+        - Range 950-900: Only affects high-noise expert
+        - Range 800-400: Only affects low-noise expert
+        - Range 400-0: Only affects low-noise expert
+        
+        Note: Ranges crossing the boundary (e.g., 950-850) will apply to whichever expert
+        is active at each timestep.
+        
+        Args:
+            current_timestep: Current timestep in absolute model space (scalar or tensor)
+        
+        Returns:
+            dict with override weights, or empty dict if no override applies.
+        """
+        tc = self.train_config
+        if not tc.timestep_range_overrides:
+            return {}
+        
+        # Convert current_timestep to a Python float for comparison
+        if isinstance(current_timestep, torch.Tensor):
+            current_t = current_timestep.item()
+        else:
+            current_t = float(current_timestep)
+        
+        # Find first matching range using absolute timesteps
+        for override in tc.timestep_range_overrides:
+            start = override.get('start_timestep', 0)
+            end = override.get('end_timestep', 0)
+            
+            # Check if current timestep falls in this range
+            # Range is [start, end) - inclusive of start, exclusive of end
+            if start >= end:
+                # Handle descending ranges (e.g., 1000-500)
+                if current_t <= start and current_t > end:
+                    return override
+            else:
+                # Handle ascending ranges (e.g., 0-500)
+                if current_t >= start and current_t < end:
+                    return override
+        
+        return {}
+
+    def _get_expert_spectral_params_with_override(self, current_timestep=None):
+        """
+        Get spectral loss parameters for the currently active expert,
+        with optional timestep range overrides applied.
+        
+        Args:
+            current_timestep: Current timestep for range override lookup
+        
+        Returns:
+            dict with keys: low_weight, mid_weight, high_weight,
+                           low_cutoff, high_cutoff, temporal_scale,
+                           spectral_weight
+        """
+        # Get base params from expert config
+        params = self._get_expert_spectral_params()
+        
+        # Apply timestep range override if applicable
+        if current_timestep is not None:
+            override = self._get_timestep_range_override(current_timestep)
+            if override:
+                # Apply spectral band weight overrides
+                if override.get('spectral_low_weight') is not None:
+                    params['low_weight'] = override['spectral_low_weight']
+                if override.get('spectral_mid_weight') is not None:
+                    params['mid_weight'] = override['spectral_mid_weight']
+                if override.get('spectral_high_weight') is not None:
+                    params['high_weight'] = override['spectral_high_weight']
+                if override.get('spectral_weight') is not None:
+                    params['spectral_weight'] = override['spectral_weight']
+                # Apply spectral filter overrides
+                if override.get('spectral_low_cutoff') is not None:
+                    params['low_cutoff'] = override['spectral_low_cutoff']
+                if override.get('spectral_high_cutoff') is not None:
+                    params['high_cutoff'] = override['spectral_high_cutoff']
+                if override.get('spectral_temporal_scale') is not None:
+                    params['temporal_scale'] = override['spectral_temporal_scale']
+        
+        return params
+
+    def _get_flow_weight_with_override(self, current_timestep=None):
+        """
+        Get flow loss weight with timestep range override applied.
+        
+        Args:
+            current_timestep: Current timestep for range override lookup
+        
+        Returns:
+            float: Flow weight to use
+        """
+        expert = self._get_active_expert_label()
+        tc = self.train_config
+        
+        # Get base flow weight
+        if expert == "low" and tc.spectral_flow_weight_low is not None:
+            base_flow_weight = tc.spectral_flow_weight_low
+        elif expert == "high" and tc.spectral_flow_weight_high is not None:
+            base_flow_weight = tc.spectral_flow_weight_high
+        else:
+            base_flow_weight = tc.spectral_flow_weight
+        
+        # Apply timestep range override if applicable
+        if current_timestep is not None:
+            override = self._get_timestep_range_override(current_timestep)
+            if override and override.get('flow_weight') is not None:
+                return override['flow_weight']
+        
+        return base_flow_weight
+
+    def _get_mse_weight_with_override(self, current_timestep=None):
+        """
+        Get MSE loss weight with timestep range override applied.
+        
+        Args:
+            current_timestep: Current timestep for range override lookup
+        
+        Returns:
+            float: MSE weight to use
+        """
+        expert = self._get_active_expert_label()
+        tc = self.train_config
+        
+        # Get base MSE weight
+        if expert == "low" and tc.mse_spectral_flow_mse_weight_low is not None:
+            base_mse_weight = tc.mse_spectral_flow_mse_weight_low
+        elif expert == "high" and tc.mse_spectral_flow_mse_weight_high is not None:
+            base_mse_weight = tc.mse_spectral_flow_mse_weight_high
+        else:
+            base_mse_weight = tc.mse_spectral_flow_mse_weight
+        
+        # Apply timestep range override if applicable
+        if current_timestep is not None:
+            override = self._get_timestep_range_override(current_timestep)
+            if override and override.get('mse_weight') is not None:
+                return override['mse_weight']
+        
+        return base_mse_weight
+
+    def _get_lcr_weight_with_override(self, current_timestep=None):
+        """
+        Get LCR (Low-Cut Ratio) weight with timestep range override applied.
+        
+        Args:
+            current_timestep: Current timestep for range override lookup
+        
+        Returns:
+            float: LCR weight to use
+        """
+        tc = self.train_config
+        
+        # Get base LCR weight
+        base_lcr_weight = tc.spectral_lcr_weight
+        
+        # Apply timestep range override if applicable
+        if current_timestep is not None:
+            override = self._get_timestep_range_override(current_timestep)
+            if override and override.get('spectral_lcr_weight') is not None:
+                return override['spectral_lcr_weight']
+        
+        return base_lcr_weight
 
     def _gradient_projection_backward(self, spectral_loss, flow_loss, mse_loss=None):
         """Compute gradients for losses separately, then project (PCGrad).
@@ -1434,8 +1781,11 @@ class SDTrainer(BaseSDTrainProcess):
             elif self.train_config.loss_type == "wavelet":
                 loss = wavelet_loss(pred, batch.latents, noise)
             elif self.train_config.loss_type == "spectral":
-                # Get per-expert spectral parameters
-                spec_params = self._get_expert_spectral_params()
+                # Get per-expert spectral parameters with timestep range override
+                # Use first timestep (all timesteps in batch are identical in flow-matching)
+                current_t = timesteps[0].item() if isinstance(timesteps, torch.Tensor) else float(timesteps)
+                spec_params = self._get_expert_spectral_params_with_override(current_t)
+                lcr_weight = self._get_lcr_weight_with_override(current_t)
                 loss = spectral_loss(
                     pred,
                     batch.latents,
@@ -1446,7 +1796,7 @@ class SDTrainer(BaseSDTrainProcess):
                     low_cutoff=spec_params['low_cutoff'],
                     high_cutoff=spec_params['high_cutoff'],
                     use_phase=self.train_config.spectral_use_phase,
-                    lcr_weight=self.train_config.spectral_lcr_weight,
+                    lcr_weight=lcr_weight,
                     spectral_transform=self.train_config.spectral_transform,
                     prediction_target=self.train_config.prediction_target,
                     temporal_scale=spec_params['temporal_scale'],
@@ -1464,8 +1814,11 @@ class SDTrainer(BaseSDTrainProcess):
                     if self.accelerator.is_main_process:
                         print_acc("[WARN] spectral_flow loss is incompatible with x0_pred mode. "
                                   "Falling back to spectral loss.")
-                    # Get per-expert spectral parameters
-                    spec_params = self._get_expert_spectral_params()
+                    # Get per-expert spectral parameters with timestep range override
+                    # Use first timestep (all timesteps in batch are identical in flow-matching)
+                    current_t = timesteps[0].item() if isinstance(timesteps, torch.Tensor) else float(timesteps)
+                    spec_params = self._get_expert_spectral_params_with_override(current_t)
+                    lcr_weight = self._get_lcr_weight_with_override(current_t)
                     loss = spectral_loss(
                         pred,
                         batch.latents,
@@ -1476,7 +1829,7 @@ class SDTrainer(BaseSDTrainProcess):
                         low_cutoff=spec_params['low_cutoff'],
                         high_cutoff=spec_params['high_cutoff'],
                         use_phase=self.train_config.spectral_use_phase,
-                        lcr_weight=self.train_config.spectral_lcr_weight,
+                        lcr_weight=lcr_weight,
                         spectral_transform=self.train_config.spectral_transform,
                         prediction_target=self.train_config.prediction_target,
                         temporal_scale=spec_params['temporal_scale'],
@@ -1488,19 +1841,17 @@ class SDTrainer(BaseSDTrainProcess):
 
                     expert = self._get_active_expert_label()
 
-                    # Determine base flow weight: per-expert config overrides global
-                    if expert == "low" and self.train_config.spectral_flow_weight_low is not None:
-                        base_flow_weight = self.train_config.spectral_flow_weight_low
-                    elif expert == "high" and self.train_config.spectral_flow_weight_high is not None:
-                        base_flow_weight = self.train_config.spectral_flow_weight_high
-                    else:
-                        base_flow_weight = self.train_config.spectral_flow_weight
+                    # Use timestep-aware weight getters with range override support
+                    # Use first timestep (all timesteps in batch are identical in flow-matching)
+                    current_t = timesteps[0].item() if isinstance(timesteps, torch.Tensor) else float(timesteps)
+                    base_flow_weight = self._get_flow_weight_with_override(current_t)
 
                     # Issue #1 fix: use per-expert current_flow_weight (adaptive adjustment)
                     expert_flow_weight = self.current_flow_weight.get(expert, base_flow_weight)
 
-                    # Get per-expert spectral parameters
-                    spec_params = self._get_expert_spectral_params()
+                    # Get per-expert spectral parameters with timestep range override
+                    spec_params = self._get_expert_spectral_params_with_override(current_t)
+                    lcr_weight = self._get_lcr_weight_with_override(current_t)
 
                     (total_loss, flow_dev, spatial_val, flow_val,
                      spectral_component, flow_component) = spectral_flow_loss(
@@ -1518,7 +1869,7 @@ class SDTrainer(BaseSDTrainProcess):
                         low_cutoff=spec_params['low_cutoff'],
                         high_cutoff=spec_params['high_cutoff'],
                         use_phase=self.train_config.spectral_use_phase,
-                        lcr_weight=self.train_config.spectral_lcr_weight,
+                        lcr_weight=lcr_weight,
                         spectral_transform=self.train_config.spectral_transform,
                         prediction_target=self.train_config.prediction_target,
                         temporal_scale=spec_params['temporal_scale'],
@@ -1711,8 +2062,11 @@ class SDTrainer(BaseSDTrainProcess):
                     if self.accelerator.is_main_process:
                         print_acc("[WARN] mse_spectral_flow loss is incompatible with x0_pred mode. "
                                   "Falling back to spectral loss.")
-                    # Get per-expert spectral parameters
-                    spec_params = self._get_expert_spectral_params()
+                    # Get per-expert spectral parameters with timestep range override
+                    # Use first timestep (all timesteps in batch are identical in flow-matching)
+                    current_t = timesteps[0].item() if isinstance(timesteps, torch.Tensor) else float(timesteps)
+                    spec_params = self._get_expert_spectral_params_with_override(current_t)
+                    lcr_weight = self._get_lcr_weight_with_override(current_t)
                     loss = spectral_loss(
                         pred=pred,
                         latents=batch.latents,
@@ -1723,7 +2077,7 @@ class SDTrainer(BaseSDTrainProcess):
                         low_cutoff=spec_params['low_cutoff'],
                         high_cutoff=spec_params['high_cutoff'],
                         use_phase=self.train_config.spectral_use_phase,
-                        lcr_weight=self.train_config.spectral_lcr_weight,
+                        lcr_weight=lcr_weight,
                         spectral_transform=self.train_config.spectral_transform,
                         prediction_target=self.train_config.prediction_target,
                         temporal_scale=spec_params['temporal_scale'],
@@ -1734,26 +2088,18 @@ class SDTrainer(BaseSDTrainProcess):
 
                     expert = self._get_active_expert_label()
 
-                    # Determine base weights: per-expert config overrides global
-                    if expert == "low" and self.train_config.mse_spectral_flow_mse_weight_low is not None:
-                        base_mse_weight = self.train_config.mse_spectral_flow_mse_weight_low
-                    elif expert == "high" and self.train_config.mse_spectral_flow_mse_weight_high is not None:
-                        base_mse_weight = self.train_config.mse_spectral_flow_mse_weight_high
-                    else:
-                        base_mse_weight = self.train_config.mse_spectral_flow_mse_weight
-
-                    if expert == "low" and self.train_config.spectral_flow_weight_low is not None:
-                        base_flow_weight = self.train_config.spectral_flow_weight_low
-                    elif expert == "high" and self.train_config.spectral_flow_weight_high is not None:
-                        base_flow_weight = self.train_config.spectral_flow_weight_high
-                    else:
-                        base_flow_weight = self.train_config.spectral_flow_weight
+                    # Use timestep-aware weight getters with range override support
+                    # Use first timestep (all timesteps in batch are identical in flow-matching)
+                    current_t = timesteps[0].item() if isinstance(timesteps, torch.Tensor) else float(timesteps)
+                    base_mse_weight = self._get_mse_weight_with_override(current_t)
+                    base_flow_weight = self._get_flow_weight_with_override(current_t)
 
                     # Issue #1 fix: use per-expert current_flow_weight (adaptive adjustment)
                     expert_flow_weight = self.current_flow_weight.get(expert, base_flow_weight)
 
-                    # Get per-expert spectral parameters
-                    spec_params = self._get_expert_spectral_params()
+                    # Get per-expert spectral parameters with timestep range override
+                    spec_params = self._get_expert_spectral_params_with_override(current_t)
+                    lcr_weight = self._get_lcr_weight_with_override(current_t)
 
                     (total_loss, flow_dev, mse_val, spatial_val, flow_val,
                      mse_component, spectral_component, flow_component) = mse_spectral_flow_loss(
@@ -1772,7 +2118,7 @@ class SDTrainer(BaseSDTrainProcess):
                         low_cutoff=spec_params['low_cutoff'],
                         high_cutoff=spec_params['high_cutoff'],
                         use_phase=self.train_config.spectral_use_phase,
-                        lcr_weight=self.train_config.spectral_lcr_weight,
+                        lcr_weight=lcr_weight,
                         spectral_transform=self.train_config.spectral_transform,
                         prediction_target=self.train_config.prediction_target,
                         temporal_scale=spec_params['temporal_scale'],
@@ -2532,6 +2878,17 @@ class SDTrainer(BaseSDTrainProcess):
         return embeds
 
     def train_single_accumulation(self, batch: DataLoaderBatchDTO):
+        # Update softcap step counter BEFORE forward pass so logging checks
+        # use the correct step number. Called here instead of at end of loop
+        # because attention ops happen during forward, not after.
+        if hasattr(self, 'step_num'):
+            try:
+                from toolkit.models.wan21.wan_attn import update_softcap_step
+                expert = self._get_active_expert_label()
+                update_softcap_step(self.step_num, expert=expert)
+            except ImportError:
+                pass  # Non-critical
+        
         with torch.no_grad():
             self.timer.start('preprocess_batch')
             if isinstance(self.adapter, CustomAdapter):
@@ -3676,6 +4033,12 @@ class SDTrainer(BaseSDTrainProcess):
 
         if grad_norm_value is not None:
             loss_dict['grad_norm'] = grad_norm_value
+
+        # Log attention softcapping stats periodically
+        # Note: update_softcap_step() is called at start of train_single_accumulation()
+        # so step counter is correct during forward pass (when attention ops happen).
+        if hasattr(self, 'step_num') and self.step_num % 10 == 0:
+            self._log_attention_stats()
 
         self.end_of_training_loop()
 

@@ -944,6 +944,38 @@ class TrainConfig:
         # automatically adapte the vae scaling based on the image norm
         self.adaptive_scaling_factor = kwargs.get('adaptive_scaling_factor', False)
 
+        # Attention tanh softcapping - prevents attention scores from becoming too extreme
+        # Inspired by Gemma2 and Grok-1. Applies: soft_cap * tanh(score / soft_cap) before softmax
+        # Helps with training stability by avoiding overly sharp attention distributions
+        # Requires PyTorch 2.5+ with flex_attention support
+        # Hierarchy: per-type-per-expert → per-type → per-expert → global
+        self.attention_tanh_softcap_enabled = kwargs.get('attention_tanh_softcap_enabled', True)
+        self.attention_tanh_softcap_value = kwargs.get('attention_tanh_softcap_value', 30.0)
+        
+        # Per-attention-type overrides (applies to both experts)
+        self.attention_tanh_softcap_value_self_attn = kwargs.get('attention_tanh_softcap_value_self_attn', None)
+        self.attention_tanh_softcap_value_cross_attn = kwargs.get('attention_tanh_softcap_value_cross_attn', None)
+        
+        # Per-expert overrides (applies to both attention types)
+        self.attention_tanh_softcap_value_high_noise = kwargs.get('attention_tanh_softcap_value_high_noise', None)
+        self.attention_tanh_softcap_value_low_noise = kwargs.get('attention_tanh_softcap_value_low_noise', None)
+        
+        # Per-type-per-expert overrides (most specific)
+        self.attention_tanh_softcap_value_self_attn_high_noise = kwargs.get('attention_tanh_softcap_value_self_attn_high_noise', None)
+        self.attention_tanh_softcap_value_self_attn_low_noise = kwargs.get('attention_tanh_softcap_value_self_attn_low_noise', None)
+        self.attention_tanh_softcap_value_cross_attn_high_noise = kwargs.get('attention_tanh_softcap_value_cross_attn_high_noise', None)
+        self.attention_tanh_softcap_value_cross_attn_low_noise = kwargs.get('attention_tanh_softcap_value_cross_attn_low_noise', None)
+
+        # Attention F32 acceleration - use float32 instead of float64 for rotary embeddings
+        # Default toolkit uses float64 for maximum precision (slow), diffusers uses input dtype (fast, less stable)
+        # F32 is a good middle ground: faster than F64, more stable than BF16/FP16 for RoPE
+        self.attention_f32_rope_enabled = kwargs.get('attention_f32_rope_enabled', True)
+
+        # GELU acceleration for Wan 2.x FeedForward layers
+        # Patches diffusers' GELU to use tanh.approx.f32 PTX instruction (~2-5% FF speedup)
+        # NOTE: Global monkeypatch - only enable when training Wan 2.x models
+        self.gelu_acceleration_enabled = kwargs.get('gelu_acceleration_enabled', True)
+
         # dropout that happens before encoding. It functions independently per text encoder
         self.prompt_dropout_prob = kwargs.get('prompt_dropout_prob', 0.0)
 
@@ -1117,6 +1149,28 @@ class TrainConfig:
         # Gradient projection (PCGrad-style) for MSE+Spectral+Flow: when any gradients conflict,
         # project them to remove components that worsen other losses
         self.mse_spectral_flow_gradient_projection_enabled = kwargs.get('mse_spectral_flow_gradient_projection_enabled', False)
+        
+        # Per-timestep range loss weight overrides
+        # Allows specifying different loss weights for different timestep ranges per model.
+        # Ranges are relative to the model's effective timestep range.
+        # Example: for a low-noise expert with range 0-900, a range of 1000-500 maps to 900-450.
+        # Multiple ranges can be specified; first matching range wins.
+        # Ranges are in absolute model timesteps (0-1000). Each expert dynamically
+        # checks if its current timestep falls within a range.
+        # Format: list of dicts with keys:
+        #   start_timestep: start of range (absolute, 0-1000)
+        #   end_timestep: end of range (absolute, 0-1000)
+        #   flow_weight: optional flow weight override
+        #   spectral_weight: optional spectral weight override
+        #   spectral_low_weight: optional low freq weight override
+        #   spectral_mid_weight: optional mid freq weight override
+        #   spectral_high_weight: optional high freq weight override
+        #   mse_weight: optional MSE weight override
+        #   spectral_low_cutoff: optional low frequency cutoff override
+        #   spectral_high_cutoff: optional high frequency cutoff override
+        #   spectral_lcr_weight: optional LCR (Low-Cut Ratio) weight override
+        #   spectral_temporal_scale: optional temporal scale override
+        self.timestep_range_overrides = kwargs.get('timestep_range_overrides', [])
         
         # do the loss on a timestep to 0 prediction
         self.t0_loss_target = kwargs.get('t0_loss_target', False)
@@ -1325,6 +1379,13 @@ class ModelConfig:
         # The loaded VAE state dict is automatically normalized to the standard
         # AutoencoderKLWan naming scheme if it uses an alternative convention.
         self.custom_vae_name_or_path = kwargs.get("custom_vae_name_or_path", None)
+        
+        # Wan transformer eps override (for LayerNorm and attention norms)
+        # Official config uses 1e-6 (for fp32 training)
+        # For bf16 training, use larger eps like 1e-4 or 1e-5 (bf16 has ~2-3 decimal digits precision)
+        # Set to None to use the model's default eps from config
+        # This is a model architecture setting, not a training hyperparameter
+        self.wan_transformer_eps = kwargs.get('wan_transformer_eps', None)
         
         # path to an accuracy recovery adapter, either local or remote
         self.accuracy_recovery_adapter = kwargs.get("accuracy_recovery_adapter", None)

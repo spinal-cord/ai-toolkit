@@ -420,6 +420,11 @@ class I2VAdapter(torch.nn.Module):
 
             transformer: WanTransformer3DModel = sd.model
             for block in transformer.blocks:
+                # Apply softcapping-enabled processor to BOTH self-attention and cross-attention
+                # Only replace if not already a WanAttnProcessor2_0 (preserve other processors)
+                if not isinstance(block.attn1.processor, WanAttnProcessor2_0):
+                    block.attn1.set_processor(WanAttnProcessor2_0())
+                
                 block.attn2.added_kv_proj_dim = added_kv_proj_dim
                 attn_module = AttentionHog(
                     added_kv_proj_dim,
@@ -428,7 +433,8 @@ class I2VAdapter(torch.nn.Module):
                     transformer
                 )
                 # set the attn function to ours that handles custom number of vision tokens
-                block.attn2.set_processor(WanAttnProcessor2_0(num_vision_tokens))
+                if not isinstance(block.attn2.processor, WanAttnProcessor2_0):
+                    block.attn2.set_processor(WanAttnProcessor2_0(num_vision_tokens))
                 
                 attn_hog_list.append(attn_module)
         else:

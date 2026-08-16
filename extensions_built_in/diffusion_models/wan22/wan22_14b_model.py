@@ -740,6 +740,27 @@ class Wan2214bModel(Wan21):
         # 8x compression  and 2x2 patch size
         return 16
 
+    def _apply_wan_transformer_eps(self, transformer, label="transformer"):
+        """Apply wan_transformer_eps override from ModelConfig to a transformer."""
+        wan_eps = getattr(self.model_config, 'wan_transformer_eps', None)
+        if wan_eps is not None:
+            original_eps = transformer.config.eps
+            transformer.config.eps = wan_eps
+            self.print_and_status_update(f"Overriding {label} eps: {original_eps} -> {wan_eps}")
+            # Update eps in all blocks
+            for block in transformer.blocks:
+                # LayerNorm layers
+                block.norm1.eps = wan_eps
+                if hasattr(block.norm2, 'eps'):
+                    block.norm2.eps = wan_eps
+                block.norm3.eps = wan_eps
+                # Attention norms (self-attention)
+                block.attn1.norm_q.eps = wan_eps
+                block.attn1.norm_k.eps = wan_eps
+                # Attention norms (cross-attention)
+                block.attn2.norm_q.eps = wan_eps
+                block.attn2.norm_k.eps = wan_eps
+
     def load_wan_transformer(self, transformer_path, subfolder=None):
         if self.model_config.split_model_over_gpus:
             raise ValueError(
@@ -871,6 +892,9 @@ class Wan2214bModel(Wan21):
             transformer_1.to(self.device_torch, dtype=dtype)
             flush()
 
+        # Apply eps override from TrainConfig (if set)
+        self._apply_wan_transformer_eps(transformer_1, "transformer 1")
+
         if self.model_config.quantize and self.model_config.accuracy_recovery_adapter is None:
             # todo handle two ARAs
             self.print_and_status_update("Quantizing Transformer 1")
@@ -900,6 +924,9 @@ class Wan2214bModel(Wan21):
         else:
             transformer_2.to(self.device_torch, dtype=dtype)
             flush()
+
+        # Apply eps override from TrainConfig (if set)
+        self._apply_wan_transformer_eps(transformer_2, "transformer 2")
 
         if self.model_config.quantize and self.model_config.accuracy_recovery_adapter is None:
             # todo handle two ARAs
@@ -988,6 +1015,9 @@ class Wan2214bModel(Wan21):
             high_path, config, dtype, device, is_high_noise=True
         )
         
+        # Apply eps override from TrainConfig (if set)
+        self._apply_wan_transformer_eps(transformer_1, "HIGH noise transformer")
+        
         if self.model_config.low_vram:
             self.print_and_status_update("Moving HIGH noise transformer to CPU")
             transformer_1.to('cpu')
@@ -1008,6 +1038,9 @@ class Wan2214bModel(Wan21):
         transformer_2 = load_transformer_from_safetensors(
             low_path, config, dtype, device, is_high_noise=False
         )
+        
+        # Apply eps override from TrainConfig (if set)
+        self._apply_wan_transformer_eps(transformer_2, "LOW noise transformer")
         
         if self.model_config.low_vram:
             self.print_and_status_update("Moving LOW noise transformer to CPU")

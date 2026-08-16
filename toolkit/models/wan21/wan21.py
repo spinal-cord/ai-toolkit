@@ -458,6 +458,26 @@ class Wan21(BaseModel):
             torch_dtype=dtype,
         ).to(dtype=dtype)
 
+        # Apply eps override if specified in config
+        wan_eps = getattr(self.model_config, 'wan_transformer_eps', None)
+        if wan_eps is not None:
+            original_eps = transformer.config.eps
+            transformer.config.eps = wan_eps
+            self.print_and_status_update(f"Overriding Wan transformer eps: {original_eps} -> {wan_eps}")
+            # Update eps in all blocks
+            for block in transformer.blocks:
+                # LayerNorm layers
+                block.norm1.eps = wan_eps
+                if hasattr(block.norm2, 'eps'):
+                    block.norm2.eps = wan_eps
+                block.norm3.eps = wan_eps
+                # Attention norms (self-attention)
+                block.attn1.norm_q.eps = wan_eps
+                block.attn1.norm_k.eps = wan_eps
+                # Attention norms (cross-attention)
+                block.attn2.norm_q.eps = wan_eps
+                block.attn2.norm_k.eps = wan_eps
+
         if self.model_config.split_model_over_gpus:
             raise ValueError(
                 "Splitting model over gpus is not supported for Wan2.1 models")

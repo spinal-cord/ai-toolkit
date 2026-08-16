@@ -178,6 +178,23 @@ export interface EMAConfig {
   ema_decay: number;
 }
 
+export interface TimestepRangeOverride {
+  start_timestep: number;  // absolute start timestep (0-1000)
+  end_timestep: number;    // absolute end timestep (0-1000)
+  // Loss weight overrides
+  flow_weight?: number | null;
+  spectral_weight?: number | null;
+  spectral_low_weight?: number | null;
+  spectral_mid_weight?: number | null;
+  spectral_high_weight?: number | null;
+  mse_weight?: number | null;
+  // Spectral filter overrides
+  spectral_low_cutoff?: number | null;
+  spectral_high_cutoff?: number | null;
+  spectral_lcr_weight?: number | null;
+  spectral_temporal_scale?: number | null;
+}
+
 export interface TrainConfig {
   batch_size: number;
   bypass_guidance_embedding?: boolean;
@@ -253,7 +270,7 @@ export interface TrainConfig {
   blank_prompt_preservation?: boolean;
   blank_prompt_preservation_multiplier?: number;
   switch_boundary_every: number;
-  loss_type: 'mse' | 'mae' | 'wavelet' | 'spectral' | 'spectral_flow' | 'stepped' | 'mean_flow' | 'pseudo_huber';
+  loss_type: 'mse' | 'mae' | 'wavelet' | 'spectral' | 'spectral_flow' | 'mse_spectral_flow' | 'stepped' | 'mean_flow' | 'pseudo_huber';
   pseudo_huber_c?: number;
   // Spectral loss config - global weights (fallback for single-expert models)
   spectral_low_weight?: number;
@@ -294,10 +311,41 @@ export interface TrainConfig {
   spectral_flow_adaptive?: boolean;
   spectral_flow_rejection_threshold?: number;
   spectral_flow_max_rejections?: number;
+  // MSE + Spectral + Flow loss config
+  mse_spectral_flow_mse_weight?: number;
+  mse_spectral_flow_mse_weight_low?: number | null;
+  mse_spectral_flow_mse_weight_high?: number | null;
+  mse_spectral_flow_gradient_projection_enabled?: boolean;
   do_differential_guidance?: boolean;
   differential_guidance_scale?: number;
   audio_loss_multiplier?: number;
   max_loss?: number | null;
+  // Per-timestep range loss weight overrides
+  // Ranges are in absolute model timesteps (0-1000)
+  // Each expert dynamically checks if its current timestep is inside a range
+  timestep_range_overrides?: TimestepRangeOverride[];
+  // Attention tanh softcapping (Gemma2/Grok-1 style)
+  // Prevents attention scores from becoming too extreme, improving training stability
+  // Hierarchy: per-type-per-expert → per-type → per-expert → global
+  attention_tanh_softcap_enabled?: boolean;
+  attention_tanh_softcap_value?: number;  // Global default
+  // Per-attention-type overrides (applies to both experts)
+  attention_tanh_softcap_value_self_attn?: number | null;
+  attention_tanh_softcap_value_cross_attn?: number | null;
+  // Per-expert overrides (applies to both attention types)
+  attention_tanh_softcap_value_high_noise?: number | null;
+  attention_tanh_softcap_value_low_noise?: number | null;
+  // Per-type-per-expert overrides (most specific)
+  attention_tanh_softcap_value_self_attn_high_noise?: number | null;
+  attention_tanh_softcap_value_self_attn_low_noise?: number | null;
+  attention_tanh_softcap_value_cross_attn_high_noise?: number | null;
+  attention_tanh_softcap_value_cross_attn_low_noise?: number | null;
+  // Attention F32 RoPE acceleration
+  // Use float32 instead of float64 for rotary embeddings (faster, still stable)
+  attention_f32_rope_enabled?: boolean;
+  // GELU acceleration for Wan 2.x FeedForward layers
+  // Uses tanh.approx.f32 PTX instruction (~2-5% FF speedup)
+  gelu_acceleration_enabled?: boolean;
 }
 
 export interface QuantizeKwargsConfig {
@@ -326,6 +374,11 @@ export interface ModelConfig {
   compile_fullgraph?: boolean;
   compile_dynamic?: boolean;
   cache_size_limit?: number;
+  // Wan transformer eps override (for LayerNorm and attention norms)
+  // Official config uses 1e-6 (for fp32 training)
+  // For bf16 training, use larger eps like 1e-4 or 1e-5
+  // Leave empty to use model's default
+  wan_transformer_eps?: number | null;
 }
 
 export interface SampleItem {
