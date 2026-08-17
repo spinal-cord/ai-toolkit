@@ -1072,10 +1072,11 @@ class SDTrainer(BaseSDTrainProcess):
         
         if not params:
             # Fallback to normal backward
-            if mse_loss is not None:
-                self.accelerator.backward(spectral_loss + flow_loss + mse_loss)
-            else:
-                self.accelerator.backward(spectral_loss + flow_loss)
+            total_loss = spectral_loss + flow_loss + (mse_loss if mse_loss is not None else 0.0)
+            if total_loss.requires_grad:
+                self.accelerator.backward(total_loss)
+            # If no component has a computation graph (e.g. all weights zero /
+            # flow gate 0), there is nothing to backprop - skip silently.
             return
         
         # Save currently accumulated gradients (from previous batches in accumulation loop)
@@ -1090,7 +1091,19 @@ class SDTrainer(BaseSDTrainProcess):
         # Helper function: compute gradient of a loss w.r.t. params using autograd.grad()
         # This avoids in-place modifications to shared computation graph intermediates
         def compute_grad(loss_tensor):
-            """Compute gradient dict for a loss using torch.autograd.grad()."""
+            """Compute gradient dict for a loss using torch.autograd.grad().
+
+            Returns an empty dict when the loss has no computation graph.
+            This happens when a component's computation is skipped entirely,
+            e.g. the flow loss when the timestep gate is 0 for the whole batch
+            or the flow weight is 0 (the loss functions return a plain
+            constant tensor in that case), or the spectral loss when all
+            spectral band weights are 0. A constant contributes no gradient;
+            calling autograd.grad() on such a tensor would raise
+            "element 0 of tensors does not require grad and does not have a grad_fn".
+            """
+            if loss_tensor is None or loss_tensor.grad_fn is None:
+                return {}
             grads = torch.autograd.grad(
                 loss_tensor, params, retain_graph=True, allow_unused=True
             )
