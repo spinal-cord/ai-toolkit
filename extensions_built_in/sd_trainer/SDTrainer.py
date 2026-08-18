@@ -125,6 +125,10 @@ class SDTrainer(BaseSDTrainProcess):
         self._mse_loss_tensor = None       # Loss tensor for MSE component (for gradient projection)
         self._spectral_loss_tensor = None  # Loss tensor for spectral component (for gradient projection)
         self._flow_loss_tensor = None      # Loss tensor for flow component (for gradient projection)
+        # Running EMA of the per-batch flow gate mean (E[gate]) over the timestep
+        # distribution, logged for monitoring the effective flow dilution factor.
+        # 0.0 = not yet warmed up.
+        self._flow_gate_ema = 0.0
         
         if self.train_config.diff_output_preservation:
             if self.trigger_word is None:
@@ -1043,6 +1047,32 @@ class SDTrainer(BaseSDTrainProcess):
         
         return base_lcr_weight
 
+    def _update_flow_gate_log(self, timesteps):
+        """Log the per-batch flow gate mean and its running EMA.
+
+        The flow loss is a zero-inflated estimator: items sampled at
+        t >= max_timestep have gate=0 and contribute nothing. The loss is
+        renormalized by the per-batch gate sum (see FlowConsistencyLoss), so the
+        gate mean here is the expected fraction of the batch that actually drives
+        the flow objective -- a direct readout of the flow dilution factor for the
+        current timestep distribution.
+        """
+        if timesteps is None:
+            return
+        if isinstance(timesteps, torch.Tensor):
+            t = timesteps[:, 0].float() if timesteps.dim() == 2 else timesteps.float()
+        else:
+            t = torch.as_tensor(float(timesteps), dtype=torch.float32)
+        max_t = float(self.train_config.spectral_flow_max_timestep)
+        if self.train_config.spectral_flow_reverse_gate:
+            gate = torch.clamp(t / max_t, min=0.0, max=1.0)
+        else:
+            gate = torch.clamp(1.0 - (t / max_t), min=0.0)
+        gmean = float(gate.mean().item())
+        self._flow_gate_ema = gmean if self._flow_gate_ema <= 1e-6 else 0.98 * self._flow_gate_ema + 0.02 * gmean
+        self.additional_logs['flow/gate_mean'] = gmean
+        self.additional_logs['flow/gate_ema'] = self._flow_gate_ema
+
     def _gradient_projection_backward(self, spectral_loss, flow_loss, mse_loss=None):
         """Compute gradients for losses separately, then project (PCGrad).
         
@@ -1866,6 +1896,9 @@ class SDTrainer(BaseSDTrainProcess):
                     spec_params = self._get_expert_spectral_params_with_override(current_t)
                     lcr_weight = self._get_lcr_weight_with_override(current_t)
 
+                    # Log the flow gate mean (effective flow dilution factor)
+                    self._update_flow_gate_log(timesteps)
+
                     (total_loss, flow_dev, spatial_val, flow_val,
                      spectral_component, flow_component) = spectral_flow_loss(
                         model_pred=pred,
@@ -1898,7 +1931,14 @@ class SDTrainer(BaseSDTrainProcess):
                     # Issue #1 fix: per-expert flow deviation tracking
                     if expert not in self.flow_deviation_history:
                         self.flow_deviation_history[expert] = []
-                    self.flow_deviation_history[expert].append(flow_dev)
+                    # Only record when flow was actually evaluated. When the timestep
+                    # gate is 0 for the whole batch (or there is no flow data / only
+                    # one latent frame), the loss functions return a plain constant 0
+                    # (requires_grad=False). Appending those zeros would dilute the
+                    # moving average and drive the adaptive weight down as if motion
+                    # were already consistent.
+                    if flow_component.requires_grad:
+                        self.flow_deviation_history[expert].append(flow_dev)
 
                     # Issue #1 fix: per-expert adaptive weight adjustment
                     if self.train_config.spectral_flow_adaptive:
@@ -2114,6 +2154,9 @@ class SDTrainer(BaseSDTrainProcess):
                     spec_params = self._get_expert_spectral_params_with_override(current_t)
                     lcr_weight = self._get_lcr_weight_with_override(current_t)
 
+                    # Log the flow gate mean (effective flow dilution factor)
+                    self._update_flow_gate_log(timesteps)
+
                     (total_loss, flow_dev, mse_val, spatial_val, flow_val,
                      mse_component, spectral_component, flow_component) = mse_spectral_flow_loss(
                         model_pred=pred,
@@ -2147,7 +2190,10 @@ class SDTrainer(BaseSDTrainProcess):
                     # Issue #1 fix: per-expert flow deviation tracking
                     if expert not in self.flow_deviation_history:
                         self.flow_deviation_history[expert] = []
-                    self.flow_deviation_history[expert].append(flow_dev)
+                    # Only record when flow was actually evaluated (see the
+                    # spectral_flow branch above for the rationale).
+                    if flow_component.requires_grad:
+                        self.flow_deviation_history[expert].append(flow_dev)
 
                     # Issue #1 fix: per-expert adaptive weight adjustment
                     if self.train_config.spectral_flow_adaptive:

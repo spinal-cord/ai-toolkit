@@ -558,6 +558,86 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'train.spectral_flow_max_timestep': {
+    title: 'Flow Max Timestep',
+    description: (
+      <>
+        <strong>Overview</strong>
+        <br />
+        <br />
+        This value sets the cutoff for the <strong>timestep gate</strong> that decides at which denoising
+        timesteps the optical flow loss is actually applied. It is a smooth ramp, not a hard on/off
+        switch.
+        <br />
+        <br />
+        <strong>How the gate works</strong>
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li>
+            <strong>Normal gate</strong> (default): <code>gate(t) = 1 - t/max_timestep</code>. The flow loss
+            is fully active at t=0 and ramps linearly to 0 at t=max_timestep. Items with t &gt;
+            max_timestep contribute no flow loss.
+          </li>
+          <li>
+            <strong>Reverse gate</strong>: <code>gate(t) = t/max_timestep</code>. The flow loss is 0 at t=0
+            and ramps to full strength at t=max_timestep (useful to enforce motion consistency early /
+            at high noise).
+          </li>
+        </ul>
+        <br />
+        <strong>Effect of the max timestep value</strong>
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li>
+            <strong>Low value</strong> (e.g. 300): flow is only enforced in a narrow low-noise window
+            [0, 300]. Fewer steps contribute, but the ones that do have a strong, reliable x0
+            prediction.
+          </li>
+          <li>
+            <strong>High value</strong> (e.g. 1000): flow is enforced across the entire denoising range,
+            so on average more of each batch contributes to the flow loss.
+          </li>
+        </ul>
+        <br />
+        The default (800) keeps flow mostly in the low-noise regime, where the reconstructed clean
+        latent (x0) that the flow loss compares between frames is most accurate.
+        <br />
+        <br />
+        <strong>How batch size and per-item timesteps interact</strong>
+        <br />
+        Each item in a batch is sampled at its <strong>own independent timestep</strong>, so it has its own
+        gate value. The flow loss is a <strong>ratio over the active items</strong>:{' '}
+        <code>sum(gate * loss) / sum(gate)</code>. Items whose gate is 0 drop out of both the numerator
+        and the denominator, so they are effectively conditioned out.
+        <br />
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li>
+            A batch where only 1 of 8 items is in the valid range produces the{' '}
+            <strong>same per-item flow signal magnitude</strong> as a batch where all 8 are active (it is{' '}
+            <strong>not</strong> diluted to 1/8). So <code>flow_weight</code> keeps a stable,
+            batch-size-independent meaning.
+          </li>
+          <li>
+            If <strong>every</strong> item in a batch is gated out (all t &gt; max_timestep), the flow loss for
+            that step is exactly 0 and contributes no gradient; the spectral / MSE losses still train
+            normally. With per-item timesteps this is rare, and its probability shrinks quickly as
+            batch size grows.
+          </li>
+          <li>
+            Smaller batches therefore have a slightly higher chance of a fully-gated (zero-flow) step,
+            especially with a low max_timestep.
+          </li>
+        </ul>
+        <br />
+        <strong>Monitoring</strong>
+        <br />
+        Watch the <code>flow/gate_mean</code> log: it is the expected fraction of the batch that actually
+        drives the flow objective. A low value means most of your timesteps sit above max_timestep and
+        the flow loss is rarely active (consider raising max_timestep or <code>flow_weight</code>).
+      </>
+    ),
+  },
   'train.attention_tanh_softcap_enabled': {
     title: 'Attention Tanh Softcapping',
     description: (
