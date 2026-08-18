@@ -324,6 +324,10 @@ export interface TrainConfig {
   // Ranges are in absolute model timesteps (0-1000)
   // Each expert dynamically checks if its current timestep is inside a range
   timestep_range_overrides?: TimestepRangeOverride[];
+  // Attention backend for training: native (auto) | flex | sdpa | flash
+  // native = flex_attention when softcapping is enabled, otherwise SDPA
+  // NOTE: enabled tanh softcapping always overrides this to 'flex' for training
+  attention_backend?: string;
   // Attention tanh softcapping (Gemma2/Grok-1 style)
   // Prevents attention scores from becoming too extreme, improving training stability
   // Hierarchy: per-type-per-expert → per-type → per-expert → global
@@ -405,6 +409,12 @@ export interface SampleItem {
 
 export interface SampleConfig {
   sampler: string;
+  // Attention backend for sampling: native (auto) | flex | sdpa | flash
+  attention_backend?: string;
+  // Apply tanh softcapping during sampling too (independent of the training
+  // toggle; uses the same soft cap value). Off by default to match standard
+  // inference. Enabling it forces the sampling backend to flex attention.
+  attention_tanh_softcap_enabled?: boolean;
   sample_every: number;
   width: number;
   height: number;

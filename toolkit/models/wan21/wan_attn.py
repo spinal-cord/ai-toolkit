@@ -11,9 +11,128 @@ from functools import partial, lru_cache
 # The WanAttnProcessor2_0 resolves which value to use and passes it directly to _apply_attention_with_softcap
 _attention_config = {
     'softcap_enabled': True,
+    # Whether tanh softcapping is also applied during SAMPLING (independent of
+    # the training toggle). Off by default to match standard inference; users
+    # can opt in via sample.attention_tanh_softcap_enabled in the job config.
+    'softcap_sample_enabled': False,
     'softcap_value': 30.0,  # Global default
     'f32_rope_enabled': True,
+    # Attention backend selection (set by the trainer from the job config)
+    #   'auto'  = flex_attention when training with softcap, otherwise SDPA (legacy default)
+    #   'flex'  = torch flex_attention (the only kernel that can apply tanh softcapping)
+    #   'sdpa'  = F.scaled_dot_product_attention (PyTorch picks flash/mem-efficient kernel)
+    #   'flash' = flash-attn v2 package (fp16/bf16, no arbitrary attention masks)
+    # 'train_backend' applies during training steps, 'sample_backend' during sampling.
+    'train_backend': 'auto',
+    'sample_backend': 'auto',
+    # Toggled by the trainer around sampling so training and sampling can use
+    # different backends. NOTE: reading this inside compiled code makes Dynamo
+    # specialize on it - the resulting graph variants are cached, so switching
+    # only costs a recompile the first time each mode is entered.
+    'in_sampling': False,
 }
+
+
+_VALID_BACKENDS = ('auto', 'flex', 'sdpa', 'flash')
+
+
+def _normalize_backend(backend) -> str:
+    backend = str(backend or 'auto').lower()
+    if backend in ('native', 'sdpa_default'):
+        return 'auto'
+    if backend in _VALID_BACKENDS:
+        return backend
+    raise ValueError(
+        f"Unknown attention backend '{backend}'. "
+        f"Valid values: {', '.join(_VALID_BACKENDS)} (or 'native' as alias for 'auto')."
+    )
+
+
+def set_attention_backend_choice(train_backend: str = 'auto', sample_backend: str = 'auto'):
+    """
+    Set the attention kernel used during training and during sampling.
+
+    Args:
+        train_backend: 'auto' | 'flex' | 'sdpa' | 'flash' (also accepts 'native' as 'auto')
+        sample_backend: same options, applied while generating samples
+
+    NOTE: when tanh softcapping is enabled for a mode (training and/or
+    sampling, see set_attention_softcapping) it REQUIRES flex_attention (it is
+    implemented as a flex_attention score_mod), so an enabled softcap overrides
+    the backend of that mode to 'flex'.
+    """
+    _attention_config['train_backend'] = _normalize_backend(train_backend)
+    _attention_config['sample_backend'] = _normalize_backend(sample_backend)
+
+
+def set_sampling_mode(enabled: bool):
+    """Toggle whether attention calls are currently part of sampling."""
+    _attention_config['in_sampling'] = bool(enabled)
+
+
+def get_effective_backend(in_sampling: Optional[bool] = None) -> str:
+    """
+    Resolve the kernel that will actually be used (after softcap override).
+    Used for logging the effective configuration at setup time.
+    """
+    if in_sampling is None:
+        in_sampling = _attention_config['in_sampling']
+    backend = _attention_config['sample_backend'] if in_sampling else _attention_config['train_backend']
+    softcap_on = (_attention_config['softcap_sample_enabled'] if in_sampling
+                  else _attention_config['softcap_enabled'])
+    if softcap_on:
+        return 'flex (softcap active)'
+    if backend == 'auto':
+        return 'sdpa'
+    return backend
+
+
+_warned_once = set()
+
+
+def _warn_once(key: str, message: str):
+    """Warn at most once per key (avoids log spam from per-attention-call fallbacks)."""
+    if key in _warned_once:
+        return
+    _warned_once.add(key)
+    import warnings
+    warnings.warn(message, RuntimeWarning, stacklevel=2)
+
+
+def _apply_flash_attention(query, key, value, dropout_p: float = 0.0,
+                           is_causal: bool = False, attn_mask: Optional[torch.Tensor] = None):
+    """
+    flash-attn v2 kernel (flash_attn.flash_attn_func).
+
+    Expects (B, H, L, D) layout; flash_attn uses (B, L, H, D) internally.
+    Falls back to SDPA (with a one-time warning) when the request is not
+    expressible with flash_attn (arbitrary masks, unsupported dtype).
+    """
+    if attn_mask is not None:
+        _warn_once('flash_mask',
+                   "flash attention backend does not support attention masks; "
+                   "using SDPA for masked attention.")
+        return F.scaled_dot_product_attention(query, key, value,
+                                              attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
+    if query.dtype not in (torch.float16, torch.bfloat16):
+        _warn_once('flash_dtype',
+                   f"flash attention backend requires fp16/bf16 (got {query.dtype}); using SDPA.")
+        return F.scaled_dot_product_attention(query, key, value,
+                                              attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
+    from flash_attn import flash_attn_func
+    q = query.transpose(1, 2)
+    k = key.transpose(1, 2)
+    v = value.transpose(1, 2)
+    out = flash_attn_func(q, k, v, dropout_p=dropout_p, causal=is_causal)
+    return out.transpose(1, 2)
+
+
+def _compiler_disable(fn):
+    """torch.compiler.disable with a safe fallback for older PyTorch."""
+    try:
+        return torch.compiler.disable(fn)
+    except Exception:
+        return fn
 
 # Per-type softcap values (None = use global)
 # These are resolved by WanAttnProcessor2_0 based on attn_type and current expert
@@ -175,9 +294,10 @@ def _get_tanh_approx():
         return _tanh_approx
 
 # Softcapping stats collector
-# NOTE: These are ONLY updated in eager mode, not under torch.compile.
-# Under torch.compile, mutable global state would cause compilation storms
-# (Dynamo guards failing on every step). Logging is disabled when compiling.
+# NOTE: These are only mutated inside torch.compiler.disable'd regions
+# (_maybe_collect_softcap_stats, _resolve_softcap_for_current_expert), so
+# stats collection works in eager mode AND under torch.compile (as a cheap
+# graph break) without creating Dynamo guards / recompilation storms.
 #
 # IMPORTANT: current_step is set by the trainer (not auto-incremented per attention)
 # to reflect actual training steps, not attention operation count.
@@ -301,6 +421,7 @@ def _get_score_mod(soft_cap: float, head_dim: int):
 def set_attention_softcapping(
     enabled: bool = True,
     soft_cap: float = 30.0,
+    sample_enabled: Optional[bool] = None,  # None = leave sampling setting unchanged
     # Per-attention-type overrides
     soft_cap_self_attn: float = None,
     soft_cap_cross_attn: float = None,
@@ -323,7 +444,10 @@ def set_attention_softcapping(
     to _apply_attention_with_softcap as a float parameter.
     
     Args:
-        enabled: Whether softcapping is enabled globally
+        enabled: Whether softcapping is enabled during training
+        sample_enabled: Whether softcapping is also applied during sampling
+            (None = do not change the current sampling setting). When enabled,
+            sampling uses the same soft_cap/overrides as training.
         soft_cap: Global default softcap value
         soft_cap_self_attn: Override for all self-attention
         soft_cap_cross_attn: Override for all cross-attention
@@ -335,6 +459,8 @@ def set_attention_softcapping(
         soft_cap_cross_attn_low_noise: Override for cross-attention in low-noise expert
     """
     _attention_config['softcap_enabled'] = enabled
+    if sample_enabled is not None:
+        _attention_config['softcap_sample_enabled'] = bool(sample_enabled)
     _attention_config['softcap_value'] = soft_cap
     
     # Store overrides in the dedicated dict
@@ -351,6 +477,62 @@ def set_attention_softcapping(
 def set_attention_f32_rope(enabled: bool = True):
     """Set global attention F32 RoPE acceleration configuration."""
     _attention_config['f32_rope_enabled'] = enabled
+
+
+@_compiler_disable
+def _resolve_softcap_for_current_expert(attn_type: str) -> float:
+    """
+    Resolve the effective softcap value for the expert currently set by the
+    trainer (via update_softcap_step).
+
+    This runs in a compiler-disabled region so that reading the mutable global
+    _softcap_stats['current_expert'] does NOT create Dynamo guards - otherwise
+    switching between high/low-noise experts (Wan 2.2 dual-expert) would force
+    a full recompile of the model on every switch.
+    """
+    current_expert = _softcap_stats.get('current_expert', 'single')
+    if current_expert == 'high':
+        expert = 'high_noise'
+    elif current_expert == 'low':
+        expert = 'low_noise'
+    else:
+        expert = 'single'
+    return resolve_softcap_value(attn_type, expert)
+
+
+@_compiler_disable
+def _maybe_collect_softcap_stats(query, key, lse, soft_cap, attn_type, q_len):
+    """
+    Sample a small subset of attention scores for softcapping statistics.
+
+    Runs in a compiler-disabled region (a graph break under torch.compile),
+    which keeps the mutable _softcap_stats global out of the compiled graph
+    while still letting stats collection work with compile enabled. The real
+    work (randperm + matmul + one .cpu() transfer) only happens every
+    `sample_every_n_steps` training steps; on all other calls this is a cheap
+    no-op check.
+    """
+    if not _softcap_stats['enabled']:
+        return
+    step = _softcap_stats['current_step']
+    if step <= 0 or step % _softcap_stats['sample_every_n_steps'] != 0:
+        return
+    try:
+        sample_stats = _sample_attention_scores(query, key, soft_cap)
+        if lse is not None:
+            # Lower LSE = softer/more diffuse attention (softcapping working)
+            sample_stats['avg_lse'] = float(lse.detach().mean().cpu())
+        sample_stats['step'] = step
+        sample_stats['seq_len'] = q_len
+        sample_stats['attn_type'] = attn_type
+        sample_stats['expert'] = _softcap_stats['current_expert']
+        sample_stats['soft_cap_used'] = soft_cap
+        _softcap_stats['sample_stats'].append(sample_stats)
+        # Trim to prevent unbounded growth (memory leak over long runs)
+        if len(_softcap_stats['sample_stats']) > 200:
+            del _softcap_stats['sample_stats'][:-200]
+    except Exception:
+        pass  # stats must never break training
 
 
 def resolve_softcap_value(attn_type: str, expert: str) -> float:
@@ -657,10 +839,20 @@ def _apply_attention_with_softcap(
     # Metadata for stats tracking only - NOT used for config resolution
     attn_type: str = 'self_attn',  # For stats logging: 'self_attn' or 'cross_attn'
     expert: str = 'single',        # For stats logging: 'single', 'high_noise', or 'low_noise'
+    backend: str = 'auto',         # 'auto' | 'flex' | 'sdpa' | 'flash' (pre-resolved by caller)
 ) -> torch.Tensor:
     """
-    Apply attention with optional tanh softcapping.
-    Uses flex_attention if available and enabled, falls back to scaled_dot_product_attention.
+    Apply attention with the configured backend and optional tanh softcapping.
+
+    Backend resolution (softcap wins):
+      - 'auto'  → flex_attention when softcap is enabled for the current mode
+                  (training or sampling), else SDPA
+      - 'flex'  → flex_attention (with score_mod softcapping when enabled)
+      - 'sdpa'  → F.scaled_dot_product_attention
+      - 'flash' → flash-attn v2 package (falls back to SDPA for masks/other dtypes)
+      - softcapping ENABLED for the current mode always overrides the backend
+        to 'flex' (it is implemented as a flex_attention score_mod).
+        Training and sampling have independent softcap toggles.
 
     Uses flex_attention's proper architecture:
     - BlockMask for structural masking (padding, causal) - allows skipping masked blocks
@@ -668,24 +860,39 @@ def _apply_attention_with_softcap(
 
     Optimizations:
     - Caches BlockMask to avoid expensive recomputation (with LRU eviction)
+    - Caches score_mod functions (prevents torch.compile recompilation storms)
     - Uses hardware-accelerated tanh.approx.f32 PTX instruction
     - Division converted to multiplication in score_mod
     - ROWS_GUARANTEED_SAFE + BLOCKS_ARE_CONTIGUOUS for causal masks
-    - PRESCALE_QK for small speedup
     - No device mismatch errors
-    - torch.compile safe (no mutable global state in hot path)
-    
-    IMPORTANT: soft_cap is passed as a parameter, NOT looked up from config inside.
-    The caller (WanAttnProcessor2_0) is responsible for resolving the correct value
-    based on attention type and expert using resolve_softcap_value().
-    
+    - torch.compile safe (mutable global state only touched in compiler-disabled regions)
+
+    IMPORTANT: soft_cap and backend are passed as parameters, NOT looked up from
+    config inside. The caller (WanAttnProcessor2_0) is responsible for resolving
+    the correct values.
+
     Args:
         soft_cap: The softcap value to use (already resolved by caller)
         attn_type: For stats logging only - 'self_attn' or 'cross_attn'
         expert: For stats logging only - 'single', 'high_noise', or 'low_noise'
+        backend: The attention backend to use (already resolved by caller)
     """
-    # Check if softcapping is enabled and flex_attention is available
-    if _attention_config['softcap_enabled']:
+    in_sampling = _attention_config['in_sampling']
+
+    if backend in ('native', 'sdpa_default'):
+        backend = 'auto'
+
+    # Tanh softcapping is configured independently per mode (training and
+    # sampling) and is only possible with flex_attention (score_mod). When
+    # enabled for the current mode it overrides the selected backend.
+    apply_softcap = (_attention_config['softcap_sample_enabled'] if in_sampling
+                     else _attention_config['softcap_enabled'])
+    if backend == 'auto':
+        backend = 'flex' if apply_softcap else 'sdpa'
+    if apply_softcap and backend != 'flex':
+        backend = 'flex'
+
+    if backend == 'flex':
         try:
             # soft_cap is already resolved by caller - use it directly
             # Try to import flex_attention
@@ -698,7 +905,13 @@ def _apply_attention_with_softcap(
 
             # Get cached score_mod function (prevents compilation storms)
             # Pass head_dim so score_mod can apply correct scaling
-            score_mod = _get_score_mod(soft_cap, head_dim)
+            score_mod = _get_score_mod(soft_cap, head_dim) if apply_softcap else None
+            # CRITICAL when softcapping: scale=1.0 disables PyTorch's default
+            # 1/sqrt(d) scaling because score_mod handles scaling internally.
+            # Without this, we get double-scaling: softmax((1/sqrt(d)) *
+            # score_mod(QK^T)), which makes soft_cap=30 effectively become
+            # soft_cap=30/sqrt(d)≈2.65, way too aggressive.
+            flex_scale = 1.0 if apply_softcap else None
 
             # Create/cached BlockMask if we have a mask or causal attention
             block_mask = None
@@ -719,22 +932,10 @@ def _apply_attention_with_softcap(
                         causal_mask_mod, B, H, Q_LEN, KV_LEN, device, "causal"
                     )
 
-            # CRITICAL: Disable logging under torch.compile to avoid compilation storms
-            # Mutable global state (_softcap_stats) would cause Dynamo guards to fail
-            # on every step, forcing recompilation and stalling training.
-            is_compiling = torch.compiler.is_compiling()
-            if is_compiling:
-                # Under torch.compile: no logging, no mutable state updates
-                # But always request LSE - it's needed for backward anyway (free during training)
-                return_aux = AuxRequest(lse=True)
-                needs_logging = False
-            else:
-                # Always request LSE - during training (grad enabled) it's free
-                # (flex_attention computes it for backward regardless of return_aux)
-                # This avoids recompilation from toggling return_aux every N steps
-                return_aux = AuxRequest(lse=True)
-                needs_logging = (_softcap_stats['enabled'] and 
-                               _softcap_stats['current_step'] % _softcap_stats['sample_every_n_steps'] == 0)
+            # Always request LSE - during training (grad enabled) it's free
+            # (flex_attention computes it for backward regardless of return_aux)
+            # and it is used for the attention-sharpness stat.
+            return_aux = AuxRequest(lse=True)
 
             # Kernel options
             # ROWS_GUARANTEED_SAFE: every query has ≥1 valid key (only safe for pure causal)
@@ -750,58 +951,39 @@ def _apply_attention_with_softcap(
                 })
 
             # Run flex_attention
-            # CRITICAL: scale=1.0 disables PyTorch's default 1/sqrt(d) scaling
-            # because score_mod handles scaling internally. Without this, we get
-            # double-scaling: softmax((1/sqrt(d)) * score_mod(QK^T)), which makes
-            # soft_cap=30 effectively become soft_cap=30/sqrt(d)≈2.65, way too aggressive.
             output, aux = flex_attention(
                 query, key, value,
                 score_mod=score_mod,
                 block_mask=block_mask,
-                scale=1.0,  # score_mod handles scaling
+                scale=flex_scale,
                 return_aux=return_aux,
                 kernel_options=kernel_options,
             )
 
-            # Only update stats and log in eager mode (not under torch.compile)
-            if not is_compiling:
-                # Periodic sampling and logging (separate from hot path)
-                if needs_logging:
-                    # Sample some scores to analyze softcapping effect
-                    sample_stats = _sample_attention_scores(query, key, soft_cap)
-
-                    # Get attention sharpness from LSE
-                    # Lower LSE = softer/more diffuse attention (softcapping working)
-                    # Higher LSE = sharper/more peaked attention
-                    avg_lse = float(aux.lse.mean().cpu())
-
-                    # Include attention type, expert, and softcap value used for per-type analysis
-                    sample_stats['avg_lse'] = avg_lse
-                    sample_stats['step'] = _softcap_stats['current_step']
-                    sample_stats['seq_len'] = Q_LEN
-                    sample_stats['attn_type'] = attn_type
-                    sample_stats['expert'] = _softcap_stats['current_expert']
-                    sample_stats['soft_cap_used'] = soft_cap
-
-                    _softcap_stats['sample_stats'].append(sample_stats)
-                    # Trim to prevent unbounded growth (memory leak over long runs)
-                    # Keep more samples now since we need per-type breakdown
-                    if len(_softcap_stats['sample_stats']) > 200:
-                        del _softcap_stats['sample_stats'][:-200]
+            # Periodic stats sampling. Runs in a compiler-disabled region
+            # (graph break under torch.compile), so stats work with compile
+            # enabled; on non-sample steps it is a cheap no-op check.
+            _maybe_collect_softcap_stats(
+                query, key, aux.lse if apply_softcap else None, soft_cap, attn_type, Q_LEN)
 
             return output
 
         except (ImportError, AttributeError) as e:
             # ImportError/AttributeError: flex_attention not available or misconfigured
-            # Permanently disable softcapping to avoid re-importing and re-raising every call
-            set_attention_softcapping(enabled=False)
-            import warnings
-            warnings.warn(
-                f"flex_attention not available ({type(e).__name__}: {e}). "
-                f"Softcapping disabled permanently. Ensure PyTorch >= 2.5.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+            if apply_softcap:
+                # Permanently disable softcapping to avoid re-importing and re-raising every call
+                set_attention_softcapping(enabled=False)
+                import warnings
+                warnings.warn(
+                    f"flex_attention not available ({type(e).__name__}: {e}). "
+                    f"Softcapping disabled permanently. Ensure PyTorch >= 2.5.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            else:
+                _warn_once('flex_unavailable',
+                           f"flex_attention not available ({type(e).__name__}: {e}); "
+                           f"using SDPA instead.")
         except RuntimeError as e:
             # RuntimeError: transient issue (OOM, CUDA error, shape mismatch)
             # Log and fall back for this call, but disable permanently after repeated failures
@@ -814,13 +996,13 @@ def _apply_attention_with_softcap(
                 _apply_attention_with_softcap._last_runtime_error = type(e).__name__
                 warnings.warn(
                     f"flex_attention runtime error ({type(e).__name__}: {str(e)[:200]}). "
-                    f"Falling back to SDPA for this operation. Softcapping will be skipped. "
+                    f"Falling back to SDPA for this operation. "
                     f"(Total fallbacks: {_softcap_stats['fallback_count']})",
                     RuntimeWarning,
                     stacklevel=2,
                 )
-            # Permanently disable after 50 fallbacks to avoid retry overhead
-            if _softcap_stats['fallback_count'] > 50:
+            # Permanently disable softcap after 50 fallbacks to avoid retry overhead
+            if apply_softcap and _softcap_stats['fallback_count'] > 50:
                 set_attention_softcapping(enabled=False)
                 warnings.warn(
                     f"flex_attention disabled permanently after {_softcap_stats['fallback_count']} fallbacks. "
@@ -828,6 +1010,17 @@ def _apply_attention_with_softcap(
                     RuntimeWarning,
                     stacklevel=2,
                 )
+
+    if backend == 'flash':
+        try:
+            return _apply_flash_attention(
+                query, key, value,
+                dropout_p=dropout_p, is_causal=is_causal, attn_mask=attn_mask,
+            )
+        except Exception as e:
+            _warn_once('flash_failed',
+                       f"flash attention backend failed ({type(e).__name__}: {e}); "
+                       f"falling back to SDPA.")
 
     # Standard scaled_dot_product_attention
     return F.scaled_dot_product_attention(
@@ -859,21 +1052,21 @@ class WanAttnProcessor2_0:
         # Cross-attention: encoder_hidden_states is provided separately
         is_self_attn = encoder_hidden_states is None
         attn_type = 'self_attn' if is_self_attn else 'cross_attn'
-        
-        # Determine current expert (for per-expert softcap resolution)
-        # Uses the global stats set by trainer via update_softcap_step()
-        current_expert = _softcap_stats.get('current_expert', 'single')
-        # Normalize expert name for resolve_softcap_value
-        if current_expert == 'high':
-            expert = 'high_noise'
-        elif current_expert == 'low':
-            expert = 'low_noise'
-        else:
-            expert = 'single'
-        
-        # Resolve the effective softcap value based on attn_type and expert
+
+        # Determine current expert (for per-expert softcap resolution).
+        # Done in a compiler-disabled region so the mutable global does not
+        # create Dynamo guards (no recompile on high/low expert switches).
         # Hierarchy: per-type-per-expert → per-type → per-expert → global
-        soft_cap = resolve_softcap_value(attn_type, expert)
+        soft_cap = _resolve_softcap_for_current_expert(attn_type)
+
+        # Resolve the attention backend. Training and sampling can use
+        # different backends (set via set_attention_backend_choice; the
+        # trainer toggles sampling mode around generate_images). Reading
+        # these globals makes Dynamo specialize on them - the resulting
+        # graph variants are cached, so each mode only compiles once.
+        in_sampling = _attention_config['in_sampling']
+        backend = _attention_config['sample_backend'] if in_sampling else _attention_config['train_backend']
+        expert = 'single'  # stats metadata only; actual expert is read in the stats probe
         
         encoder_hidden_states_img = None
         if attn.add_k_proj is not None:
@@ -934,12 +1127,13 @@ class WanAttnProcessor2_0:
                 2, (attn.heads, -1)).transpose(1, 2)
 
             # I2V cross-attention from image encoder - resolve its own softcap value
-            soft_cap_img = resolve_softcap_value('cross_attn', expert)
+            soft_cap_img = _resolve_softcap_for_current_expert('cross_attn')
             hidden_states_img = _apply_attention_with_softcap(
                 query, key_img, value_img, attn_mask=None, dropout_p=0.0, is_causal=False,
                 soft_cap=soft_cap_img,
                 attn_type='cross_attn',
                 expert=expert,
+                backend=backend,
             )
             hidden_states_img = hidden_states_img.transpose(1, 2).flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
@@ -949,6 +1143,7 @@ class WanAttnProcessor2_0:
             soft_cap=soft_cap,
             attn_type=attn_type,
             expert=expert,
+            backend=backend,
         )
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
         hidden_states = hidden_states.type_as(query)

@@ -2227,6 +2227,24 @@ export default function SimpleJob({
                   Velocity: model predicts ε - x₀ (standard for pretrained flow-matching models).
                   x0: model predicts x₀ directly (requires compatible backbone; x0 reconstruction changes).
                 </p>
+                {/* Attention Backend (Training) */}
+                <SelectInput
+                  label="Attention Backend (Training)"
+                  className="pt-2"
+                  value={jobConfig.config.process[0].train.attention_backend ?? 'native'}
+                  onChange={value => setJobConfig(value, 'config.process[0].train.attention_backend')}
+                  options={[
+                    { value: 'native', label: 'Auto (recommended)' },
+                    { value: 'flex', label: 'FlexAttention (torch)' },
+                    { value: 'sdpa', label: 'SDPA (PyTorch scaled dot product)' },
+                    { value: 'flash', label: 'Flash Attention 2 (flash-attn pkg)' },
+                  ]}
+                />
+                <p className="text-xs text-gray-500 -mt-1">
+                  Kernel used for the transformer's attention during training. Auto = FlexAttention when
+                  tanh softcapping is enabled (softcapping requires it and overrides this setting),
+                  otherwise SDPA. Flash Attention 2 requires the <code>flash-attn</code> package.
+                </p>
                 {/* Attention Tanh Softcapping */}
                 <div className="border border-green-900 rounded-lg p-3 mt-2 space-y-2">
                   <div className="flex items-center justify-between">
@@ -3847,6 +3865,43 @@ export default function SimpleJob({
                   onChange={value => setJobConfig(value, 'config.process[0].sample.sampler')}
                   options={schedulerOptions}
                 />
+                <SelectInput
+                  label="Attention Backend (Sampling)"
+                  className="pt-2"
+                  value={jobConfig.config.process[0].sample.attention_backend ?? 'native'}
+                  onChange={value => setJobConfig(value, 'config.process[0].sample.attention_backend')}
+                  options={[
+                    { value: 'native', label: 'Auto (recommended)' },
+                    { value: 'flex', label: 'FlexAttention (torch)' },
+                    { value: 'sdpa', label: 'SDPA (PyTorch scaled dot product)' },
+                    { value: 'flash', label: 'Flash Attention 2 (flash-attn pkg)' },
+                  ]}
+                />
+                <p className="text-xs text-gray-500 -mt-1">
+                  Kernel used while generating samples. Auto = FlexAttention when sampling softcapping
+                  is enabled below, otherwise SDPA.
+                </p>
+                <div className="border border-green-900 rounded-lg p-3 mt-2">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center space-x-2">
+                      <input
+                        type="checkbox"
+                        id="sample_attention_tanh_softcap_enabled"
+                        checked={jobConfig.config.process[0].sample.attention_tanh_softcap_enabled ?? false}
+                        onChange={e => setJobConfig(e.target.checked, 'config.process[0].sample.attention_tanh_softcap_enabled')}
+                        className="rounded border-gray-600"
+                      />
+                      <label htmlFor="sample_attention_tanh_softcap_enabled" className="text-sm text-green-300 font-medium">
+                        Apply Tanh Softcapping During Sampling
+                      </label>
+                    </div>
+                    <span className="text-xs text-gray-500">off = standard inference</span>
+                  </div>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Independent of the training toggle above; uses the same global soft cap value.
+                    Forces the sampling attention backend to FlexAttention.
+                  </p>
+                </div>
                 <NumberInput
                   label="Guidance Scale"
                   value={jobConfig.config.process[0].sample.guidance_scale}

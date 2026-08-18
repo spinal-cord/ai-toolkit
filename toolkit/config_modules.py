@@ -361,6 +361,15 @@ class SampleItem:
 class SampleConfig:
     def __init__(self, **kwargs):
         self.sampler: str = kwargs.get('sampler', 'ddpm')
+        # Attention backend used while generating samples (Wan 2.x toolkit path).
+        # Same values as TrainConfig.attention_backend:
+        # native (default/auto), flex, sdpa, flash.
+        self.attention_backend: str = kwargs.get('attention_backend', 'native')
+        # Whether tanh softcapping is applied during sampling (Wan 2.x toolkit
+        # path). Independent of train.attention_tanh_softcap_enabled; uses the
+        # same soft_cap value/overrides. Off by default to match standard
+        # inference; enabling it forces the sampling backend to flex_attention.
+        self.attention_tanh_softcap_enabled: bool = kwargs.get('attention_tanh_softcap_enabled', False)
         self.sample_every: int = kwargs.get('sample_every', 100)
         self.width: int = kwargs.get('width', 512)
         self.height: int = kwargs.get('height', 512)
@@ -898,6 +907,16 @@ class TrainConfig:
         self.xformers = kwargs.get('xformers', False)
         self.sdp = kwargs.get('sdp', False)
         # see https://huggingface.co/docs/diffusers/main/optimization/attention_backends#available-backends for options
+        # Values used by the Wan 2.x toolkit attention path:
+        #   native (default) = auto: flex_attention when softcapping is enabled, else SDPA
+        #   flex = torch flex_attention (required for tanh softcapping)
+        #   sdpa = PyTorch scaled_dot_product_attention (auto flash/mem-efficient kernels)
+        #   flash = flash-attn v2 package (requires `pip install flash-attn`, fp16/bf16)
+        # NOTE: for Wan 2.x the transformer's custom attention processor honors this
+        # setting directly; for other models it is forwarded to diffusers
+        # set_attention_backend() on the VAE/text encoder where available.
+        # NOTE: when attention_tanh_softcap_enabled is true, training attention
+        # always uses flex_attention regardless of this setting.
         self.attention_backend: str = kwargs.get('attention_backend', 'native')  # native, flash, _flash_3_hub, _flash_3, 
         self.train_unet = kwargs.get('train_unet', True)
         self.train_text_encoder = kwargs.get('train_text_encoder', False)

@@ -634,7 +634,8 @@ class SDTrainer(BaseSDTrainProcess):
         try:
             from toolkit.models.wan21.wan_attn import (
                 set_attention_softcapping, set_attention_f32_rope, configure_softcap_logging,
-                enable_gelu_acceleration, is_gelu_acceleration_enabled, update_softcap_step
+                enable_gelu_acceleration, is_gelu_acceleration_enabled, update_softcap_step,
+                set_attention_backend_choice, get_effective_backend
             )
             from toolkit.util.attention_softcapping import check_flex_attention_support
 
@@ -656,12 +657,18 @@ class SDTrainer(BaseSDTrainProcess):
             soft_cap_cross_high = getattr(self.train_config, 'attention_tanh_softcap_value_cross_attn_high_noise', None)
             soft_cap_cross_low = getattr(self.train_config, 'attention_tanh_softcap_value_cross_attn_low_noise', None)
 
-            if softcap_enabled:
+            # Sampling softcapping is an independent toggle (off by default to
+            # match standard inference). Uses the same soft_cap/overrides.
+            sample_softcap_enabled = getattr(
+                getattr(self, 'sample_config', None), 'attention_tanh_softcap_enabled', False)
+
+            if softcap_enabled or sample_softcap_enabled:
                 support = check_flex_attention_support()
                 if support.get('available', False):
                     set_attention_softcapping(
-                        enabled=True,
+                        enabled=softcap_enabled,
                         soft_cap=soft_cap,
+                        sample_enabled=sample_softcap_enabled,
                         soft_cap_self_attn=soft_cap_self,
                         soft_cap_cross_attn=soft_cap_cross,
                         soft_cap_high_noise=soft_cap_high,
@@ -671,10 +678,13 @@ class SDTrainer(BaseSDTrainProcess):
                         soft_cap_cross_attn_high_noise=soft_cap_cross_high,
                         soft_cap_cross_attn_low_noise=soft_cap_cross_low,
                     )
-                    # Enable logging - log every 10 training steps (not attention ops)
+                    # Enable logging - sample every 10 training steps (not attention ops)
                     configure_softcap_logging(enabled=True, sample_every_n_steps=10)
-                    print_acc(f"Attention tanh softcapping enabled. "
+                    print_acc(f"Attention tanh softcapping -> training: {'ON' if softcap_enabled else 'off'}, "
+                              f"sampling: {'ON' if sample_softcap_enabled else 'off'}. "
                               f"PyTorch {support.get('torch_version')}, flex_attention available.")
+                    print_acc(f"Softcapping requires flex_attention, so it overrides the attention "
+                              f"backend of any mode where it is enabled.")
                     
                     # Print active softcap configuration summary
                     has_overrides = any(v is not None for v in [
@@ -693,20 +703,32 @@ class SDTrainer(BaseSDTrainProcess):
                     else:
                         print_acc(f"  Global soft_cap={soft_cap} for all attention types and experts.")
                     
-                    # Note: stats logging only works when torch.compile is NOT used
-                    # (mutable global state in compiled functions causes recompilation storms)
-                    print_acc(f"Softcapping stats logging enabled - will log per-type per-expert statistics every 10 steps.")
-                    print_acc(f"Note: stats logging requires torch.compile disabled. Check job config 'compile' setting.")
+                    print_acc(f"Softcapping stats logging enabled - will log per-type per-expert statistics every 10 steps. "
+                              f"(Works with torch.compile enabled; sampled via a graph break.)")
                 else:
                     print_acc("Attention tanh softcapping requested but flex_attention not available. "
                               f"Using standard attention. (Requires PyTorch 2.5+) "
                               f"Support check: {support}")
-                    set_attention_softcapping(enabled=False)
+                    set_attention_softcapping(enabled=False, sample_enabled=False)
                     configure_softcap_logging(enabled=False)
             else:
-                set_attention_softcapping(enabled=False)
+                set_attention_softcapping(enabled=False, sample_enabled=False)
                 configure_softcap_logging(enabled=False)
                 print_acc("Attention tanh softcapping disabled.")
+
+            # Attention backend selection (separate for training and sampling)
+            # train.attention_backend / sample.attention_backend:
+            #   native (default) | flex | sdpa | flash
+            train_backend = getattr(self.train_config, 'attention_backend', 'native')
+            sample_backend = getattr(getattr(self, 'sample_config', None), 'attention_backend', 'native')
+            try:
+                set_attention_backend_choice(train_backend=train_backend, sample_backend=sample_backend)
+            except ValueError as e:
+                print_acc(f"Warning: {e} Using 'auto' for both.")
+                set_attention_backend_choice(train_backend='auto', sample_backend='auto')
+            print_acc(f"Attention backend -> training: {get_effective_backend(in_sampling=False)} "
+                      f"(configured: '{train_backend}'), sampling: {get_effective_backend(in_sampling=True)} "
+                      f"(configured: '{sample_backend}').")
 
             # F32 RoPE acceleration config
             f32_rope_enabled = getattr(self.train_config, 'attention_f32_rope_enabled', True)
@@ -746,6 +768,9 @@ class SDTrainer(BaseSDTrainProcess):
 
             print_acc(f"\n{'='*70}")
             print_acc(f"Attention Softcapping Stats (step {step}, expert: {expert})")
+            if stats.get('fallback_count'):
+                print_acc(f"WARNING: flex_attention fell back to SDPA {stats['fallback_count']} time(s) "
+                          f"- softcapping was skipped on those calls.")
             print_acc(f"{'='*70}")
 
             # Log per attention type

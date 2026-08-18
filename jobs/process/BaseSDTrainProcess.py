@@ -364,15 +364,31 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # let adapter know we are sampling
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
-        
-        # send to be generated
-        self.sd.generate_images(
-            gen_img_config_list,
-            sampler=sample_config.sampler,
-            sampling_flow_shift=sample_config.sampling_flow_shift,
-        )
 
-        
+        # Use the sampling attention backend (Wan 2.x toolkit path only;
+        # no-op for other models). Sampling never applies tanh softcapping.
+        wan_attn_module = None
+        try:
+            from toolkit.models.wan21 import wan_attn as wan_attn_module
+            wan_attn_module.set_sampling_mode(True)
+        except Exception:
+            wan_attn_module = None
+
+        try:
+            # send to be generated
+            self.sd.generate_images(
+                gen_img_config_list,
+                sampler=sample_config.sampler,
+                sampling_flow_shift=sample_config.sampling_flow_shift,
+            )
+        finally:
+            if wan_attn_module is not None:
+                try:
+                    wan_attn_module.set_sampling_mode(False)
+                except Exception:
+                    pass
+
+
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = False
 
@@ -1754,17 +1770,28 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         te.enable_xformers_memory_efficient_attention()
         
         if self.train_config.attention_backend != 'native':
-            if hasattr(vae, 'set_attention_backend'):
-                vae.set_attention_backend(self.train_config.attention_backend)
-            if hasattr(unet, 'set_attention_backend'):
-                unet.set_attention_backend(self.train_config.attention_backend)
-            if isinstance(text_encoder, list):
-                for te in text_encoder:
-                    if hasattr(te, 'set_attention_backend'):
-                        te.set_attention_backend(self.train_config.attention_backend)
-            else:
-                if hasattr(text_encoder, 'set_attention_backend'):
-                    text_encoder.set_attention_backend(self.train_config.attention_backend)
+            # Forward the backend to diffusers models that support it (VAE/text encoder).
+            # NOTE: for Wan 2.x the transformer uses the toolkit's custom attention
+            # processor, which honors train.attention_backend / sample.attention_backend
+            # directly (see toolkit/models/wan21/wan_attn.py) - diffusers'
+            # set_attention_backend() has no effect on that custom processor.
+            # Wrapped in try/except: e.g. 'flash' raises if flash-attn isn't
+            # installed, which should degrade to a warning, not crash the job.
+            try:
+                if hasattr(vae, 'set_attention_backend'):
+                    vae.set_attention_backend(self.train_config.attention_backend)
+                if hasattr(unet, 'set_attention_backend'):
+                    unet.set_attention_backend(self.train_config.attention_backend)
+                if isinstance(text_encoder, list):
+                    for te in text_encoder:
+                        if hasattr(te, 'set_attention_backend'):
+                            te.set_attention_backend(self.train_config.attention_backend)
+                else:
+                    if hasattr(text_encoder, 'set_attention_backend'):
+                        text_encoder.set_attention_backend(self.train_config.attention_backend)
+            except Exception as e:
+                print(f"Warning: failed to set attention backend "
+                      f"'{self.train_config.attention_backend}': {e}")
         if self.train_config.sdp:
             torch.backends.cuda.enable_math_sdp(True)
             torch.backends.cuda.enable_flash_sdp(True)
