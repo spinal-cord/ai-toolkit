@@ -558,6 +558,81 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'train.force_same_timestep_per_batch': {
+    title: 'Force Same Timestep Per Batch',
+    description: (
+      <>
+        <strong>Overview</strong>
+        <br />
+        By default, every item in a batch is trained at its own randomly drawn timestep. Enabling this
+        makes all items in a batch share a single randomly drawn timestep.
+        <br />
+        <br />
+        <strong>Why TREAD needs it</strong>
+        <br />
+        TREAD's per-timestep range overrides resolve the active routing settings from the batch's
+        <strong> global timestep</strong> once per forward pass. If batch items had different timesteps, a single
+        resolution could not cover them all, so when TREAD routing is active this setting is
+        <strong> automatically enabled</strong> (and forced on even if explicitly unchecked).
+        <br />
+        <br />
+        <strong>Effect on training</strong>
+        <br />
+        The objective stays unbiased (the same expectation is averaged over steps instead of within a batch),
+        so it converges to the same place; per-step gradient noise is marginally higher for batch sizes above 1.
+        For batch size 1 (the common Wan 2.2 14B video setup) it changes nothing.
+      </>
+    ),
+  },
+  'model.tread.timestep_overrides': {
+    title: 'TREAD Per-Timestep Range Overrides',
+    description: (
+      <>
+        <strong>Overview</strong>
+        <br />
+        Per-timestep range overrides let TREAD use different routing settings at different points of the
+        denoising process. Each range specifies a window of <strong>global timesteps (0-1000)</strong> - the
+        high-noise expert only ever sees ~900-1000 and the low-noise expert 0-900 - and any TREAD routing
+        fields that should apply inside that window.
+        <br />
+        <br />
+        <strong>Opt-in behavior (important)</strong>
+        <br />
+        When you add <strong>at least one</strong> range, TREAD routing is <strong>only used inside the matched
+        ranges</strong>. Timesteps that are not covered by any range run <strong>without TREAD routing</strong>.
+        For example, a single range <code>1000-875</code> (inheriting all other settings) means TREAD is active
+        for timesteps 876-1000 and <strong>not used at all for 875-0</strong>. When no ranges are defined, the
+        settings above apply at every timestep.
+        <br />
+        <br />
+        <strong>How ranges match</strong>
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li>A range <code>start-end</code> matches when the batch timestep is in <code>[start, end)</code> (inclusive of start, exclusive of end)</li>
+          <li>Descending ranges (e.g. <code>1000-875</code>) match from start down to end+1; ascending ranges (e.g. <code>0-500</code>) also work</li>
+          <li>First matching range wins (order matters if ranges overlap)</li>
+          <li>Fields left empty inherit the settings of the scope (global or the expert's own)</li>
+          <li>The <code>Enabled</code> field can turn routing on or off within a range, overriding the inherited value</li>
+        </ul>
+        <br />
+        <strong>Scopes</strong>
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li><strong>Global</strong> ranges apply to both experts unless an expert defines its own list</li>
+          <li>An expert's own list <strong>replaces</strong> the global one for that expert (it still inherits the expert's base settings for empty fields)</li>
+          <li>Because ranges use global timesteps, e.g. <code>1000-950</code> can only ever match on the high-noise expert</li>
+        </ul>
+        <br />
+        <strong>Notes</strong>
+        <br />
+        <ul className="list-disc list-inside ml-4 space-y-1">
+          <li>The fp32 front/tail layers are a static precision setting and are applied regardless of the ranges</li>
+          <li>TREAD resolves its settings once per batch from the batch's global timestep, so when routing is active all batch items share one timestep (Force Same Timestep Per Batch is enabled automatically)</li>
+          <li>Routing is training-only; sampling always uses the stock forward</li>
+        </ul>
+      </>
+    ),
+  },
   'train.spectral_flow_max_timestep': {
     title: 'Flow Max Timestep',
     description: (

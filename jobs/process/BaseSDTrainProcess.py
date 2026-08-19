@@ -866,6 +866,38 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # and handle switch_boundary_every logic (e.g., SDTrainer).
         return 0.0
     
+    def _should_force_same_timestep(self):
+        """Whether all batch items must share a single timestep (resolved once per job).
+
+        Explicit ``train.force_same_timestep_per_batch`` wins when set to true. When unset
+        (None) it is auto-enabled if TREAD token routing is active, because TREAD resolves
+        its per-timestep settings from the batch's (single) global timestep. TREAD routing
+        forces it on even when explicitly set to false, since per-item timesteps would make
+        the per-batch TREAD resolution ambiguous.
+        """
+        if not hasattr(self, '_force_same_timestep_resolved'):
+            self._force_same_timestep_resolved = self._compute_force_same_timestep()
+        return self._force_same_timestep_resolved
+
+    def _compute_force_same_timestep(self):
+        explicit = getattr(self.train_config, 'force_same_timestep_per_batch', None)
+        try:
+            from toolkit.models.wan21.wan_tread import tread_routing_may_be_active
+            tread_active = tread_routing_may_be_active(
+                getattr(self.model_config, 'model_kwargs', None)
+            )
+        except Exception:
+            tread_active = False
+        if tread_active:
+            if explicit is False:
+                self.print(
+                    "TREAD routing is enabled: forcing 'force_same_timestep_per_batch' on - "
+                    "TREAD resolves its per-timestep settings from the batch's global timestep, "
+                    "so all batch items must share one timestep."
+                )
+            return True
+        return bool(explicit) if explicit is not None else False
+
     def switch_boundary_if_needed(self):
         """Increment current_boundary_index based on switch_boundary_every.
         
@@ -1172,7 +1204,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         # do it ad contrast
                         imgs = reduce_contrast(imgs, self.train_config.img_multiplier)
                 if batch.latents is not None:
-                    latents = batch.latents.to(self.device_torch, dtype=dtype)
+                    # Keep latents at full precision when the model's front-end runs in fp32
+                    # (TREAD fp32_front) so they are not rounded to the training dtype before
+                    # reaching the fp32 patch embedding. (add_noise / loss promote as needed.)
+                    latent_dtype = torch.promote_types(dtype, self.sd.get_cache_dtype())
+                    latents = batch.latents.to(self.device_torch, dtype=latent_dtype)
                     batch.latents = latents
                 else:
                     # normalize to
@@ -1397,6 +1433,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     timestep_indices = timestep_indices.long()
                 else:
                     raise ValueError(f"Unknown content_or_style {content_or_style}")
+
+                # Force one shared timestep for the whole batch (see
+                # ``_should_force_same_timestep``). Required for TREAD per-timestep routing,
+                # optionally usable for any model. Applied on the indices (pre-conversion)
+                # so every downstream consumer (scheduler, loss weighting, overrides) sees
+                # the uniform timesteps; the CFG / short-long-caption doubling below just
+                # replicates the same value.
+                if self._should_force_same_timestep():
+                    timestep_indices = torch.full_like(timestep_indices, int(timestep_indices[0]))
+
             with self.timer('convert_timestep_indices_to_timesteps'):
                 # convert the timestep_indices to a timestep
                 timesteps = self.sd.noise_scheduler.timesteps[timestep_indices.long()]

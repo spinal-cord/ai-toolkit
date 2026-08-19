@@ -616,6 +616,386 @@ const SCHEDULER_DEFAULT_PARAMS: Record<string, Record<string, any>> = {
   constant_with_warmup: { num_warmup_steps: 1000 },
 };
 
+// ============================================================================
+// TREAD Token Routing Section (Wan 2.2 14B dual-expert)
+// ============================================================================
+const TREAD_MODE_OPTIONS: SelectOption[] = [
+  { value: 'random', label: 'Random' },
+  { value: 'contiguous', label: 'Contiguous' },
+  { value: 'stride', label: 'Stride' },
+];
+const TREAD_GRANULARITY_OPTIONS: SelectOption[] = [
+  { value: 'token', label: 'Token' },
+  { value: 'frame', label: 'Frame' },
+];
+const TREAD_BOOL_ON_OFF: SelectOption[] = [
+  { value: 'true', label: 'On' },
+  { value: 'false', label: 'Off' },
+];
+const TREAD_INHERIT: SelectOption = { value: '', label: 'Inherit (global)' };
+
+// Renders the TREAD parameters for one scope (global or a single expert).
+// - isExpert: every field falls back to the global value when left empty.
+// - showRouting: whether to show the token-routing fields (only meaningful when enabled).
+function TreadParamsBlock({
+  path,
+  obj,
+  isExpert,
+  showRouting,
+  setJobConfig,
+}: {
+  path: string;
+  obj: Record<string, any>;
+  isExpert: boolean;
+  showRouting: boolean;
+  setJobConfig: (value: any, key: string) => void;
+}) {
+  const set = (key: string, value: any) => setJobConfig(value, `${path}.${key}`);
+  const modeOptions = isExpert ? [TREAD_INHERIT, ...TREAD_MODE_OPTIONS] : TREAD_MODE_OPTIONS;
+  const granOptions = isExpert ? [TREAD_INHERIT, ...TREAD_GRANULARITY_OPTIONS] : TREAD_GRANULARITY_OPTIONS;
+  const boolOptions = isExpert ? [TREAD_INHERIT, ...TREAD_BOOL_ON_OFF] : TREAD_BOOL_ON_OFF;
+
+  return (
+    <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+      {showRouting && (
+        <>
+          <NumberInput
+            label="Start Layer"
+            value={obj.start_layer ?? null}
+            onChange={v => set('start_layer', v)}
+            placeholder={isExpert ? 'inherit' : '2'}
+            min={0}
+          />
+          <NumberInput
+            label="End Layer"
+            value={obj.end_layer ?? null}
+            onChange={v => set('end_layer', v)}
+            placeholder={isExpert ? 'inherit' : 'auto (n-4)'}
+            min={0}
+          />
+          <NumberInput
+            label="Keep Ratio"
+            value={obj.keep_ratio ?? null}
+            onChange={v => set('keep_ratio', v)}
+            placeholder={isExpert ? 'inherit' : '0.5'}
+            min={0}
+            max={1}
+          />
+          <SelectInput
+            label="Selection Mode"
+            value={obj.mode ?? (isExpert ? '' : 'random')}
+            onChange={v => set('mode', v === '' ? undefined : v)}
+            options={modeOptions}
+          />
+          <SelectInput
+            label="Granularity"
+            value={obj.granularity ?? (isExpert ? '' : 'token')}
+            onChange={v => set('granularity', v === '' ? undefined : v)}
+            options={granOptions}
+          />
+        </>
+      )}
+      {isExpert ? (
+        <SelectInput
+          label="fp32 Front"
+          value={obj.fp32_front === undefined ? '' : `${obj.fp32_front}`}
+          onChange={v => set('fp32_front', v === '' ? undefined : v === 'true')}
+          options={boolOptions}
+        />
+      ) : (
+        <Checkbox
+          label="fp32 Front"
+          checked={obj.fp32_front === true}
+          onChange={v => set('fp32_front', v)}
+        />
+      )}
+      <NumberInput
+        label="fp32 Last Layers"
+        value={obj.fp32_last_layers ?? null}
+        onChange={v => set('fp32_last_layers', v)}
+        placeholder={isExpert ? 'inherit' : '0'}
+        min={0}
+      />
+      <TextInput
+        label="fp32 Layers"
+        value={obj.fp32_layers ?? ''}
+        onChange={v => set('fp32_layers', v?.trim() === '' ? undefined : v.trim())}
+        placeholder={isExpert ? 'inherit' : 'e.g. 0,17,38'}
+      />
+    </div>
+  );
+}
+
+// TREAD per-timestep range overrides for one scope (global or a single expert).
+// Ranges use GLOBAL timesteps (high-noise expert: 900-1000, low-noise: 0-900). Each entry
+// overrides any TREAD routing field for the batch timestep range it matches (first match
+// wins); fields left empty inherit the settings of the scope. Stored under
+// <scope>.timestep_overrides (e.g. model_kwargs.tread.timestep_overrides).
+function TreadTimestepRanges({
+  path,
+  obj,
+  setJobConfig,
+}: {
+  path: string;
+  obj: Record<string, any>;
+  setJobConfig: (value: any, key: string) => void;
+}) {
+  const overrides: Record<string, any>[] = obj.timestep_overrides || [];
+  const setList = (list: Record<string, any>[]) => setJobConfig(list, `${path}.timestep_overrides`);
+  const addOverride = () => {
+    setList([
+      ...overrides,
+      {
+        start_timestep: 900,
+        end_timestep: 0,
+        enabled: null,
+        start_layer: null,
+        end_layer: null,
+        keep_ratio: null,
+        mode: null,
+        granularity: null,
+      },
+    ]);
+  };
+  const removeOverride = (index: number) => setList(overrides.filter((_o, i) => i !== index));
+  const updateOverride = (index: number, field: string, value: any) =>
+    setList(overrides.map((o, i) => (i === index ? { ...o, [field]: value } : o)));
+
+  const enabledOptions: SelectOption[] = [
+    { value: '', label: 'Inherit' },
+    { value: 'true', label: 'On' },
+    { value: 'false', label: 'Off' },
+  ];
+  const modeOptions: SelectOption[] = [{ value: '', label: 'Inherit' }, ...TREAD_MODE_OPTIONS];
+  const granOptions: SelectOption[] = [{ value: '', label: 'Inherit' }, ...TREAD_GRANULARITY_OPTIONS];
+
+  return (
+    <div className="space-y-3">
+      {overrides.length === 0 && (
+        <p className="text-xs text-gray-500 italic">No timestep range overrides. The settings above apply for all timesteps.</p>
+      )}
+      {overrides.length > 0 && (
+        <p className="text-xs text-purple-300/80">
+          Opt-in: TREAD routing is only used inside the ranges below. Timesteps not covered by any range run
+          without TREAD (fp32 layers are still applied - they are a static precision setting).
+        </p>
+      )}
+      {overrides.map((override, index) => (
+        <div key={index} className="border border-purple-800 rounded-lg p-3 space-y-2">
+          <div className="flex items-center justify-between">
+            <p className="text-xs text-purple-400 font-medium">Range #{index + 1}</p>
+            <button
+              type="button"
+              onClick={() => removeOverride(index)}
+              className="text-xs text-red-400 hover:text-red-300"
+            >
+              Remove
+            </button>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <NumberInput
+              label="Start Timestep (global)"
+              className="pt-1"
+              value={override.start_timestep ?? null}
+              onChange={value => updateOverride(index, 'start_timestep', value)}
+              placeholder="1000"
+              min={0}
+              max={1000}
+              step={50}
+            />
+            <NumberInput
+              label="End Timestep (global)"
+              className="pt-1"
+              value={override.end_timestep ?? null}
+              onChange={value => updateOverride(index, 'end_timestep', value)}
+              placeholder="0"
+              min={0}
+              max={1000}
+              step={50}
+            />
+          </div>
+          <p className="text-xs text-gray-500">
+            Global timesteps (high-noise expert: 900-1000, low-noise: 0-900). Applies when the batch timestep is
+            between Start and End (inclusive of Start, exclusive of End). First matching range wins. Fields left
+            empty inherit the settings above. Timesteps outside every range do not use TREAD routing.
+          </p>
+          <div className="grid grid-cols-2 gap-2">
+            <SelectInput
+              label="Enabled"
+              value={override.enabled === undefined || override.enabled === null ? '' : `${override.enabled}`}
+              onChange={v => updateOverride(index, 'enabled', v === '' ? null : v === 'true')}
+              options={enabledOptions}
+            />
+            <NumberInput
+              label="Start Layer"
+              className="pt-1"
+              value={override.start_layer ?? null}
+              onChange={v => updateOverride(index, 'start_layer', v)}
+              placeholder="inherit"
+              min={0}
+            />
+            <NumberInput
+              label="End Layer"
+              className="pt-1"
+              value={override.end_layer ?? null}
+              onChange={v => updateOverride(index, 'end_layer', v)}
+              placeholder="inherit"
+              min={0}
+            />
+            <NumberInput
+              label="Keep Ratio"
+              className="pt-1"
+              value={override.keep_ratio ?? null}
+              onChange={v => updateOverride(index, 'keep_ratio', v)}
+              placeholder="inherit"
+              min={0}
+              max={1}
+            />
+            <SelectInput
+              label="Selection Mode"
+              value={override.mode ?? ''}
+              onChange={v => updateOverride(index, 'mode', v === '' ? null : v)}
+              options={modeOptions}
+            />
+            <SelectInput
+              label="Granularity"
+              value={override.granularity ?? ''}
+              onChange={v => updateOverride(index, 'granularity', v === '' ? null : v)}
+              options={granOptions}
+            />
+          </div>
+        </div>
+      ))}
+      {/* Full-width, placed under all other fields of this scope so it expands left to
+          right and wraps to its own line. */}
+      <button
+        type="button"
+        onClick={addOverride}
+        className="w-full text-xs text-purple-400 hover:text-purple-300 border border-purple-800 rounded-lg px-3 py-2 hover:bg-purple-900/20 transition-colors"
+      >
+        + Add Timestep Range Override
+      </button>
+    </div>
+  );
+}
+
+// Question-mark help button for the TREAD per-timestep range override headers.
+function TreadRangesHelp() {
+  return (
+    <div
+      className="inline-block text-xs text-purple-400 cursor-pointer hover:text-purple-300 transition-colors"
+      onClick={() => {
+        const doc = getDoc('model.tread.timestep_overrides');
+        if (doc) openDoc(doc);
+      }}
+      title="How per-timestep ranges work"
+    >
+      <CircleHelp className="inline-block w-4 h-4" />
+    </div>
+  );
+}
+
+function TreadSection({
+  jobConfig,
+  setJobConfig,
+}: {
+  jobConfig: JobConfig;
+  setJobConfig: (value: any, key: string) => void;
+}) {
+  const mk = jobConfig.config.process[0].model.model_kwargs || {};
+  const g = mk.tread || {};
+  const high = mk.tread_high || {};
+  const low = mk.tread_low || {};
+  const enabled = g.enabled === true;
+  const basePath = 'config.process[0].model.model_kwargs';
+
+  return (
+    <Card title="TREAD Token Routing" collapsible>
+      <div className="space-y-4">
+        <div className="flex flex-col gap-1">
+          <Checkbox
+            label="Enable TREAD Token Routing"
+            checked={enabled}
+            onChange={v => setJobConfig(v, `${basePath}.tread.enabled`)}
+          />
+          <p className="text-xs text-gray-500">
+            Training-only token routing (arXiv:2501.04765): a fraction of tokens bypasses a window of
+            transformer layers to speed up training. The fp32 options keep selected layers (and their
+            latents / text embeddings) in full precision; their attention runs via SDPA (memory-efficient
+            for fp32). Global values apply to both experts; per-expert overrides fall back to the global
+            value when left empty.
+          </p>
+          <p className="text-xs text-gray-500">
+            Norms in blocks kept in fp32 automatically use <code className="text-purple-400">eps = 1e-8</code>
+            (fp32 resolves it exactly; in bf16 an eps below ~1e-5 is rounded to 0). Other blocks are
+            unaffected. Override with <code className="text-purple-400">model.wan_transformer_fp32_eps</code>.
+          </p>
+        </div>
+
+        <FormGroup label="Global (applies to both experts)">
+          <TreadParamsBlock
+            path={`${basePath}.tread`}
+            obj={g}
+            isExpert={false}
+            showRouting={enabled}
+            setJobConfig={setJobConfig}
+          />
+          <div className="mt-3">
+            <div className="flex items-center gap-1 mb-2">
+              <div className="text-xs font-semibold text-gray-400 uppercase">Per-Timestep Range Overrides (global)</div>
+              <TreadRangesHelp />
+            </div>
+            <TreadTimestepRanges path={`${basePath}.tread`} obj={g} setJobConfig={setJobConfig} />
+          </div>
+        </FormGroup>
+        <FormGroup label="Per-Expert Overrides (empty = inherit global)">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div>
+              <div className="text-xs font-semibold text-gray-400 uppercase mb-2">High-Noise Expert</div>
+              <TreadParamsBlock
+                path={`${basePath}.tread_high`}
+                obj={high}
+                isExpert={true}
+                showRouting={enabled}
+                setJobConfig={setJobConfig}
+              />
+              <div className="mt-3">
+                <div className="flex items-center gap-1 mb-2">
+                  <div className="text-xs font-semibold text-gray-400 uppercase">Per-Timestep Ranges (this expert only)</div>
+                  <TreadRangesHelp />
+                </div>
+                <TreadTimestepRanges path={`${basePath}.tread_high`} obj={high} setJobConfig={setJobConfig} />
+              </div>
+            </div>
+            <div>
+              <div className="text-xs font-semibold text-gray-400 uppercase mb-2">Low-Noise Expert</div>
+              <TreadParamsBlock
+                path={`${basePath}.tread_low`}
+                obj={low}
+                isExpert={true}
+                showRouting={enabled}
+                setJobConfig={setJobConfig}
+              />
+              <div className="mt-3">
+                <div className="flex items-center gap-1 mb-2">
+                  <div className="text-xs font-semibold text-gray-400 uppercase">Per-Timestep Ranges (this expert only)</div>
+                  <TreadRangesHelp />
+                </div>
+                <TreadTimestepRanges path={`${basePath}.tread_low`} obj={low} setJobConfig={setJobConfig} />
+              </div>
+            </div>
+          </div>
+          <p className="text-xs text-gray-500 mt-2">
+            An expert's own ranges replace the global ones for that expert (they still inherit the expert's base
+            settings for empty fields). Ranges use global timesteps, so e.g. 1000-950 can only match on the
+            high-noise expert. Timesteps not covered by any range do not use TREAD routing.
+          </p>
+        </FormGroup>
+      </div>
+    </Card>
+  );
+}
+
 export default function SimpleJob({
   jobConfig,
   setJobConfig,
@@ -1760,6 +2140,11 @@ export default function SimpleJob({
             />
           </Card>
         </div>
+        {modelArch?.additionalSections?.includes('model.tread') && (
+          <div>
+            <TreadSection jobConfig={jobConfig} setJobConfig={setJobConfig} />
+          </div>
+        )}
         <div>
           <Card title="Training">
             <div className={trainingBarClass}>
@@ -2357,6 +2742,8 @@ export default function SimpleJob({
                     Override <code className="text-purple-400">eps</code> for LayerNorm and attention norms in Wan transformer.
                     For <code className="text-purple-400">bf16</code> training, use larger values like <code className="text-purple-400">1e-4</code> or <code className="text-purple-400">1e-5</code> (bf16 has ~2-3 decimal digits precision).
                     Uncheck to use model's default. Only applies to Wan 2.x models.
+                    Blocks kept in fp32 by TREAD automatically use <code className="text-purple-400">eps = 1e-8</code> instead
+                    (override: <code className="text-purple-400">wan_transformer_fp32_eps</code>).
                   </p>
                 </div>
                 {/* Attention F32 RoPE Acceleration */}
@@ -3464,6 +3851,15 @@ export default function SimpleJob({
                     />
                   </>
                 )}
+              </div>
+              <div>
+                <Checkbox
+                  label="Force Same Timestep Per Batch"
+                  docKey={'train.force_same_timestep_per_batch'}
+                  className="pt-1"
+                  checked={jobConfig.config.process[0].train.force_same_timestep_per_batch === true}
+                  onChange={value => setJobConfig(value === true ? true : null, 'config.process[0].train.force_same_timestep_per_batch')}
+                />
               </div>
             </div>
           </Card>

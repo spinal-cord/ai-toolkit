@@ -1169,10 +1169,17 @@ class TrainConfig:
         # project them to remove components that worsen other losses
         self.mse_spectral_flow_gradient_projection_enabled = kwargs.get('mse_spectral_flow_gradient_projection_enabled', False)
         
+        # Force every item in a batch to share a single (randomly drawn) timestep instead of
+        # each item getting its own random one. None (default) = automatic: enabled whenever
+        # TREAD token routing is active (global/per-expert enabled, or a per-timestep TREAD
+        # range that enables routing), because TREAD resolves its per-timestep settings from
+        # the batch's global timestep - and forced on even if explicitly set to false while
+        # TREAD routing is active. Set true manually to share one timestep without TREAD.
+        self.force_same_timestep_per_batch = kwargs.get('force_same_timestep_per_batch', None)
+
         # Per-timestep range loss weight overrides
         # Allows specifying different loss weights for different timestep ranges per model.
-        # Ranges are relative to the model's effective timestep range.
-        # Example: for a low-noise expert with range 0-900, a range of 1000-500 maps to 900-450.
+        # Ranges are in absolute model timesteps (0-1000); no scaling is applied.
         # Multiple ranges can be specified; first matching range wins.
         # Ranges are in absolute model timesteps (0-1000). Each expert dynamically
         # checks if its current timestep falls within a range.
@@ -1405,6 +1412,15 @@ class ModelConfig:
         # Set to None to use the model's default eps from config
         # This is a model architecture setting, not a training hyperparameter
         self.wan_transformer_eps = kwargs.get('wan_transformer_eps', None)
+        
+        # Eps for Wan transformer blocks kept in fp32 (TREAD fp32_front / fp32_last_layers /
+        # fp32_layers). Applied automatically per block compute dtype: fp32 blocks get this
+        # value (default 1e-8, which fp32 resolves exactly), all other blocks get
+        # wan_transformer_eps. The global wan_transformer_eps does NOT leak into fp32
+        # blocks, so a bf16-oriented global (e.g. 1e-4) keeps fp32 blocks at 1e-8 unless
+        # you set this explicitly. This is a model architecture setting, not a training
+        # hyperparameter
+        self.wan_transformer_fp32_eps = kwargs.get('wan_transformer_fp32_eps', None)
         
         # path to an accuracy recovery adapter, either local or remote
         self.accuracy_recovery_adapter = kwargs.get("accuracy_recovery_adapter", None)

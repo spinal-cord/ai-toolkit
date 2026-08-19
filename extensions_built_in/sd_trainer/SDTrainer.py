@@ -2981,6 +2981,11 @@ class SDTrainer(BaseSDTrainProcess):
             if isinstance(self.adapter, CustomAdapter):
                 batch = self.adapter.edit_batch_processed(batch)
             dtype = get_torch_dtype(self.train_config.dtype)
+            # When the model's front-end runs in fp32 (TREAD fp32_front), keep the text
+            # embeddings at full precision so they are not rounded to the training dtype
+            # before reaching the fp32 condition embedder. (Latents are handled the same way
+            # in ``process_general_training_batch``.)
+            embed_dtype = torch.promote_types(dtype, self.sd.get_cache_dtype())
             # sanity check
             if self.sd.vae.dtype != self.sd.vae_torch_dtype:
                 self.sd.vae = self.sd.vae.to(self.sd.vae_torch_dtype)
@@ -3267,9 +3272,9 @@ class SDTrainer(BaseSDTrainProcess):
                     if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
                         with torch.set_grad_enabled(False):
                             if batch.prompt_embeds is not None:
-                                # use the cached embeds
+                                # use the cached embeds (full precision when fp32_front)
                                 conditional_embeds = batch.prompt_embeds.clone().detach().to(
-                                    self.device_torch, dtype=dtype
+                                    self.device_torch, dtype=embed_dtype
                                 )
                                 # Apply caption dropout to cached embeddings.
                                 # When text embeddings are cached, the text encoder
@@ -3294,18 +3299,18 @@ class SDTrainer(BaseSDTrainProcess):
                                     )
                             else:
                                 embeds_to_use = self.cached_blank_embeds.clone().detach().to(
-                                    self.device_torch, dtype=dtype
+                                    self.device_torch, dtype=embed_dtype
                                 )
                                 if self.cached_trigger_embeds is not None and not is_reg:
                                     embeds_to_use = self.cached_trigger_embeds.clone().detach().to(
-                                        self.device_torch, dtype=dtype
+                                        self.device_torch, dtype=embed_dtype
                                     )
                                 conditional_embeds = concat_prompt_embeds(
                                     [embeds_to_use] * noisy_latents.shape[0]
                                 )
                             if self.train_config.do_cfg:
                                 unconditional_embeds = self.cached_blank_embeds.clone().detach().to(
-                                    self.device_torch, dtype=dtype
+                                    self.device_torch, dtype=embed_dtype
                                 )
                                 unconditional_embeds = concat_prompt_embeds(
                                     [unconditional_embeds] * noisy_latents.shape[0]

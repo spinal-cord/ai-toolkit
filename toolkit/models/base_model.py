@@ -1070,6 +1070,15 @@ class BaseModel:
             return latents, first_prediction
         return latents
 
+    def get_cache_dtype(self):
+        """Dtype to store cached latents / text embeddings in.
+
+        Defaults to the training dtype. Models that run their front-end in fp32 (e.g. TREAD
+        ``fp32_front``) override this to fp32 so the cached tensors keep full precision and
+        are not silently rounded to bf16 before reaching the fp32 layers.
+        """
+        return self.torch_dtype
+
     def encode_prompt(
             self,
             prompt,

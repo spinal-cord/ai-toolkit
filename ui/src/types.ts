@@ -198,6 +198,8 @@ export interface TimestepRangeOverride {
 export interface TrainConfig {
   batch_size: number;
   bypass_guidance_embedding?: boolean;
+  // Force all batch items to share one timestep. Auto-enabled when TREAD routing is on.
+  force_same_timestep_per_batch?: boolean | null;
   steps: number;
   gradient_accumulation: number;
   train_unet: boolean;
@@ -383,6 +385,9 @@ export interface ModelConfig {
   // For bf16 training, use larger eps like 1e-4 or 1e-5
   // Leave empty to use model's default
   wan_transformer_eps?: number | null;
+  // Eps for Wan transformer blocks kept in fp32 (TREAD fp32_front / fp32_last_layers /
+  // fp32_layers). Defaults to 1e-8 automatically; other blocks use wan_transformer_eps.
+  wan_transformer_fp32_eps?: number | null;
 }
 
 export interface SampleItem {

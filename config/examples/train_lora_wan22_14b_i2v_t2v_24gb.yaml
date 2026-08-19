@@ -9,6 +9,60 @@ processes:
       low_vram: true
       quantize: true
       quantize_te: true
+      # Optional TREAD (token routing) training acceleration (arXiv:2501.04765).
+      # Routing is training-only (sampling always uses the stock forward). Any fp32 layers
+      # run their attention via SDPA (scaled_dot_product_attention), which auto-selects the
+      # memory-efficient kernel for fp32 (flash can't do fp32) and is torch.compile-safe. bf16/fp32
+      # weights only (not quantized).
+      #
+      # Global settings (applied to both experts; per-expert blocks override these):
+      # model_kwargs:
+      #   tread:
+      #     enabled: true
+      #     start_layer: 2        # route start (paper: early, ~2)
+      #     end_layer: 36         # route end (default: num_layers - 4)
+      #     keep_ratio: 0.5       # fraction of tokens/frames kept/processed in the window
+      #     mode: random          # random (paper-faithful) | contiguous | stride
+      #     granularity: token    # token (individual) | frame (route whole video frames)
+      #     fp32_front: false     # keep patch_embed + condition_embed + block 0 in fp32
+      #     fp32_last_layers: 2   # run the last N blocks (+ output head) in fp32 (0 = off)
+      #     fp32_layers: []       # optional explicit block indices to run in fp32
+      #
+      # Per-timestep routing overrides (GLOBAL timesteps: high expert ~900-1000, low 0-900).
+      # OPT-IN: when at least one range is defined, TREAD routing is only used INSIDE the
+      # matched ranges - timesteps not covered by any range run without TREAD (e.g. a
+      # single range 1000-875 means TREAD is not used at all for 875-0). With no ranges
+      # defined, the settings above apply at every timestep. Each entry matches when the
+      # batch timestep is in [start, end) (or (end, start] when descending); first match
+      # wins; fields left out inherit the settings above. A range can also turn routing
+      # on/off within its range. Defining timestep_overrides under tread_high / tread_low
+      # replaces the global list for that expert.
+      #     timestep_overrides:
+      #       - start_timestep: 1000   # matches timesteps 951-1000 (high expert only)
+      #         end_timestep: 950
+      #         keep_ratio: 0.3        # route more tokens early on
+      #       - start_timestep: 950
+      #         end_timestep: 900
+      #         keep_ratio: 0.7        # (875-0 would run without TREAD)
+      #
+      # TREAD resolves its settings from the batch's global timestep, so with routing
+      # enabled ALL batch items share one timestep automatically
+      # (train.force_same_timestep_per_batch is forced on; it can also be set manually).
+      #
+      # Blocks kept in fp32 automatically get eps=1e-8 for their LayerNorm / attention
+      # norms (fp32 resolves it exactly; in bf16 an eps below ~1e-5 rounds to 0 and can
+      # NaN). Other blocks keep wan_transformer_eps. Override the fp32 value with
+      # model.wan_transformer_fp32_eps.
+      #
+      # Per-expert overrides (high-noise = transformer_1, low-noise = transformer_2).
+      # Any parameter left out falls back to the global tread settings above:
+      #   tread_high:
+      #     fp32_front: true      # high expert keeps its front in fp32
+      #   tread_low:
+      #     keep_ratio: 0.7       # low expert uses a different keep ratio
+      #     fp32_last_layers: 3
+      # If EITHER expert sets fp32_front, latents + text embeddings are cached in fp32
+      # (the highest precision across both experts) and each expert handles its own precision.
 
     train:
       batch_size: 1

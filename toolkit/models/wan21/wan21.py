@@ -440,6 +440,20 @@ class Wan21(BaseModel):
     def get_bucket_divisibility(self):
         return 16
 
+    def get_cache_dtype(self):
+        # The cache dtype is the HIGHEST precision across both experts' front layers. If
+        # EITHER expert keeps its front in fp32, latents / text embeddings are cached in fp32
+        # so that expert sees full precision; the other expert (bf16 front) downcasts its
+        # inputs in the forward (see ``tread_forward``), so fp32 latents are handled correctly
+        # for it too. For single-expert models the per-expert parse falls back to the global
+        # ``tread`` settings.
+        from toolkit.models.wan21.wan_tread import parse_tread_config
+        mk = self.model_config.model_kwargs
+        for expert in ("high", "low"):
+            if parse_tread_config(mk, expert=expert).fp32_front:
+                return torch.float32
+        return self.torch_dtype
+
     # static method to get the scheduler
     @staticmethod
     def get_train_scheduler(model_config=None):
@@ -458,25 +472,19 @@ class Wan21(BaseModel):
             torch_dtype=dtype,
         ).to(dtype=dtype)
 
-        # Apply eps override if specified in config
-        wan_eps = getattr(self.model_config, 'wan_transformer_eps', None)
-        if wan_eps is not None:
-            original_eps = transformer.config.eps
-            transformer.config.eps = wan_eps
-            self.print_and_status_update(f"Overriding Wan transformer eps: {original_eps} -> {wan_eps}")
-            # Update eps in all blocks
-            for block in transformer.blocks:
-                # LayerNorm layers
-                block.norm1.eps = wan_eps
-                if hasattr(block.norm2, 'eps'):
-                    block.norm2.eps = wan_eps
-                block.norm3.eps = wan_eps
-                # Attention norms (self-attention)
-                block.attn1.norm_q.eps = wan_eps
-                block.attn1.norm_k.eps = wan_eps
-                # Attention norms (cross-attention)
-                block.attn2.norm_q.eps = wan_eps
-                block.attn2.norm_k.eps = wan_eps
+        # Apply eps override if specified in config (per compute dtype: blocks kept in
+        # fp32 by TREAD automatically get a small eps, default 1e-8; see
+        # wan_tread.apply_wan_transformer_eps for the mixed-precision rationale).
+        from toolkit.models.wan21.wan_tread import apply_wan_transformer_eps, TREAD_FP32_EPS_DEFAULT
+        global_eps = getattr(self.model_config, 'wan_transformer_eps', None)
+        fp32_eps = getattr(self.model_config, 'wan_transformer_fp32_eps', None)
+        original_eps = transformer.config.eps
+        if apply_wan_transformer_eps(transformer, global_eps, fp32_eps):
+            eff_fp32 = fp32_eps if fp32_eps is not None else TREAD_FP32_EPS_DEFAULT
+            eff_global = global_eps if global_eps is not None else f"default ({original_eps})"
+            self.print_and_status_update(
+                f"Overriding Wan transformer eps: {original_eps} -> bf16 blocks: {eff_global}, fp32 blocks: {eff_fp32}"
+            )
 
         if self.model_config.split_model_over_gpus:
             raise ValueError(

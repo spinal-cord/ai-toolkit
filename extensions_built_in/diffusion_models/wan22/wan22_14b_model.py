@@ -26,6 +26,13 @@ from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
 from torchvision.transforms import functional as TF
 
 from toolkit.models.wan21.wan21 import Wan21
+from toolkit.models.wan21.wan_tread import (
+    apply_tread_to_dual,
+    parse_tread_config,
+    selective_cast_model,
+    load_fp32_target_tensors,
+    refill_fp32_target_weights,
+)
 from .wan22_5b_model import (
     scheduler_config,
     sampling_scheduler_config,
@@ -70,7 +77,7 @@ scheduler_configUniPC = {
 }
 
 
-def _process_state_dict_for_fp8(state_dict: Dict[str, torch.Tensor], target_dtype: torch.dtype = torch.bfloat16, debug: bool = True) -> Dict[str, torch.Tensor]:
+def _process_state_dict_for_fp8(state_dict: Dict[str, torch.Tensor], target_dtype: torch.dtype = torch.bfloat16, debug: bool = True, fp32_prefixes: Optional[set] = None) -> Dict[str, torch.Tensor]:
 	"""
 	Process state dict to dequantize FP8 weights and map keys to diffusers format.
 	Handles:
@@ -91,6 +98,12 @@ def _process_state_dict_for_fp8(state_dict: Dict[str, torch.Tensor], target_dtyp
 	"""
 	processed_state_dict = {}
 	all_keys = list(state_dict.keys())
+
+	def _wants_fp32(key):
+		# TREAD front/tail keys stay in fp32 (never downcast to the base dtype).
+		return fp32_prefixes is not None and (
+			key in fp32_prefixes or any(key.startswith(p + ".") for p in fp32_prefixes)
+		)
 # Build set of all scale keys from the state dict
 	scale_keys = set()
 	for key in all_keys:
@@ -295,17 +308,19 @@ def _process_state_dict_for_fp8(state_dict: Dict[str, torch.Tensor], target_dtyp
 				dequantized = dequantized * scale_input
 			if scale_weight is not None:
 				dequantized = dequantized * scale_weight
-# Convert to target dtype
-			if target_dtype and target_dtype != torch.float32:
+# Convert to target dtype (fp32 for TREAD front/tail keys)
+			eff_dtype = torch.float32 if _wants_fp32(target_key) else target_dtype
+			if eff_dtype and eff_dtype != torch.float32:
 				try:
-					dequantized = dequantized.to(dtype=target_dtype)
+					dequantized = dequantized.to(dtype=eff_dtype)
 				except:
 					pass
 			processed_state_dict[target_key] = dequantized
 			continue
 # Regular key (norms, biases, patch_embedding, etc.) - just store (with dtype conversion if needed)
-		if target_dtype and value.dtype != target_dtype:
-			value = value.to(target_dtype)
+		eff_dtype = torch.float32 if _wants_fp32(target_key) else target_dtype
+		if eff_dtype and value.dtype != eff_dtype:
+			value = value.to(eff_dtype)
 		processed_state_dict[target_key] = value
 	print(f"DEBUG: Processed {len(processed_state_dict)} keys to Diffusers bf16 format")
 	return processed_state_dict
@@ -411,6 +426,22 @@ class DualWanTransformer3DModel(torch.nn.Module):
 
             self.transformer.to(hidden_states.device)
 
+        # The latents / text embeddings are cached at the HIGHEST precision across both
+        # experts (see ``get_cache_dtype``). Cast them to the active expert's front dtype so
+        # an fp32-cached input feeds an fp32-front expert at full precision AND a bf16-front
+        # expert (whose stock forward would otherwise choke on an fp32 input) correctly.
+        active = getattr(self, t_name)
+        try:
+            front_dtype = next(active.patch_embedding.parameters()).dtype
+            if hidden_states.dtype != front_dtype:
+                hidden_states = hidden_states.to(front_dtype)
+            if encoder_hidden_states is not None and encoder_hidden_states.dtype != front_dtype:
+                encoder_hidden_states = encoder_hidden_states.to(front_dtype)
+            if encoder_hidden_states_image is not None and encoder_hidden_states_image.dtype != front_dtype:
+                encoder_hidden_states_image = encoder_hidden_states_image.to(front_dtype)
+        except StopIteration:
+            pass
+
         return self.transformer(
             hidden_states=hidden_states,
             timestep=timestep,
@@ -473,6 +504,35 @@ def find_safetensors_files_in_repo(repo_id: str, revision: str = "main") -> Dict
                 safetensor_files['low'] = f
     
     return safetensor_files
+
+
+def _find_wan_transformer_safetensors(transformer_path: str, subfolder: Optional[str], is_hf_path: bool) -> Optional[str]:
+    """Locate the first safetensors file for a standard-structure Wan transformer folder.
+
+    Used to refill the TREAD fp32 front/tail weights at full precision when the model was
+    loaded in the base dtype. Returns ``None`` if it cannot be found (the selective upcast
+    is then still applied, which is lossless for bf16 checkpoints).
+    """
+    try:
+        if is_hf_path:
+            from huggingface_hub import list_repo_files, hf_hub_download
+            files = list_repo_files(transformer_path)
+            prefix = (subfolder or "transformer") + "/"
+            cands = [f for f in files if f.startswith(prefix) and f.endswith(".safetensors")]
+            if not cands:
+                cands = [f for f in files if f.endswith(".safetensors")]
+            if not cands:
+                return None
+            return hf_hub_download(repo_id=transformer_path, filename=sorted(cands)[0])
+        else:
+            base = transformer_path if subfolder is None else os.path.join(transformer_path, subfolder)
+            if os.path.isdir(base):
+                sf = sorted(f for f in os.listdir(base) if f.endswith(".safetensors"))
+                if sf:
+                    return os.path.join(base, sf[0])
+    except Exception as e:
+        print(f"Could not locate transformer safetensors for fp32 refill: {e}")
+    return None
 
 
 def find_safetensors_files_local(base_path: str) -> Dict[str, str]:
@@ -574,22 +634,37 @@ def download_safetensors_file(repo_id: str, filename: str,
 
 def load_transformer_from_safetensors(safetensors_path: str, config: Dict, 
                                         dtype: torch.dtype, device: torch.device,
-                                        is_high_noise: bool = True) -> WanTransformer3DModel:
+                                        is_high_noise: bool = True,
+                                        tread_cfg=None) -> WanTransformer3DModel:
     """
     Load a WanTransformer3DModel from a safetensors file and config.
     Handles FP8 quantized weights by dequantizing them to the target dtype.
+
+    When ``tread_cfg`` requests fp32 front/tail layers, those modules are loaded in fp32
+    (their checkpoint weights are never downcast to the base dtype), while the rest of the
+    model stays in ``dtype``.
     """
-    # Create model from config
-    model = WanTransformer3DModel(**config)
-    
+    # Create model from config and start it in the base dtype (small) so the fp32 subset
+    # is the *only* fp32 part of the model.
+    model = WanTransformer3DModel(**config).to(dtype)
+
     # Load weights
     state_dict = load_file(safetensors_path)
 
     # Debug: Print the actual dtype being used
     print(f"Target dtype: {dtype}")
 
+    # TREAD fp32 front/tail/layers: keep those keys in fp32 and upcast the matching modules
+    # before load_state_dict so the copy is lossless (no blanket downcast afterwards).
+    num_layers = config.get("num_layers", len(model.blocks))
+    fp32_prefixes = None
+    if tread_cfg is not None and tread_cfg.has_fp32:
+        from toolkit.models.wan21.wan_tread import tread_fp32_param_prefixes
+        fp32_prefixes = tread_fp32_param_prefixes(tread_cfg, num_layers)
+        selective_cast_model(model, tread_cfg, dtype)
+
     print("Processing state dict")
-    processed_state_dict = _process_state_dict_for_fp8(state_dict, dtype)
+    processed_state_dict = _process_state_dict_for_fp8(state_dict, dtype, fp32_prefixes=fp32_prefixes)
 
     # Load state dict
     missing_keys, unexpected_keys = model.load_state_dict(processed_state_dict, strict=False)
@@ -597,12 +672,12 @@ def load_transformer_from_safetensors(safetensors_path: str, config: Dict,
         print(f"Warning: Missing keys when loading transformer: {missing_keys[:5]}...")
     if unexpected_keys:
         print(f"Warning: Unexpected keys when loading transformer: {unexpected_keys[:5]}...")
-    
-    # Move to device and dtype
-    model = model.to(dtype=dtype)
+
+    # Move to device. Do NOT re-apply ``.to(dtype)`` here: it would downcast the TREAD
+    # fp32 modules back to the base dtype. (Their dtypes are already correct.)
     if device != torch.device('cpu'):
         model = model.to(device)
-    
+
     return model
 
 
@@ -736,30 +811,36 @@ class Wan2214bModel(Wan21):
             time_text_monkeypatch, self.model.transformer_2.condition_embedder
         )
 
+        # Optional TREAD (token routing) training acceleration. Training-only: during
+        # sampling the stock forward is used automatically (grad disabled).
+        apply_tread_to_dual(self.model, self.model_config.model_kwargs)
+
     def get_bucket_divisibility(self):
         # 8x compression  and 2x2 patch size
         return 16
 
     def _apply_wan_transformer_eps(self, transformer, label="transformer"):
-        """Apply wan_transformer_eps override from ModelConfig to a transformer."""
-        wan_eps = getattr(self.model_config, 'wan_transformer_eps', None)
-        if wan_eps is not None:
-            original_eps = transformer.config.eps
-            transformer.config.eps = wan_eps
-            self.print_and_status_update(f"Overriding {label} eps: {original_eps} -> {wan_eps}")
-            # Update eps in all blocks
-            for block in transformer.blocks:
-                # LayerNorm layers
-                block.norm1.eps = wan_eps
-                if hasattr(block.norm2, 'eps'):
-                    block.norm2.eps = wan_eps
-                block.norm3.eps = wan_eps
-                # Attention norms (self-attention)
-                block.attn1.norm_q.eps = wan_eps
-                block.attn1.norm_k.eps = wan_eps
-                # Attention norms (cross-attention)
-                block.attn2.norm_q.eps = wan_eps
-                block.attn2.norm_k.eps = wan_eps
+        """Apply the ``wan_transformer_eps`` override to a transformer, per compute dtype.
+
+        Blocks kept in fp32 by TREAD (``fp32_front`` / ``fp32_last_layers`` /
+        ``fp32_layers``) automatically get a small eps (``wan_transformer_fp32_eps``,
+        default 1e-8) which fp32 resolves exactly; the remaining (bf16) blocks keep
+        ``wan_transformer_eps`` - in bf16 an eps below ~1e-5 is rounded to 0 by the
+        variance addition and can cause NaNs. Must run after the TREAD selective fp32
+        cast (all load paths do this).
+        """
+        from toolkit.models.wan21.wan_tread import apply_wan_transformer_eps, TREAD_FP32_EPS_DEFAULT
+
+        global_eps = getattr(self.model_config, 'wan_transformer_eps', None)
+        fp32_eps = getattr(self.model_config, 'wan_transformer_fp32_eps', None)
+
+        original_eps = transformer.config.eps
+        if apply_wan_transformer_eps(transformer, global_eps, fp32_eps):
+            eff_fp32 = fp32_eps if fp32_eps is not None else TREAD_FP32_EPS_DEFAULT
+            eff_global = global_eps if global_eps is not None else f"default ({original_eps})"
+            self.print_and_status_update(
+                f"Overriding {label} eps: {original_eps} -> bf16 blocks: {eff_global}, fp32 blocks: {eff_fp32}"
+            )
 
     def load_wan_transformer(self, transformer_path, subfolder=None):
         if self.model_config.split_model_over_gpus:
@@ -841,7 +922,14 @@ class Wan2214bModel(Wan21):
         
         # Check if this is a HuggingFace path
         is_hf_path = '/' in transformer_path and not os.path.exists(transformer_path)
-        
+
+        # TREAD fp32 front/tail (if configured) is applied after each load below. Per-expert
+        # configs (transformer_1 = high, transformer_2 = low), each falling back to global.
+        tread_cfg_1 = parse_tread_config(self.model_config.model_kwargs, expert="high")
+        tread_cfg_2 = parse_tread_config(self.model_config.model_kwargs, expert="low")
+        needs_fp32_1 = tread_cfg_1.has_fp32
+        needs_fp32_2 = tread_cfg_2.has_fp32
+
         state_dict = None
         if is_hf_path:
             # For HuggingFace models, we need to download the safetensors file
@@ -880,16 +968,27 @@ class Wan2214bModel(Wan21):
             transformer_path_1,
             subfolder=subfolder_1,
             torch_dtype=dtype,
-        ).to(dtype=dtype)
+        )
+
+        # TREAD fp32 front/tail: upcast those modules to fp32 and refill their weights at
+        # full precision so an fp32 checkpoint is never downcast to bf16 for them.
+        if needs_fp32_1:
+            selective_cast_model(transformer_1, tread_cfg_1, dtype)
+            st_file = _find_wan_transformer_safetensors(transformer_path_1, subfolder_1, is_hf_path)
+            if st_file is not None:
+                n = refill_fp32_target_weights(
+                    transformer_1, load_fp32_target_tensors(st_file, tread_cfg_1, len(transformer_1.blocks))
+                )
+                self.print_and_status_update(f"TREAD fp32 refill: {n} tensors (transformer 1)")
 
         flush()
 
         if self.model_config.low_vram:
             # quantize on the device
-            transformer_1.to('cpu', dtype=dtype)
+            transformer_1.to('cpu')
             flush()
         else:
-            transformer_1.to(self.device_torch, dtype=dtype)
+            transformer_1.to(self.device_torch)
             flush()
 
         # Apply eps override from TrainConfig (if set)
@@ -913,16 +1012,26 @@ class Wan2214bModel(Wan21):
             transformer_path_2,
             subfolder=subfolder_2,
             torch_dtype=dtype,
-        ).to(dtype=dtype)
+        )
+
+        # TREAD fp32 front/tail (transformer 2) - same handling as transformer 1.
+        if needs_fp32_2:
+            selective_cast_model(transformer_2, tread_cfg_2, dtype)
+            st_file = _find_wan_transformer_safetensors(transformer_path_2, subfolder_2, is_hf_path)
+            if st_file is not None:
+                n = refill_fp32_target_weights(
+                    transformer_2, load_fp32_target_tensors(st_file, tread_cfg_2, len(transformer_2.blocks))
+                )
+                self.print_and_status_update(f"TREAD fp32 refill: {n} tensors (transformer 2)")
 
         flush()
 
         if self.model_config.low_vram:
             # quantize on the device
-            transformer_2.to('cpu', dtype=dtype)
+            transformer_2.to('cpu')
             flush()
         else:
-            transformer_2.to(self.device_torch, dtype=dtype)
+            transformer_2.to(self.device_torch)
             flush()
 
         # Apply eps override from TrainConfig (if set)
@@ -949,7 +1058,11 @@ class Wan2214bModel(Wan21):
         """
         dtype = self.torch_dtype
         device = self.device_torch
-        
+        # Per-expert TREAD configs (transformer_1 = high-noise, transformer_2 = low-noise),
+        # each falling back to the global ``tread`` settings for any undefined parameter.
+        tread_cfg_high = parse_tread_config(self.model_config.model_kwargs, expert="high")
+        tread_cfg_low = parse_tread_config(self.model_config.model_kwargs, expert="low")
+
         self.print_and_status_update("Searching for safetensors files in repo")
         
         safetensor_files = {}
@@ -1012,7 +1125,7 @@ class Wan2214bModel(Wan21):
             high_path = safetensor_files['high']
         
         transformer_1 = load_transformer_from_safetensors(
-            high_path, config, dtype, device, is_high_noise=True
+            high_path, config, dtype, device, is_high_noise=True, tread_cfg=tread_cfg_high
         )
         
         # Apply eps override from TrainConfig (if set)
@@ -1036,7 +1149,7 @@ class Wan2214bModel(Wan21):
             low_path = safetensor_files['low']
         
         transformer_2 = load_transformer_from_safetensors(
-            low_path, config, dtype, device, is_high_noise=False
+            low_path, config, dtype, device, is_high_noise=False, tread_cfg=tread_cfg_low
         )
         
         # Apply eps override from TrainConfig (if set)

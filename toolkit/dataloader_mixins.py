@@ -2116,7 +2116,8 @@ class LatentCachingMixin:
                     # not saved to disk, calculate
                     # load the image first
                     file_item.load_and_process_image(self.transform, only_load_latents=True)
-                    dtype = self.sd.torch_dtype
+                    # fp32 when the model's front-end runs in fp32 (TREAD fp32_front)
+                    dtype = self.sd.get_cache_dtype()
                     device = self.sd.device_torch
                     state_dict = OrderedDict()
                     first_frame_latent = None
@@ -2125,7 +2126,7 @@ class LatentCachingMixin:
                     # add batch dimension
                     try:
                         imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
-                        latent = self.sd.encode_images(imgs).squeeze(0)
+                        latent = self.sd.encode_images(imgs, dtype=dtype).squeeze(0)
                         state_dict['latent'] = latent.clone().detach().cpu()
                     except Exception as e:
                         print_acc(f"Error processing image: {file_item.path}")
@@ -2141,7 +2142,7 @@ class LatentCachingMixin:
                             first_frames = frames[:, 0]
                         else:
                             raise ValueError(f"Unknown frame shape {frames.shape}")
-                        first_frame_latent = self.sd.encode_images(first_frames).squeeze(0)
+                        first_frame_latent = self.sd.encode_images(first_frames, dtype=dtype).squeeze(0)
                         state_dict['first_frame_latent'] = first_frame_latent.clone().detach().cpu()
                     
                     # audio (video+audio models only — audio-only models already encoded above via encode_images)
@@ -2361,6 +2362,8 @@ class TextEmbeddingCachingMixin:
             
             did_move = False
             total_cached = 0
+            # fp32 when the model's front-end runs in fp32 (TREAD fp32_front)
+            cache_dtype = self.sd.get_cache_dtype()
 
             # use tqdm to show progress
             i = 0
@@ -2417,8 +2420,9 @@ class TextEmbeddingCachingMixin:
                             prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption_text, control_images=ctrl_img)
                         else:
                             prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption_text)
-                        
-                        # save it
+
+                        # save it (in fp32 when the front-end runs in fp32)
+                        prompt_embeds = prompt_embeds.to(dtype=cache_dtype)
                         prompt_embeds.save(text_embedding_path)
                         del prompt_embeds
                         total_cached += 1
@@ -2461,7 +2465,8 @@ class TextEmbeddingCachingMixin:
                             prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption, control_images=ctrl_img)
                         else:
                             prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption)
-                        # save it
+                        # save it (in fp32 when the front-end runs in fp32)
+                        prompt_embeds = prompt_embeds.to(dtype=cache_dtype)
                         prompt_embeds.save(text_embedding_path)
                         del prompt_embeds
                         total_cached += 1
