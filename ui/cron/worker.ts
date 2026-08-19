@@ -1,4 +1,11 @@
 import processQueue from './actions/processQueue';
+
+// Self-heal the SQLite schema on startup (adds e.g. Job.job_config_encrypted
+// to pre-existing DBs so no manual `prisma db push` is needed; see
+// db/ensureSchema.js). Plain JS so it can be shared with server.js.
+/* eslint-disable @typescript-eslint/no-var-requires */
+const { ensureSchema } = require('../db/ensureSchema');
+
 class CronWorker {
   interval: number;
   is_running: boolean;
@@ -6,6 +13,7 @@ class CronWorker {
   constructor() {
     this.interval = 1000; // Default interval of 1 second
     this.is_running = false;
+    ensureSchema().catch(() => {}); // fire-and-forget; never blocks the worker
     this.intervalId = setInterval(() => {
       this.run();
     }, this.interval);

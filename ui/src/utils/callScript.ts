@@ -64,9 +64,9 @@ export const callScriptStream = async (
   script: string,
   options: StreamCallScriptOptions = {},
 ): Promise<StreamEvent | null> => {
-  const token = typeof window !== 'undefined' ? localStorage.getItem('AI_TOOLKIT_AUTH') : null;
+  // The AITK_SESSION cookie is sent automatically (same-origin fetch); no
+  // Bearer token is needed (see src/utils/api.ts).
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (token) headers['Authorization'] = `Bearer ${token}`;
 
   const controller = new AbortController();
   const onAbort = () => controller.abort();

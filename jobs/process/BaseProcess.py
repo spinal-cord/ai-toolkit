@@ -23,7 +23,11 @@ class BaseProcess(object):
         self.timer: Timer = Timer(f'{self.name} Timer')
         self.performance_log_every = self.get_conf('performance_log_every', 0)
 
-        print(json.dumps(self.config, indent=4))
+        # Log the config, but omit the sample section (it can contain long
+        # prompts) so log.txt stays readable and does not leak prompts.
+        log_config = copy.deepcopy(self.config)
+        log_config.pop('sample', None)
+        print(json.dumps(log_config, indent=4))
         
     def on_error(self, e: Exception):
         pass

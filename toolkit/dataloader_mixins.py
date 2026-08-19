@@ -26,7 +26,6 @@ from toolkit.models.pixtral_vision import PixtralVisionImagePreprocessorCompatib
 from toolkit.prompt_utils import inject_trigger_into_prompt
 from torchvision import transforms
 from PIL import Image, ImageFilter, ImageOps
-from PIL.ImageOps import exif_transpose
 import albumentations as A
 from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
@@ -34,6 +33,7 @@ from toolkit.prompt_utils import PromptEmbeds
 from torchvision.transforms import functional as TF
 
 from toolkit.train_tools import get_torch_dtype
+from toolkit import dataset_crypto
 
 if TYPE_CHECKING:
     from toolkit.data_loader import AiToolkitDataset
@@ -235,9 +235,8 @@ def parse_json_captions(json_path: str) -> List[Dict[str, Any]]:
     - If all prompts lack weights, they get equal chance
     - If only one prompt exists, weight is set to 1.0
     """
-    with open(json_path, 'r', encoding='utf-8') as f:
-        raw_content = f.read()
-        data = json.loads(raw_content)
+    raw_content = dataset_crypto.read_text_file(json_path)
+    data = json.loads(raw_content)
     
     # Handle single object (not in a list)
     if isinstance(data, dict):
@@ -424,17 +423,11 @@ class CaptionMixin:
             else:
                 prompt = ''
         elif os.path.exists(prompt_path):
-            with open(prompt_path, 'r', encoding='utf-8') as f:
-                prompt = f.read()
-                prompt = clean_caption(prompt)
+            prompt = clean_caption(dataset_crypto.read_text_file(prompt_path))
         elif os.path.exists(default_prompt_path_with_ext):
-            with open(default_prompt_path_with_ext, 'r', encoding='utf-8') as f:
-                prompt = f.read()
-                prompt = clean_caption(prompt)
+            prompt = clean_caption(dataset_crypto.read_text_file(default_prompt_path_with_ext))
         elif os.path.exists(default_prompt_path):
-            with open(default_prompt_path, 'r', encoding='utf-8') as f:
-                prompt = f.read()
-                prompt = clean_caption(prompt)
+            prompt = clean_caption(dataset_crypto.read_text_file(default_prompt_path))
         else:
             prompt = ''
             # get default_prompt if it exists on the class instance
@@ -661,17 +654,17 @@ class CaptionProcessingDTOMixin:
                 short_caption = None
 
                 if os.path.exists(prompt_path):
-                    with open(prompt_path, 'r', encoding='utf-8') as f:
-                        prompt = f.read()
-                        short_caption = None
-                        prompt = clean_caption(prompt)
-                        if short_caption is not None:
-                            short_caption = clean_caption(short_caption)
-                        # JSON mode does not apply default_caption fallback;
-                        # this branch only runs for .txt fallback, which does.
-                        
-                        if prompt.strip() == '' and self.dataset_config.default_caption is not None:
-                            prompt = self.dataset_config.default_caption
+                    # decrypted in RAM on the fly if the dataset is encrypted
+                    prompt = dataset_crypto.read_text_file(prompt_path)
+                    short_caption = None
+                    prompt = clean_caption(prompt)
+                    if short_caption is not None:
+                        short_caption = clean_caption(short_caption)
+                    # JSON mode does not apply default_caption fallback;
+                    # this branch only runs for .txt fallback, which does.
+
+                    if prompt.strip() == '' and self.dataset_config.default_caption is not None:
+                        prompt = self.dataset_config.default_caption
                 else:
                     prompt = ''
                     if self.dataset_config.default_caption is not None:
@@ -840,10 +833,11 @@ class AudioProcessingDTOMixin:
         self.audio_data = None
         self.audio_tensor = None
         self.tensor = None
+        _df = dataset_crypto.open_dataset(self.path)
         try:
             import torchaudio
 
-            waveform, sample_rate = torchaudio.load(self.path)  # [channels, samples]
+            waveform, sample_rate = _df.open_audio()  # [channels, samples]
             waveform = waveform_to_stereo(waveform)  # Convert to stereo if not already
             if sample_rate != self.sample_rate:
                 waveform = torchaudio.functional.resample(waveform, sample_rate, self.sample_rate)
@@ -854,6 +848,8 @@ class AudioProcessingDTOMixin:
         except Exception as e:
             # if issue with libtorchcodec "Could not load libtorchcodec"
             raise Exception(f"** WARNING ** - Error Processing audio for {self.path}. Error: {e}")
+        finally:
+            _df.cleanup()
         
 
 class ImageProcessingDTOMixin:
@@ -874,16 +870,17 @@ class ImageProcessingDTOMixin:
         
         do_audio = self.dataset_config.do_audio
         
+        _df = dataset_crypto.open_dataset(self.path)
         try:
-            # Use OpenCV to capture video frames
-            cap = cv2.VideoCapture(self.path)
+            # Use OpenCV (plain) or PyAV (encrypted, in-RAM) to capture video frames
+            cap = _df.open_video()
             
-            if not cap.isOpened():
+            if not cap.is_opened():
                 raise Exception(f"Failed to open video file: {self.path}")
             
             # Get video properties
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            video_fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.total_frames)
+            video_fps = cap.fps
             
             # Calculate the max valid frame index (accounting for zero-indexing)
             max_frame_index = total_frames - 1
@@ -951,41 +948,24 @@ class ImageProcessingDTOMixin:
                 if frame_idx > max_frame_index:
                     frame_idx = max_frame_index
                 
-                # Set frame position
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                
-                # Silently verify position was set correctly (no warnings unless debug mode)
-                if hasattr(self.dataset_config, 'debug') and self.dataset_config.debug:
-                    actual_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                    if actual_pos != frame_idx:
-                        print_acc(f"Warning: Failed to set exact frame position. Requested: {frame_idx}, Actual: {actual_pos}")
-                
-                ret, frame = cap.read()
-                if not ret:
-                    # Try to provide more detailed error information
-                    actual_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                    frame_pos_info = f"Requested frame: {frame_idx}, Actual frame position: {actual_frame}"
-                    
-                    # Try to read the next available frame as a fallback
+                # Read the frame (RGB) - works for both plain (cv2) and encrypted (PyAV) sources
+                frame = cap.read_frame(frame_idx)
+                if frame is None:
+                    # Try to read a nearby frame as a fallback
                     fallback_success = False
                     for fallback_offset in [1, -1, 5, -5, 10, -10]:
                         fallback_pos = max(0, min(frame_idx + fallback_offset, max_frame_index))
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, fallback_pos)
-                        fallback_ret, fallback_frame = cap.read()
-                        if fallback_ret:
+                        fallback_frame = cap.read_frame(fallback_pos)
+                        if fallback_frame is not None:
                             # Only log in debug mode
                             if hasattr(self.dataset_config, 'debug') and self.dataset_config.debug:
                                 print_acc(f"Falling back to nearby frame {fallback_pos} instead of {frame_idx}")
                             frame = fallback_frame
                             fallback_success = True
                             break
-                    else:
-                        # No fallback worked, raise a more detailed exception
+                    if not fallback_success:
                         video_info = f"Video: {self.path}, Total frames: {total_frames}, FPS: {video_fps}"
-                        raise Exception(f"Failed to read frame {frame_idx} from video. {frame_pos_info}. {video_info}")
-                
-                # Convert BGR to RGB
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        raise Exception(f"Failed to read frame {frame_idx} from video. {video_info}")
                 
                 # Convert to PIL Image
                 img = Image.fromarray(frame)
@@ -1051,7 +1031,7 @@ class ImageProcessingDTOMixin:
                     else:
                         target_duration = source_duration
 
-                    waveform, sample_rate = torchaudio.load(self.path)  # [channels, samples]
+                    waveform, sample_rate = _df.open_audio()  # [channels, samples]
                     
                     waveform = waveform_to_stereo(waveform)  # Convert to stereo if not already
                     
@@ -1099,6 +1079,7 @@ class ImageProcessingDTOMixin:
             # Only log success in debug mode
             if hasattr(self.dataset_config, 'debug') and self.dataset_config.debug:
                 print_acc(f"Successfully loaded video with {len(frames)} frames: {self.path}")
+            _df.cleanup()
         
         except Exception as e:
             # Print full traceback
@@ -1109,30 +1090,19 @@ class ImageProcessingDTOMixin:
             try:
                 if 'Failed to read frame' in error_msg and cap is not None:
                     # Try to get more info about the video that failed
-                    cap_status = "Opened" if cap.isOpened() else "Closed"
-                    current_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) if cap.isOpened() else "Unknown"
-                    reported_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else "Unknown"
-                    
+                    cap_status = "Opened" if cap.is_opened() else "Closed"
+                    reported_total = cap.total_frames if cap.is_opened() else "Unknown"
+
                     print_acc(f"Video details when error occurred:")
                     print_acc(f"  Cap status: {cap_status}")
-                    print_acc(f"  Current position: {current_pos}")
                     print_acc(f"  Reported total frames: {reported_total}")
-                    
-                    # Try to verify if the video is corrupted
-                    if cap.isOpened():
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Go to start
-                        start_ret, _ = cap.read()
-                        
-                        # Try to read the last frame to check if it's accessible
-                        if reported_total > 0:
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, reported_total - 1)
-                            end_ret, _ = cap.read()
-                            print_acc(f"  Can read first frame: {start_ret}, Can read last frame: {end_ret}")
-                    
+
                     # Close the cap if it's still open
                     cap.release()
             except Exception as debug_err:
                 print_acc(f"Error during error diagnosis: {debug_err}")
+            finally:
+                _df.cleanup()
             
             print_acc(f"Error: {error_msg}")
             print_acc(f"Error loading video: {self.path}")
@@ -1174,8 +1144,9 @@ class ImageProcessingDTOMixin:
             self.load_and_process_video(transform, only_load_latents)
             return
         try:
-            img = Image.open(self.path)
-            img = exif_transpose(img)
+            _df = dataset_crypto.open_dataset(self.path)
+            img = _df.open_image()  # exif-transposed; decrypted in RAM if encrypted
+            _df.cleanup()
         except Exception as e:
             print_acc(f"Error: {e}")
             print_acc(f"Error loading image: {self.path}")
@@ -1297,11 +1268,11 @@ class InpaintControlFileItemDTOMixin:
     def load_inpaint_image(self: 'FileItemDTO'):
         try:
             # image must have alpha channel for inpaint
-            img = Image.open(self.inpaint_path)
+            # (decrypted in RAM on the fly if the dataset is encrypted)
+            img = dataset_crypto.open_image(self.inpaint_path)
             # make sure has aplha
             if img.mode != 'RGBA':
                 return
-            img = exif_transpose(img)
         
             w, h = img.size
             if w > h and self.scale_to_width < self.scale_to_height:
@@ -1420,8 +1391,8 @@ class ControlFileItemDTOMixin:
         
         for control_path in control_path_list:
             try:
-                img = Image.open(control_path)
-                img = exif_transpose(img)
+                # decrypted in RAM on the fly if the dataset is encrypted
+                img = dataset_crypto.open_image(control_path)
 
                 if img.mode in ("RGBA", "LA"):
                     # Create a background with the specified transparent color
@@ -1637,18 +1608,19 @@ class ClipImageFileItemDTOMixin:
         if self.clip_image_processor is None:
             is_dynamic_size_and_aspect = True # serving it raw
         if self.is_vision_clip_cached:
-            self.clip_image_embeds = load_file(self.get_clip_vision_embeddings_path())
+            self.clip_image_embeds = dataset_crypto.load_safetensors(self.get_clip_vision_embeddings_path())
 
             # get a random unconditional image
             if self.clip_vision_unconditional_paths is not None:
                 unconditional_path = random.choice(self.clip_vision_unconditional_paths)
-                self.clip_image_embeds_unconditional = load_file(unconditional_path)
+                self.clip_image_embeds_unconditional = dataset_crypto.load_safetensors(unconditional_path)
 
             return
         clip_image_path = self.get_new_clip_image_path()
         try:
-            img = Image.open(clip_image_path).convert('RGB')
-            img = exif_transpose(img)
+            _cdf = dataset_crypto.open_dataset(clip_image_path)
+            img = _cdf.open_image().convert('RGB')
+            _cdf.cleanup()
         except Exception as e:
             # make a random noise image
             img = Image.new('RGB', (self.dataset_config.resolution, self.dataset_config.resolution))
@@ -1847,8 +1819,8 @@ class MaskFileItemDTOMixin:
 
     def load_mask_image(self: 'FileItemDTO'):
         try:
-            img = Image.open(self.mask_path)
-            img = exif_transpose(img)
+            # decrypted in RAM on the fly if the dataset is encrypted
+            img = dataset_crypto.open_image(self.mask_path)
         except Exception as e:
             print_acc(f"Error: {e}")
             print_acc(f"Error loading image: {self.mask_path}")
@@ -1950,8 +1922,8 @@ class UnconditionalFileItemDTOMixin:
 
     def load_unconditional_image(self: 'FileItemDTO'):
         try:
-            img = Image.open(self.unconditional_path)
-            img = exif_transpose(img)
+            # decrypted in RAM on the fly if the dataset is encrypted
+            img = dataset_crypto.open_image(self.unconditional_path)
         except Exception as e:
             print_acc(f"Error: {e}")
             print_acc(f"Error loading image: {self.mask_path}")
@@ -2080,26 +2052,21 @@ class LatentCachingFileItemDTOMixin:
         return self._latent_path
 
     def cleanup_latent(self):
-        if self._encoded_latent is not None:
-            if not self.is_caching_to_memory:
-                # we are caching on disk, don't save in memory
-                self._encoded_latent = None
-                self._cached_first_frame_latent = None
-                self._cached_audio_latent = None
-            else:
-                # move it back to cpu
-                self._encoded_latent = self._encoded_latent.to('cpu')
-                if self._cached_first_frame_latent is not None:
-                    self._cached_first_frame_latent = self._cached_first_frame_latent.to('cpu')
-                if self._cached_audio_latent is not None:
-                    self._cached_audio_latent = self._cached_audio_latent.to('cpu')
+        # Streaming: latents live on disk and are loaded on the fly
+        # (decrypted in RAM if the dataset is encrypted). The per-item
+        # tensors only exist while the item is inside the rotating prefetch
+        # ring, so always release them here - nothing is kept in RAM/VRAM
+        # across items.
+        self._encoded_latent = None
+        self._cached_first_frame_latent = None
+        self._cached_audio_latent = None
 
     def get_latent(self, device=None):
         if not self.is_latent_cached:
             return None
         if self._encoded_latent is None:
-            # load it from disk
-            state_dict = load_file(
+            # load it from disk (decrypted in RAM if the dataset is encrypted)
+            state_dict = dataset_crypto.load_safetensors(
                 self.get_latent_path(),
                 # device=device if device is not None else self.latent_load_device
                 device='cpu'
@@ -2124,35 +2091,27 @@ class LatentCachingMixin:
     def cache_latents_all_latents(self: 'AiToolkitDataset'):
         with accelerator.main_process_first():
             print_acc(f"Caching latents for {self.dataset_path}")
-            # cache all latents to disk
-            to_disk = self.is_caching_latents_to_disk
-            to_memory = self.is_caching_latents_to_memory
-
-            if to_disk:
-                print_acc(" - Saving latents to disk")
-            if to_memory:
-                print_acc(" - Keeping latents in memory")
+            # Streaming design: latents are always written to disk and are
+            # loaded on the fly (decrypted in RAM if the dataset is
+            # encrypted) by the prefetch pipeline during training. Nothing
+            # is kept in RAM/VRAM after this pass.
+            print_acc(" - Saving latents to disk (streamed from disk at training time)")
             # move sd items to cpu except for vae
             self.sd.set_device_state_preset('cache_latents')
 
             # use tqdm to show progress
             i = 0
-            for file_item in tqdm(self.file_list, desc=f'Caching latents{" to disk" if to_disk else ""}'):
-                file_item.is_caching_to_disk = to_disk
-                file_item.is_caching_to_memory = to_memory
+            for file_item in tqdm(self.file_list, desc='Caching latents to disk'):
+                file_item.is_caching_to_disk = True
+                file_item.is_caching_to_memory = False
                 file_item.latent_load_device = self.sd.device
 
                 latent_path = file_item.get_latent_path(recalculate=True)
                 # check if it is saved to disk already
                 if os.path.exists(latent_path):
-                    if to_memory:
-                        # load it into memory
-                        state_dict = load_file(latent_path, device='cpu')
-                        file_item._encoded_latent = state_dict['latent'].to('cpu', dtype=self.sd.torch_dtype)
-                        if 'first_frame_latent' in state_dict:
-                            file_item._cached_first_frame_latent = state_dict['first_frame_latent'].to('cpu', dtype=self.sd.torch_dtype)
-                        if 'audio_latent' in state_dict:
-                            file_item._cached_audio_latent = state_dict['audio_latent'].to('cpu', dtype=self.sd.torch_dtype)
+                    # already cached; it will be loaded on demand (on the
+                    # fly, decrypted in RAM if encrypted) during training
+                    pass
                 else:
                     # not saved to disk, calculate
                     # load the image first
@@ -2167,8 +2126,7 @@ class LatentCachingMixin:
                     try:
                         imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
                         latent = self.sd.encode_images(imgs).squeeze(0)
-                        if to_disk:
-                            state_dict['latent'] = latent.clone().detach().cpu()
+                        state_dict['latent'] = latent.clone().detach().cpu()
                     except Exception as e:
                         print_acc(f"Error processing image: {file_item.path}")
                         print_acc(f"Error: {str(e)}")
@@ -2184,32 +2142,21 @@ class LatentCachingMixin:
                         else:
                             raise ValueError(f"Unknown frame shape {frames.shape}")
                         first_frame_latent = self.sd.encode_images(first_frames).squeeze(0)
-                        if to_disk:
-                            state_dict['first_frame_latent'] = first_frame_latent.clone().detach().cpu()
+                        state_dict['first_frame_latent'] = first_frame_latent.clone().detach().cpu()
                     
                     # audio (video+audio models only — audio-only models already encoded above via encode_images)
                     if not self.is_audio_model and file_item.audio_data is not None:
                         audio_latent = self.sd.encode_audio([file_item.audio_data]).squeeze(0)
-                        if to_disk:
-                            state_dict['audio_latent'] = audio_latent.clone().detach().cpu()
+                        state_dict['audio_latent'] = audio_latent.clone().detach().cpu()
                     
                     if is_video:
                         state_dict['num_frames'] = torch.tensor(file_item.num_frames, dtype=torch.int32)
                     
-                    # save_latent
-                    if to_disk:
-                        # metadata
-                        meta = get_meta_for_safetensors(file_item.get_latent_info_dict())
-                        os.makedirs(os.path.dirname(latent_path), exist_ok=True)
-                        save_file(state_dict, latent_path, metadata=meta)
-
-                    if to_memory:
-                        # keep it in memory
-                        file_item._encoded_latent = latent.to('cpu', dtype=self.sd.torch_dtype)
-                        if first_frame_latent is not None:
-                            file_item._cached_first_frame_latent = first_frame_latent.to('cpu', dtype=self.sd.torch_dtype)
-                        if audio_latent is not None:
-                            file_item._cached_audio_latent = audio_latent.to('cpu', dtype=self.sd.torch_dtype)
+                    # save_latent (encrypted at rest when a dataset password is set).
+                    # The tensors are NOT kept in memory - they are streamed
+                    # back from disk (decrypted on the fly) during training.
+                    meta = get_meta_for_safetensors(file_item.get_latent_info_dict())
+                    dataset_crypto.save_safetensors(state_dict, latent_path, metadata=meta)
 
                     del imgs
                     del latent
@@ -2448,8 +2395,8 @@ class TextEmbeddingCachingMixin:
                                 control_path_list = [control_path_list]
                             for ctrl_idx in range(len(control_path_list)):
                                 try:
-                                    img = Image.open(control_path_list[ctrl_idx]).convert("RGB")
-                                    img = exif_transpose(img)
+                                    # decrypted in RAM on the fly if encrypted
+                                    img = dataset_crypto.open_image(control_path_list[ctrl_idx]).convert("RGB")
                                     # convert to 0 to 1 tensor
                                     img = (
                                         TF.to_tensor(img)
@@ -2492,8 +2439,8 @@ class TextEmbeddingCachingMixin:
                                 control_path_list = [control_path_list]
                             for ctrl_idx in range(len(control_path_list)):
                                 try:
-                                    img = Image.open(control_path_list[ctrl_idx]).convert("RGB")
-                                    img = exif_transpose(img)
+                                    # decrypted in RAM on the fly if encrypted
+                                    img = dataset_crypto.open_image(control_path_list[ctrl_idx]).convert("RGB")
                                     # convert to 0 to 1 tensor
                                     img = (
                                         TF.to_tensor(img)
@@ -2638,8 +2585,7 @@ class CLIPCachingMixin:
                     ('penultimate_hidden_states', clip_output.hidden_states[-2].clone().detach().cpu()),
                 ])
 
-                os.makedirs(os.path.dirname(uncond_path), exist_ok=True)
-                save_file(state_dict, uncond_path)
+                dataset_crypto.save_safetensors(state_dict, uncond_path)
                 unconditional_paths.append(uncond_path)
 
             self.clip_vision_unconditional_cache = unconditional_paths
@@ -2681,10 +2627,9 @@ class CLIPCachingMixin:
                         ('last_hidden_state', clip_output.hidden_states[-1].clone().detach().cpu()),
                         ('penultimate_hidden_states', clip_output.hidden_states[-2].clone().detach().cpu()),
                     ])
-                    # metadata
+                    # metadata (encrypted at rest when a dataset password is set)
                     meta = get_meta_for_safetensors(file_item.get_clip_vision_info_dict())
-                    os.makedirs(os.path.dirname(embedding_path), exist_ok=True)
-                    save_file(state_dict, embedding_path, metadata=meta)
+                    dataset_crypto.save_safetensors(state_dict, embedding_path, metadata=meta)
 
                     del clip_image
                     del clip_output

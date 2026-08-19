@@ -1720,6 +1720,9 @@ class StableDiffusion:
                         ).images[0]
 
                     gen_config.save_image(img, i)
+                    # encrypt the sample in place (preserving its extension) when a
+                    # sample password is configured; no-op otherwise
+                    gen_config.encrypt_sample_if_enabled(i, 0)
                     gen_config.log_image(img, i)
                     self._after_sample_image(i, len(image_configs))
                     flush()

@@ -1,86 +1,107 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
-import { apiClient, isAuthorizedState } from '@/utils/api';
-import { createGlobalState } from 'react-global-hooks';
+import { apiClient } from '@/utils/api';
+import { signChallenge } from '@/utils/authKey';
+
+interface AuthStatus {
+  required: boolean;
+  authenticated: boolean;
+  mode: 'publickey' | 'legacy' | 'none';
+}
 
 interface AuthWrapperProps {
-  authRequired: boolean;
   children: React.ReactNode | React.ReactNode[];
 }
 
-export default function AuthWrapper({ authRequired, children }: AuthWrapperProps) {
+export default function AuthWrapper({ children }: AuthWrapperProps) {
+  const [status, setStatus] = useState<AuthStatus | null>(null);
   const [token, setToken] = useState('');
-  // start with true, and deauth if needed
-  const [isAuthorizedGlobal, setIsAuthorized] = isAuthorizedState.use();
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
-  const [isBrowser, setIsBrowser] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const isAuthorized = authRequired ? isAuthorizedGlobal : true;
+  const checkAuth = async () => {
+    try {
+      const response = await apiClient.get('/api/auth');
+      setStatus(response.data);
+    } catch {
+      // API unreachable -> don't gate the UI (errors will surface elsewhere)
+      setStatus({ required: false, authenticated: true, mode: 'none' });
+    }
+  };
 
-  // Set isBrowser to true when component mounts
   useEffect(() => {
-    setIsBrowser(true);
-    // Get token from localStorage only after component has mounted
-    const storedToken = localStorage.getItem('AI_TOOLKIT_AUTH') || '';
-    setToken(storedToken);
     checkAuth();
   }, []);
 
   // auto focus on input when not authorized
   useEffect(() => {
-    if (isAuthorized) {
-      return;
+    if (status && status.required && !status.authenticated) {
+      setTimeout(() => {
+        if (inputRef.current) {
+          inputRef.current.focus();
+        }
+      }, 100);
     }
-    setTimeout(() => {
-      if (inputRef.current) {
-        inputRef.current.focus();
-      }
-    }, 100);
-  }, [isAuthorized]);
-
-  const checkAuth = async () => {
-    // always get current stored token here to avoid state race conditions
-    const currentToken = localStorage.getItem('AI_TOOLKIT_AUTH') || '';
-    if (!authRequired || isLoading || currentToken === '') {
-      return;
-    }
-    setIsLoading(true);
-    setError('');
-    try {
-      const response = await apiClient.get('/api/auth');
-      if (response.data.isAuthenticated) {
-        setIsAuthorized(true);
-      } else {
-        setIsAuthorized(false);
-        setError('Invalid token. Please try again.');
-      }
-    } catch (err) {
-      setIsAuthorized(false);
-      console.log(err);
-      setError('Invalid token. Please try again.');
-    }
-    setIsLoading(false);
-  };
+  }, [status]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
 
     if (!token.trim()) {
-      setError('Please enter your token');
+      setError('Please enter your password');
       return;
     }
 
-    if (isBrowser) {
-      localStorage.setItem('AI_TOOLKIT_AUTH', token);
-      checkAuth();
+    setIsLoading(true);
+    try {
+      let body: Record<string, string>;
+      if (status?.mode === 'publickey') {
+        // Password stays in the browser: sign a one-time server challenge
+        // with the Ed25519 private key derived from it (never transmitted).
+        const { data } = await apiClient.get('/api/auth/challenge');
+        body = {
+          challenge: data.challenge,
+          signature: await signChallenge(token, data.challenge),
+        };
+      } else {
+        // Legacy migration mode: old scrypt-hash install, plaintext accepted
+        // once so the user can log in and re-save the password in Settings.
+        body = { password: token };
+      }
+      const response = await apiClient.post('/api/auth/login', body);
+      if (response.status === 200) {
+        setToken('');
+        await checkAuth();
+      }
+    } catch (err: any) {
+      console.log(err);
+      const serverError = err.response?.data?.error;
+      if (serverError) {
+        setError(serverError);
+      } else if (err?.message && /Ed25519|browser/i.test(err.message)) {
+        // crypto unsupported in this browser
+        setError(err.message);
+      } else {
+        setError('Invalid password. Please try again.');
+      }
     }
+    setIsLoading(false);
   };
 
-  if (isAuthorized) {
+  // While we don't know the auth state yet, don't render anything sensitive.
+  if (status === null) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-gray-900 text-gray-400">
+        Checking...
+      </div>
+    );
+  }
+
+  // Not required (no password configured) or already authenticated -> show app.
+  if (!status.required || status.authenticated) {
     return <>{children}</>;
   }
 
@@ -89,7 +110,6 @@ export default function AuthWrapper({ authRequired, children }: AuthWrapperProps
       {/* Left side - decorative or brand area */}
       <div className="hidden lg:flex lg:w-1/2 bg-gray-800 flex-col justify-center items-center p-12">
         <div className="mb-4">
-          {/* Replace with your own logo */}
           <div className="flex items-center justify-center">
             <img src="/ostris_logo.png" alt="Ostris AI Toolkit" className="w-auto h-24 inline" />
           </div>
@@ -101,7 +121,6 @@ export default function AuthWrapper({ authRequired, children }: AuthWrapperProps
       <div className="w-full lg:w-1/2 flex flex-col justify-center items-center p-8 sm:p-12">
         <div className="w-full max-w-md">
           <div className="lg:hidden flex justify-center mb-4">
-            {/* Mobile logo */}
             <div className="flex items-center justify-center">
               <img src="/ostris_logo.png" alt="Ostris AI Toolkit" className="w-auto h-24 inline" />
             </div>
@@ -127,7 +146,8 @@ export default function AuthWrapper({ authRequired, children }: AuthWrapperProps
                 placeholder="Enter your password"
               />
               <div className='text-gray-500 text-xs mt-2'>
-                The password is set with the environment variable AI_TOOLKIT_AUTH, the default is the super secure secret word "password"
+                The password is set in Settings → Security. Only a public key derived from it is stored
+                on the server; the password itself never leaves your browser.
               </div>
             </div>
 

@@ -29,9 +29,6 @@ export const viewport = {
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
-  // Check if the AI_TOOLKIT_AUTH environment variable is set
-  const authRequired = process.env.AI_TOOLKIT_AUTH ? true : false;
-
   const platform = os.platform();
 
   return (
@@ -52,7 +49,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className={inter.className}>
         <script dangerouslySetInnerHTML={{ __html: `window.server_platform = "${platform}";` }} />
         <ThemeProvider>
-          <AuthWrapper authRequired={authRequired}>
+          <AuthWrapper>
             <div className="flex h-screen bg-gray-950">
               <Sidebar />
               <main className="flex-1 overflow-auto bg-gray-950 text-gray-100 relative">

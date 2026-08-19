@@ -1,6 +1,7 @@
 import os
 import torch
 from safetensors.torch import load_file, save_file
+from toolkit import dataset_crypto
 
 
 class AdvancedPromptEmbeds:
@@ -143,13 +144,12 @@ class AdvancedPromptEmbeds:
                     f"Cannot save key {key!r}: expected list of length 1, got {len(value)}"
                 )
             data[key] = value[0]
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        save_file(data, path, metadata=metadata)
+        dataset_crypto.save_safetensors(data, path, metadata=metadata)
 
     @classmethod
     def load(cls, path=None):
         if path is not None:
-            loaded = load_file(path)
+            loaded = dataset_crypto.load_safetensors(path)
         else:
             raise ValueError("Must provide a path")
 

@@ -3,7 +3,7 @@ import { Job } from '@prisma/client';
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
-import { TOOLKIT_ROOT, getTrainingFolder, getHFToken } from '../paths';
+import { TOOLKIT_ROOT, getTrainingFolder, getHFToken, getSamplePublicKey, getDatasetPassword } from '../paths';
 import { resolvePythonPath } from '../pythonPath';
 const isWindows = process.platform === 'win32';
 
@@ -79,6 +79,23 @@ const startAndWatchJob = (job: Job) => {
     const hfToken = await getHFToken();
     if (hfToken && hfToken.trim() !== '') {
       additionalEnv.HF_TOKEN = hfToken;
+    }
+
+    // SAMPLE_PUBLIC_KEY - when set, generated samples are encrypted at rest.
+    // This is the X25519 public key the UI derived from the user's password
+    // client-side; the password itself is never stored or passed to the job.
+    const samplePublicKey = await getSamplePublicKey();
+    if (samplePublicKey && samplePublicKey.trim() !== '') {
+      additionalEnv.SAMPLE_PUBLIC_KEY = samplePublicKey;
+    }
+
+    // DATASET_PASSWORD - when set, the training dataloader transparently
+    // decrypts encrypted dataset files (see toolkit/dataset_crypto.py).
+    // This is the actual symmetric password (unlike the sample key, which is
+    // public-key based), so the plaintext is passed to the worker process.
+    const datasetPassword = await getDatasetPassword();
+    if (datasetPassword && datasetPassword.trim() !== '') {
+      additionalEnv.DATASET_PASSWORD = datasetPassword;
     }
 
     // Add the --log argument to the command

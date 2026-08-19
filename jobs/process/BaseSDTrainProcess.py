@@ -2352,11 +2352,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
         ### HOOk ###
         self.before_dataset_load()
         # load datasets if passed in the root process
+        # gradient_accumulation is passed so the prefetch stream can derive
+        # the number of items to stage in VRAM (batch number per step)
         if self.datasets is not None:
-            self.data_loader = get_dataloader_from_datasets(self.datasets, self.train_config.batch_size, self.sd)
+            self.data_loader = get_dataloader_from_datasets(
+                self.datasets, self.train_config.batch_size, self.sd,
+                gradient_accumulation=self.train_config.gradient_accumulation,
+            )
         if self.datasets_reg is not None:
-            self.data_loader_reg = get_dataloader_from_datasets(self.datasets_reg, self.train_config.batch_size,
-                                                                self.sd)
+            self.data_loader_reg = get_dataloader_from_datasets(
+                self.datasets_reg, self.train_config.batch_size, self.sd,
+                gradient_accumulation=self.train_config.gradient_accumulation,
+            )
 
         flush()
         self.last_save_step = self.step_num
@@ -2756,6 +2763,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc("")
             else:
                 self.num_consecutive_oom = 0
+
+            # Release the consumed batches back to their rotating VRAM
+            # prefetch buffers (PrefetchStream) so the background worker can
+            # refill the ring with the next steps' data (already decrypted
+            # from disk and staged in VRAM). This keeps peak VRAM at exactly
+            # `prefetch_steps` steps of data. On OOM this also frees the
+            # batch memory before we retry.
+            with self.timer('batch_release'):
+                for b in batch_list:
+                    if b is None:
+                        continue
+                    stream = getattr(b, '_prefetch_stream', None)
+                    if stream is not None:
+                        stream.release(b)
+                    elif isinstance(b, DataLoaderBatchDTO):
+                        b.cleanup()
+
             if self.torch_profiler is not None:
                 torch.cuda.synchronize()  # Make sure all CUDA ops are done
                 self.torch_profiler.stop()
@@ -2843,11 +2867,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                     if self.progress_bar is not None:
                         self.progress_bar.set_postfix_str(prog_bar_string)
-
-                # if the batch is a DataLoaderBatchDTO, then we need to clean it up
-                if isinstance(batch, DataLoaderBatchDTO):
-                    with self.timer('batch_cleanup'):
-                        batch.cleanup()
 
                 # don't do on first step
                 if self.step_num != self.start_step:

@@ -9,6 +9,7 @@ import random
 from toolkit.train_tools import get_torch_dtype
 import itertools
 from safetensors import safe_open
+from toolkit import dataset_crypto
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 
 if TYPE_CHECKING:
@@ -137,8 +138,7 @@ class PromptEmbeds:
                     state_dict[f"attention_mask_{i}"] = attn.cpu()
             else:
                 state_dict["attention_mask"] = pe.attention_mask.cpu()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        save_file(state_dict, path)
+        dataset_crypto.save_safetensors(state_dict, path)
     
     @classmethod
     def load(cls, path: str) -> 'PromptEmbeds':
@@ -147,13 +147,11 @@ class PromptEmbeds:
         :param path: The path to load the prompt embeds from.
         :return: An instance of PromptEmbeds.
         """
-        # first check if it is advanced prompt embed file
-        f = safe_open(path, framework='pt')
-        metadata = f.metadata()
+        # first check if it is advanced prompt embed file (handles encrypted files)
+        state_dict, metadata = dataset_crypto.load_safetensors_meta(path)
         if metadata is not None and metadata.get("class_name", "") == "AdvancedPromptEmbeds":
             return AdvancedPromptEmbeds.load(path=path)
         
-        state_dict = load_file(path, device='cpu')
         text_embeds = []
         pooled_embeds = None
         attention_mask = []

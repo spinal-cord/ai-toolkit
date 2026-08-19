@@ -64,6 +64,17 @@ export async function POST(request: Request) {
       extra["job_type"] = body.job_type;
     }
 
+    // Encrypted config blob (base64) for webui fetch+edit. Only the browser
+    // holding the private key can decrypt it. Stored alongside the unencrypted
+    // job_config (which is used to start training).
+    if (typeof body.job_config_encrypted === 'string' && body.job_config_encrypted.length > 0) {
+      extra["job_config_encrypted"] = body.job_config_encrypted;
+    } else if (id) {
+      // Editing a job without a new encrypted blob: clear the stale one so we
+      // never present a config that no longer matches the unencrypted version.
+      extra["job_config_encrypted"] = null;
+    }
+
     if (id) {
       // Update existing training
       const training = await prisma.job.update({

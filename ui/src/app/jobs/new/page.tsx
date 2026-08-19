@@ -20,6 +20,7 @@ import SimpleJob from './SimpleJob';
 import AdvancedConfigEditor from '@/components/AdvancedConfigEditor';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import { apiClient } from '@/utils/api';
+import { encryptConfig, decryptConfig, getConfigPrivateKey } from '@/utils/configKey';
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -37,7 +38,38 @@ export default function TrainingForm() {
 
   const [jobConfig, setJobConfig] = useNestedState<JobConfig>(objectCopy(migrateJobConfig(defaultJobConfig)));
   const [status, setStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
+  const [configDecryptWarning, setConfigDecryptWarning] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Load a job's config for editing, preferring the ENCRYPTED blob (decryptable
+  // only by this browser's private key). Falls back to the unencrypted config
+  // (used to start training) when decryption is not possible.
+  const loadJobConfigFromData = async (data: any): Promise<JobConfig | null> => {
+    if (data.job_config_encrypted) {
+      const privKey = getConfigPrivateKey();
+      if (privKey) {
+        try {
+          const decrypted = await decryptConfig(data.job_config_encrypted, privKey);
+          return migrateJobConfig(JSON.parse(decrypted));
+        } catch (err) {
+          console.error('Failed to decrypt stored config:', err);
+          setConfigDecryptWarning(
+            'Could not decrypt the stored config with this browser\'s private key. Showing the unencrypted version instead.',
+          );
+        }
+      } else {
+        setConfigDecryptWarning(
+          'This job\'s config is encrypted, but this browser has no config private key (Settings -> Config Encryption). Showing the unencrypted version instead.',
+        );
+      }
+    }
+    try {
+      return migrateJobConfig(JSON.parse(data.job_config));
+    } catch (err) {
+      console.error('Failed to parse job config:', err);
+      return null;
+    }
+  };
 
   const handleImportConfig = () => {
     fileInputRef.current?.click();
@@ -109,12 +141,14 @@ export default function TrainingForm() {
       apiClient
         .get(`/api/jobs?id=${cloneId}`)
         .then(res => res.data)
-        .then(data => {
+        .then(async data => {
           console.log('Clone Training:', data);
           setGpuIDs(data.gpu_ids);
-          const newJobConfig = migrateJobConfig(JSON.parse(data.job_config));
-          newJobConfig.config.name = `${newJobConfig.config.name}_copy`;
-          setJobConfig(newJobConfig);
+          const newJobConfig = await loadJobConfigFromData(data);
+          if (newJobConfig) {
+            newJobConfig.config.name = `${newJobConfig.config.name}_copy`;
+            setJobConfig(newJobConfig);
+          }
         })
         .catch(error => console.error('Error fetching training:', error));
     }
@@ -125,10 +159,11 @@ export default function TrainingForm() {
       apiClient
         .get(`/api/jobs?id=${runId}`)
         .then(res => res.data)
-        .then(data => {
+        .then(async data => {
           console.log('Training:', data);
           setGpuIDs(data.gpu_ids);
-          setJobConfig(migrateJobConfig(JSON.parse(data.job_config)));
+          const cfg = await loadJobConfigFromData(data);
+          if (cfg) setJobConfig(cfg);
         })
         .catch(error => console.error('Error fetching training:', error));
     }
@@ -152,12 +187,27 @@ export default function TrainingForm() {
     if (status === 'saving') return;
     setStatus('saving');
 
+    // If config encryption is set up, encrypt the config with the public key
+    // and send BOTH versions: unencrypted (used to start training) + encrypted
+    // (stored for later fetch+edit in the webui; only this browser's private
+    // key can decrypt it).
+    let jobConfigEncrypted: string | undefined;
+    if (settings.CONFIG_PUBLIC_KEY && settings.CONFIG_PUBLIC_KEY.length > 0) {
+      try {
+        jobConfigEncrypted = await encryptConfig(JSON.stringify(jobConfig), settings.CONFIG_PUBLIC_KEY);
+      } catch (err) {
+        console.error('Failed to encrypt config:', err);
+        alert('Failed to encrypt the config. It will be saved unencrypted for this save.');
+      }
+    }
+
     apiClient
       .post('/api/jobs', {
         id: runId,
         name: jobConfig.config.name,
         gpu_ids: gpuIDs,
         job_config: jobConfig,
+        ...(jobConfigEncrypted ? { job_config_encrypted: jobConfigEncrypted } : {}),
       })
       .then(res => {
         setStatus('success');
@@ -286,6 +336,12 @@ export default function TrainingForm() {
         style={{ display: 'none' }}
         onChange={handleFileSelected}
       />
+
+      {configDecryptWarning && (
+        <div className="px-4 py-2 mx-4 mt-2 text-sm text-amber-200 bg-amber-900/40 border border-amber-700 rounded-lg">
+          {configDecryptWarning}
+        </div>
+      )}
 
       {showAdvancedView ? (
         <div className="pt-[48px] absolute top-0 left-0 w-full h-full overflow-auto">

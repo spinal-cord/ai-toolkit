@@ -6,8 +6,17 @@ import NodeCache from 'node-cache';
 const myCache = new NodeCache();
 const prisma = new PrismaClient();
 
+// Shared with server.js (same process, like __AITK_BOOT_SECRET__): bumping the
+// revision makes the server.js auth middleware re-read Settings immediately,
+// so (un)setting the UI password takes effect without waiting for its TTL.
+function bumpSettingsRevision() {
+  const g = globalThis as any;
+  g.__AITK_SETTINGS_REV__ = (g.__AITK_SETTINGS_REV__ || 0) + 1;
+}
+
 export const flushCache = () => {
   myCache.flushAll();
+  bumpSettingsRevision();
 };
 
 export const getDatasetsRoot = async () => {

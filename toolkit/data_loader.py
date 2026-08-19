@@ -16,12 +16,13 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from tqdm import tqdm
 import albumentations as A
 
-from toolkit import image_utils
+from toolkit import image_utils, dataset_crypto
 from toolkit.basic import get_resize_method
 from toolkit.buckets import get_bucket_for_image_size, BucketResolution
 from toolkit.config_modules import DatasetConfig, preprocess_dataset_raw_config
 from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, ControlCachingMixin, TextEmbeddingCachingMixin
 from toolkit.optical_flow.flow_caching_mixin import OpticalFlowCachingMixin
+from toolkit.prefetch import PrefetchStream
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
@@ -489,6 +490,10 @@ class AiToolkitDataset(LatentCachingMixin, OpticalFlowCachingMixin, ControlCachi
         # remove items in the _controls_ folder
         file_list = [x for x in file_list if not os.path.basename(os.path.dirname(x)) == "_controls"]
 
+        # Fail fast if the dataset is encrypted but no (valid) password is set.
+        # Plain (non-encrypted) datasets are unaffected - this is a no-op for them.
+        dataset_crypto.validate_dataset(file_list, log=print_acc)
+
         if self.dataset_config.num_repeats > 1:
             # repeat the list
             file_list = file_list * self.dataset_config.num_repeats
@@ -733,6 +738,7 @@ def get_dataloader_from_datasets(
         dataset_options,
         batch_size=1,
         sd: 'StableDiffusion' = None,
+        gradient_accumulation=1,
 ) -> DataLoader:
     if dataset_options is None or len(dataset_options) == 0:
         return None
@@ -806,6 +812,27 @@ def get_dataloader_from_datasets(
             shuffle=True,
             collate_fn=dto_collation,
             **dataloader_kwargs
+        )
+
+    # Wrap the dataloader in the rotating, device-resident prefetch stream:
+    # it stages `prefetch_steps` full optimizer steps ahead of the training
+    # loop in VRAM (the item count is derived from the batch number) and
+    # streams everything else from disk, decrypting on the fly. Batches
+    # rotate in/out of VRAM as the training loop consumes and releases them,
+    # so peak VRAM stays at exactly `prefetch_steps` steps of data.
+    prefetch_steps = dataset_config_list[0].prefetch_steps
+    if sd is not None and prefetch_steps > 0:
+        data_loader = PrefetchStream(
+            data_loader,
+            device=sd.device_torch,
+            batch_size=batch_size,
+            gradient_accumulation=gradient_accumulation,
+            prefetch_steps=prefetch_steps,
+        )
+        print_acc(
+            f"Prefetch stream enabled: keeping {data_loader.prefetched_items} items in VRAM "
+            f"({prefetch_steps} steps x {data_loader.items_per_step} items/step), "
+            f"streaming the rest from disk"
         )
     return data_loader
 

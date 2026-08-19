@@ -6,6 +6,7 @@ from collections import OrderedDict
 from typing import Union
 import torch
 from safetensors.torch import load_file
+from toolkit import dataset_crypto
 
 
 class OpticalFlowFileItemDTOMixin:
@@ -78,9 +79,14 @@ class OpticalFlowFileItemDTOMixin:
         return self._flow_path
 
     def cleanup_flow(self):
-        """Release cached flow tensor if not caching to disk."""
-        if self._cached_flow is not None and not self.dataset_config.cache_optical_flow_to_disk:
-            self._cached_flow = None
+        """Release the per-item flow tensor.
+
+        Streaming: flow is always cached on disk and loaded on the fly
+        (decrypted in RAM if the dataset is encrypted); the per-item tensor
+        only exists while the item is inside the rotating prefetch ring, so
+        always release it here.
+        """
+        self._cached_flow = None
 
     def get_flow(self, device=None) -> Union[torch.Tensor, None]:
         """Load and return cached flow tensor."""
@@ -88,7 +94,7 @@ class OpticalFlowFileItemDTOMixin:
             return None
 
         if self._cached_flow is None:
-            state_dict = load_file(self.get_flow_path(), device='cpu')
+            state_dict = dataset_crypto.load_safetensors(self.get_flow_path(), device='cpu')
             self._cached_flow = state_dict['flow']  # (T-1, 2, H, W) fp16
 
         if device is not None:

@@ -25,7 +25,8 @@ model Job {
   id              String   @id @default(uuid())
   name            String   @unique
   gpu_ids         String
-  job_config      String // JSON string
+  job_config      String // JSON string (unencrypted - used to start training)
+  job_config_encrypted String? // encrypted config blob (base64) for webui fetch+edit; only the browser private key can decrypt
   created_at      DateTime @default(now())
   updated_at      DateTime @updatedAt
   status          String   @default("stopped")

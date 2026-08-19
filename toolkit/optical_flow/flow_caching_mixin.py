@@ -8,6 +8,7 @@ from tqdm import tqdm
 from toolkit.print import print_acc
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.optical_flow.base import get_flow_model_info, get_flow_model_names, default_flow_model_name
+from toolkit import dataset_crypto
 
 
 class OpticalFlowCachingMixin:
@@ -149,11 +150,10 @@ class OpticalFlowCachingMixin:
         # FIX: Safetensors requires contiguous tensors. Slicing breaks contiguity.
         flow = flow.contiguous()
 
-        # Save to disk
+        # Save to disk (encrypted at rest when a dataset password is set)
         state_dict = OrderedDict([("flow", flow.cpu())])
         meta = get_meta_for_safetensors(file_item.get_flow_info_dict())
-        os.makedirs(os.path.dirname(flow_path), exist_ok=True)
-        save_file(state_dict, flow_path, metadata=meta)
+        dataset_crypto.save_safetensors(state_dict, flow_path, metadata=meta)
 
         # Cache in memory
         file_item._cached_flow = flow

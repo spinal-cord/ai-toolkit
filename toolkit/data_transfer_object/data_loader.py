@@ -7,7 +7,7 @@ from PIL import Image
 from PIL.ImageOps import exif_transpose
 import av
             
-from toolkit import image_utils
+from toolkit import image_utils, dataset_crypto
 from toolkit.basic import get_quick_signature_string
 from toolkit.dataloader_mixins import (
     CaptionProcessingDTOMixin,
@@ -91,46 +91,56 @@ class FileItemDTO(
                 use_db_entry = True
         if self.is_audio_model:
             # get the length of the audio file in ms
-            with av.open(self.path) as c:
-                if c.duration is not None:
-                    w =  int(c.duration / 1_000)
-                else:
-                    s = c.streams.audio[0]
-                    w = int(float(s.duration * s.time_base) * 1_000)
+            _df = dataset_crypto.open_dataset(self.path)
+            try:
+                with _df.open_av() as c:
+                    if c.duration is not None:
+                        w =  int(c.duration / 1_000)
+                    else:
+                        s = c.streams.audio[0]
+                        w = int(float(s.duration * s.time_base) * 1_000)
+            finally:
+                _df.cleanup()
             h = 1
         elif use_db_entry:
             w, h, _ = size_database[file_key]
         elif self.is_video:
-            # Open the video file
-            video = cv2.VideoCapture(self.path)
+            # Open the video file (decrypted in RAM if the dataset is encrypted)
+            _df = dataset_crypto.open_dataset(self.path)
+            video = _df.open_video()
+            try:
+                # Check if video opened successfully
+                if not video.is_opened():
+                    raise Exception(f"Error: Could not open video file {self.path}")
 
-            # Check if video opened successfully
-            if not video.isOpened():
-                raise Exception(f"Error: Could not open video file {self.path}")
-
-            # Get width and height
-            width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            w, h = width, height
-
-            # Release the video capture object immediately
-            video.release()
+                # Get width and height
+                width = video.width
+                height = video.height
+                w, h = width, height
+            finally:
+                # Release the video capture object immediately
+                video.release()
+                _df.cleanup()
             size_database[file_key] = (width, height, file_signature)
         else:
-            if self.dataset_config.fast_image_size:
-                # original method is significantly faster, but some images are read sideways. Not sure why. Do slow method by default.
-                try:
-                    w, h = image_utils.get_image_size(self.path)
-                except image_utils.UnknownImageFormat:
-                    print_once(
-                        f"Warning: Some images in the dataset cannot be fast read. "
-                        + f"This process is faster for png, jpeg"
-                    )
-                    img = exif_transpose(Image.open(self.path))
+            _df = dataset_crypto.open_dataset(self.path)
+            try:
+                if self.dataset_config.fast_image_size:
+                    # original method is significantly faster, but some images are read sideways. Not sure why. Do slow method by default.
+                    try:
+                        w, h = _df.image_size()
+                    except image_utils.UnknownImageFormat:
+                        print_once(
+                            f"Warning: Some images in the dataset cannot be fast read. "
+                            + f"This process is faster for png, jpeg"
+                        )
+                        img = _df.open_image()
+                        w, h = img.size
+                else:
+                    img = _df.open_image()
                     w, h = img.size
-            else:
-                img = exif_transpose(Image.open(self.path))
-                w, h = img.size
+            finally:
+                _df.cleanup()
             size_database[file_key] = (w, h, file_signature)
         self.width: int = w
         self.height: int = h
@@ -172,6 +182,7 @@ class FileItemDTO(
         self.audio_tensor = None
         self.cleanup_latent()
         self.cleanup_text_embedding()
+        self.cleanup_flow()
         self.cleanup_control()
         self.cleanup_inpaint()
         self.cleanup_clip_image()
@@ -470,9 +481,48 @@ class DataLoaderBatchDTO:
                         audio_tensors.append(x.audio_tensor)
                 self.audio_tensor = torch.cat([x.unsqueeze(0) for x in audio_tensors])
 
+            # Streaming: the batch-level tensors above now own the data
+            # (torch.cat copies it). Release the per-item duplicates so RAM
+            # and VRAM hold a single copy per batch, and the rotating
+            # prefetch ring can evict the whole batch when it rotates out.
+            self._release_item_tensors()
+
         except Exception as e:
             print(e)
             raise e
+
+    def _release_item_tensors(self):
+        """Release per-item tensor copies after the batch-level tensors are built.
+
+        Everything the training loop needs is exposed at batch level
+        (``latents``, ``tensor``, ``flow``, ``prompt_embeds``, control/mask/
+        clip tensors, audio ...), so the per-item copies are pure
+        duplication and are dropped here. The remaining per-item attributes
+        (path, captions, flags, dataset_config) are lightweight.
+        """
+        for x in self.file_items:
+            # cached latents (batch.latents / first_frame / audio are cat'd)
+            x._encoded_latent = None
+            x._cached_first_frame_latent = None
+            x._cached_audio_latent = None
+            # optical flow (batch.flow is cat'd)
+            if getattr(x, '_cached_flow', None) is not None:
+                x._cached_flow = None
+            # prompt embeddings (batch.prompt_embeds is cat'd)
+            x.prompt_embeds = None
+            # raw / conditioning tensors (batch-level cats own the data)
+            x.tensor = None
+            x.control_tensor = None
+            x.inpaint_tensor = None
+            x.clip_image_tensor = None
+            x.mask_tensor = None
+            x.unconditional_tensor = None
+            x.unaugmented_tensor = None
+            x.audio_tensor = None
+            # batch.audio_data / clip embeds keep their own references
+            x.audio_data = None
+            x.clip_image_embeds = None
+            x.clip_image_embeds_unconditional = None
 
     def get_is_reg_list(self):
         return [x.is_reg for x in self.file_items]
@@ -501,17 +551,26 @@ class DataLoaderBatchDTO:
         return [x.caption_short for x in self.file_items]
 
     def cleanup(self):
-        del self.latents
-        del self.tensor
-        del self.control_tensor
-        del self.audio_tensor
-        del self.audio_data
-        del self.audio_target
-        del self.audio_pred
-        del self.first_frame_latents
-        del self.audio_latents
+        # Idempotent: batches are cleaned up both by the prefetch stream
+        # (when a slot rotates out of VRAM) and by the training loop.
+        if getattr(self, '_cleaned_up', False):
+            return
+        self._cleaned_up = True
+        for attr in (
+            'latents', 'tensor', 'control_tensor', 'control_tensor_list',
+            'clip_image_tensor', 'mask_tensor', 'unaugmented_tensor',
+            'unconditional_tensor', 'unconditional_latents', 'inpaint_tensor',
+            'extra_values', 'audio_tensor', 'audio_data', 'audio_target',
+            'audio_pred', 'first_frame_latents', 'audio_latents', 'flow',
+            'clip_image_embeds', 'clip_image_embeds_unconditional',
+            'prompt_embeds',
+        ):
+            setattr(self, attr, None)
         for file_item in self.file_items:
-            file_item.cleanup()
+            try:
+                file_item.cleanup()
+            except Exception:
+                pass
 
     @property
     def dataset_config(self) -> "DatasetConfig":

@@ -35,3 +35,31 @@ export const getHFToken = async () => {
   }
   return token;
 };
+
+export const getSamplePublicKey = async () => {
+  const key = 'SAMPLE_PUBLIC_KEY';
+  let row = await prisma.settings.findFirst({
+    where: {
+      key: key,
+    },
+  });
+  let publicKey = '';
+  if (row?.value && row.value !== '') {
+    publicKey = row.value;
+  }
+  return publicKey;
+};
+
+export const getDatasetPassword = async () => {
+  const key = 'DATASET_PASSWORD';
+  let row = await prisma.settings.findFirst({
+    where: {
+      key: key,
+    },
+  });
+  let password = '';
+  if (row?.value && row.value !== '') {
+    password = row.value;
+  }
+  return password;
+};

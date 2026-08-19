@@ -1714,6 +1714,11 @@ class DatasetConfig:
 
         self.num_workers: int = kwargs.get('num_workers', 2)
         self.prefetch_factor: int = kwargs.get('prefetch_factor', 2)
+        # Number of optimizer steps the training dataloader keeps staged in
+        # VRAM ahead of the current step (rotating prefetch buffer). The
+        # buffer holds `prefetch_steps * batch_size * gradient_accumulation`
+        # items. Set 0 to disable the prefetch stream.
+        self.prefetch_steps: int = kwargs.get('prefetch_steps', 2)
         self.extra_values: List[float] = kwargs.get('extra_values', [])
         self.square_crop: bool = kwargs.get('square_crop', False)
         # apply same augmentations to control images. Usually want this true unless special case
@@ -1982,6 +1987,28 @@ class GenerateImageConfig:
             # do prompt file
             if self.add_prompt_file:
                 self.save_prompt_file(count, max_count)
+
+    def encrypt_sample_if_enabled(self, count: int = 0, max_count=0):
+        """Encrypt the just-written sample file in place if sample encryption is enabled.
+
+        Called from the ``generate_images`` funnels right after ``save_image`` so
+        that every generated sample (image / video / audio, including any
+        model-specific ``save_image`` override) is encrypted. The sample keeps
+        its extension (e.g. .png) but its bytes become an AITK encrypted sample
+        blob (X25519 public key + AES-256-GCM). The public key was derived
+        client-side from the user's password - the password itself never reaches
+        the server. No-op when no sample public key is configured. Failures are
+        logged, not raised, so a crypto problem never aborts sampling.
+        """
+        try:
+            from toolkit import dataset_crypto
+        except Exception:
+            return
+        try:
+            if dataset_crypto.is_sample_encryption_enabled():
+                dataset_crypto.encrypt_sample_file_in_place(self.get_image_path(count, max_count))
+        except Exception as e:
+            print(f"Error encrypting generated sample: {e}")
 
     def _save_video_mp4(self, frames, count: int = 0, max_count=0):
         """Save frames as MP4 video using libx264 with CRF 24."""
