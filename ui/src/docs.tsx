@@ -343,6 +343,234 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'train.do_cfg': {
+    title: 'Train with CFG',
+    description: (
+      <>
+        Training with CFG (Classifier Free Guidance) distills guidance into the LoRA. Each training step, the model
+        runs twice: once with the positive prompt and once with the negative/blank prompt, and the loss is computed
+        against the CFG-combined prediction:
+        <br />
+        <br />
+        <code>pred = uncond + cfg_scale * (cond - uncond)</code>
+        <br />
+        <br />
+        This "bakes in" the guidance scale so the concept is learned as if it were generated with that cfg at
+        inference. Because the guidance is already in the weights, generate with a <strong>lower</strong> cfg at
+        inference (near 1.0-1.5); re-applying the same high cfg will double-boost guidance and oversaturate results.
+        <br />
+        <br />
+        <em>Cost:</em> ~2x compute and memory per step (two network passes).
+      </>
+    ),
+  },
+  'train.cfg_scale': {
+    title: 'CFG Scale',
+    description: (
+      <>
+        The guidance scale used for the CFG combination during training (see "Train with CFG"). A value of 1.0 is a
+        no-op. Higher values bake in stronger guidance (e.g. 3.0-5.0).
+        <br />
+        <br />
+        Ignored while "Random CFG Scale" is enabled, where the scale is drawn from 1.0 to "Max CFG Scale" each step.
+      </>
+    ),
+  },
+  'train.do_random_cfg': {
+    title: 'Random CFG Scale',
+    description: (
+      <>
+        Instead of using a fixed CFG Scale, each training step draws a random guidance scale uniformly between 1.0
+        and "Max CFG Scale". This teaches the LoRA to behave well across a range of guidance strengths, which can
+        improve robustness at inference.
+      </>
+    ),
+  },
+  'train.max_cfg_scale': {
+    title: 'Max CFG Scale',
+    description: (
+      <>
+        Upper bound of the random guidance scale range used when "Random CFG Scale" is enabled. Each step, the scale
+        is drawn uniformly from 1.0 to this value.
+      </>
+    ),
+  },
+  'train.cfg_same_prompt': {
+    title: 'Same Prompt for Both CFG Branches',
+    description: (
+      <>
+        Uses the same prompt for the unconditional (negative) CFG branch instead of the negative/blank prompt.
+        <br />
+        <br />
+        <strong>Text-only models:</strong> both branches then produce identical text embeddings, so CFG collapses and
+        the scale has no effect. It only matters when the unconditional branch differs by something other than the
+        prompt.
+        <br />
+        <br />
+        <strong>Image-conditioned models (e.g. Wan I2V):</strong> the starting image is dropped on the unconditional
+        branch, so the two branches differ by the <em>image</em> rather than the prompt. CFG then amplifies the
+        image's contribution, baking stronger first-frame adherence into the LoRA (less drift across the video).
+        Higher cfg_scale = stronger adherence to the input frame. At 1.0 it is a no-op.
+        <br />
+        <br />
+        <em>Cost:</em> ~2x compute and memory per step, same as regular training-time CFG.
+      </>
+    ),
+  },
+  'train.text_dropout_rate': {
+    title: 'Text Dropout Rate (positive)',
+    description: (
+      <>
+        Probability that the <strong>positive</strong> (main) prompt is replaced with a blank prompt for a given
+        item/step. Dropped items are trained against the empty prompt, which improves the LoRA's robustness when the
+        prompt is short or empty at inference and reduces overfitting to specific wording.
+        <br />
+        <br />
+        This is the <em>global</em> rate. A per-dataset "Text Dropout Rate" (in the Datasets section) overrides it for
+        items in that dataset. When both are empty it falls back to the legacy Caption Dropout Rate.
+        <br />
+        <br />
+        <strong>Typical range:</strong> 0.0-0.2. <strong>Default:</strong> 0.0 (off).
+      </>
+    ),
+  },
+  'train.text_dropout_rate_negative': {
+    title: 'Text Dropout Rate (negative)',
+    description: (
+      <>
+        Probability that the <strong>negative</strong> (unconditional) CFG branch's prompt is dropped (to blank).
+        Only has an effect when CFG is active ("Train with CFG" or "Random CFG Scale").
+        <br />
+        <br />
+        With "Same Prompt for Both CFG Branches" the negative branch uses the real prompt, so this can independently
+        drop it. Without that option the negative branch is already blank, so dropping it is a no-op. See the sync /
+        invert toggles to tie the negative state to the positive state instead of using an independent rate.
+      </>
+    ),
+  },
+  'train.image_dropout_rate': {
+    title: 'Image Dropout Rate (positive)',
+    description: (
+      <>
+        Probability that the <strong>I2V first-frame image</strong> conditioning is dropped for a given item/step on the
+        positive branch. A dropped I2V item is trained as T2V for that step (no first-frame conditioning), so this
+        effectively turns pure I2V training into <strong>mixed I2V/T2V training</strong> and improves robustness when
+        sampling T2V from an I2V LoRA.
+        <br />
+        <br />
+        Works <strong>with or without CFG</strong>. Only applies to items in I2V mode; T2V items are unaffected.
+        <br />
+        <br />
+        <strong>Typical range:</strong> 0.0-0.5. <strong>Default:</strong> 0.0 (off, always I2V).
+      </>
+    ),
+  },
+  'train.image_dropout_rate_negative': {
+    title: 'Image Dropout Rate (negative)',
+    description: (
+      <>
+        Probability that the first-frame image conditioning is dropped on the <strong>negative</strong> CFG branch.
+        Only has an effect when CFG is active.
+        <br />
+        <br />
+        <strong>Default behavior:</strong> when "Same Prompt for Both CFG Branches" is on and this is left empty, it
+        defaults to <strong>1.0</strong> (always drop) so the negative branch is fully unconditional (no text, no
+        image) - the original cfg_same_prompt behavior. Set it to 0.0 to keep the image on the negative branch (pure
+        text CFG), or to a value in between for partial image dropout.
+      </>
+    ),
+  },
+  'train.sync_text_dropout': {
+    title: 'Sync Text Dropout (pos = neg)',
+    description: (
+      <>
+        Forces the negative branch to use the <strong>same</strong> text-drop state as the positive branch for the same
+        item/step: if the positive prompt is dropped, the negative prompt is dropped too (and vice versa). The
+        "Text Dropout Rate (negative)" is ignored while this is on.
+        <br />
+        <br />
+        Use this so the two CFG branches stay consistent (both real, or both blank) instead of independently random.
+        Combine with "Invert Text Dropout" to make the negative the opposite of the positive.
+      </>
+    ),
+  },
+  'train.sync_image_dropout': {
+    title: 'Sync Image Dropout (pos = neg)',
+    description: (
+      <>
+        Forces the negative branch to use the <strong>same</strong> image-drop state as the positive branch for the same
+        item/step: if the positive first-frame image is dropped, the negative image is dropped too (and vice versa).
+        The "Image Dropout Rate (negative)" is ignored while this is on.
+        <br />
+        <br />
+        Combine with "Invert Image Dropout" to make the negative the opposite of the positive (e.g. positive keeps the
+        image while the negative drops it).
+      </>
+    ),
+  },
+  'train.invert_text_dropout': {
+    title: 'Invert Text Dropout (pos != neg)',
+    description: (
+      <>
+        Only meaningful with "Sync Text Dropout" on. Inverts the synced relationship: if the positive prompt is
+        dropped, the negative prompt is <strong>forced to be kept</strong> (and vice versa). This guarantees the two
+        branches always differ by the prompt (one real, one blank), which is a strong, consistent text-guidance
+        signal for CFG.
+      </>
+    ),
+  },
+  'train.invert_image_dropout': {
+    title: 'Invert Image Dropout (pos != neg)',
+    description: (
+      <>
+        Only meaningful with "Sync Image Dropout" on. Inverts the synced relationship: if the positive first-frame
+        image is dropped, the negative image is <strong>forced to be kept</strong> (and vice versa).
+        <br />
+        <br />
+        A common I2V recipe: keep the image on the positive branch and drop it on the negative branch (positive
+        image-drop = 0, sync on + invert on) so CFG amplifies the image's contribution.
+      </>
+    ),
+  },
+  'dataset.text_dropout_rate': {
+    title: 'Text Dropout Rate (this dataset)',
+    description: (
+      <>
+        Per-dataset override of the positive text dropout rate. When set (not empty), it is used for items in this
+        dataset instead of the global "Text Dropout Rate (positive)". Leave empty to inherit the global value.
+      </>
+    ),
+  },
+  'dataset.text_dropout_rate_negative': {
+    title: 'Text Dropout Rate (negative, this dataset)',
+    description: (
+      <>
+        Per-dataset override of the negative text dropout rate. When set, it is used for items in this dataset instead
+        of the global "Text Dropout Rate (negative)". Leave empty to inherit the global value. Only matters when CFG is
+        active.
+      </>
+    ),
+  },
+  'dataset.image_dropout_rate': {
+    title: 'Image Dropout Rate (this dataset)',
+    description: (
+      <>
+        Per-dataset override of the positive I2V image dropout rate. When set, it is used for items in this dataset
+        instead of the global "Image Dropout Rate (positive)". Useful for mixing I2V/T2V ratios across datasets.
+        Leave empty to inherit the global value.
+      </>
+    ),
+  },
+  'dataset.image_dropout_rate_negative': {
+    title: 'Image Dropout Rate (negative, this dataset)',
+    description: (
+      <>
+        Per-dataset override of the negative I2V image dropout rate. When set, it is used for items in this dataset
+        instead of the global "Image Dropout Rate (negative)". Leave empty to inherit the global value. Only matters
+        when CFG is active.
+      </>
+    ),
+  },
   'dataset.num_repeats': {
     title: 'Num Repeats',
     description: (
@@ -862,8 +1090,9 @@ const docs: { [key: string]: ConfigDoc } = {
         <strong>Requirements</strong>
         <br />
         <ul className="list-disc list-inside ml-4 space-y-1">
-          <li>Requires PyTorch 2.5+ with flex_attention support</li>
-          <li>Falls back silently to standard attention if unavailable</li>
+          <li>Applied by the selected attention backend: <code className="bg-gray-700 px-1 rounded">flash</code> natively in-kernel (flash-attn 2.8.3+), or <code className="bg-gray-700 px-1 rounded">flex</code>/<code className="bg-gray-700 px-1 rounded">native</code>/<code className="bg-gray-700 px-1 rounded">sdpa</code> via flex_attention (PyTorch 2.5+)</li>
+          <li>fp32 layers skip the cap under the <code className="bg-gray-700 px-1 rounded">flash</code> backend (falls back to un-capped attention)</li>
+          <li>Falls back to standard (un-capped) attention if no capable kernel is available</li>
           <li>Currently integrated with Wan attention processors</li>
           <li>Logging overhead: negligible (~0.1% training time)</li>
         </ul>

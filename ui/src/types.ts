@@ -144,6 +144,11 @@ export interface DatasetConfig {
   caption_ext: string;
   caption_dropout_rate: number;
   caption_dropout_rate_t2v?: number;
+  // Per-dataset conditioning dropout rates (override the global TrainConfig rates when set)
+  text_dropout_rate?: number | null;
+  text_dropout_rate_negative?: number | null;
+  image_dropout_rate?: number | null;
+  image_dropout_rate_negative?: number | null;
   shuffle_tokens?: boolean;
   is_reg: boolean;
   network_weight: number;
@@ -320,6 +325,27 @@ export interface TrainConfig {
   mse_spectral_flow_gradient_projection_enabled?: boolean;
   do_differential_guidance?: boolean;
   differential_guidance_scale?: number;
+  // Training-time CFG (guidance distillation)
+  do_cfg?: boolean;
+  cfg_scale?: number;
+  cfg_rescale?: number;
+  do_random_cfg?: boolean;
+  max_cfg_scale?: number;
+  // Use the same prompt for both CFG branches (drops image conditioning on the
+  // unconditional half for image-conditioned models like Wan I2V)
+  cfg_same_prompt?: boolean;
+  // Conditioning dropout (text + image), positive & negative branches (global rates).
+  // Per-dataset values (DatasetConfig) override these when set. All in [0, 1].
+  text_dropout_rate?: number | null;
+  text_dropout_rate_negative?: number | null;
+  image_dropout_rate?: number | null;
+  image_dropout_rate_negative?: number | null;
+  // Force the negative branch to share the positive branch's drop state per step
+  sync_text_dropout?: boolean;
+  sync_image_dropout?: boolean;
+  // Invert the synced relationship (positive dropped => negative NOT dropped)
+  invert_text_dropout?: boolean;
+  invert_image_dropout?: boolean;
   audio_loss_multiplier?: number;
   max_loss?: number | null;
   // Per-timestep range loss weight overrides

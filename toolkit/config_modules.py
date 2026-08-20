@@ -909,14 +909,17 @@ class TrainConfig:
         # see https://huggingface.co/docs/diffusers/main/optimization/attention_backends#available-backends for options
         # Values used by the Wan 2.x toolkit attention path:
         #   native (default) = auto: flex_attention when softcapping is enabled, else SDPA
-        #   flex = torch flex_attention (required for tanh softcapping)
+        #   flex = torch flex_attention (applies tanh softcapping via a score_mod)
         #   sdpa = PyTorch scaled_dot_product_attention (auto flash/mem-efficient kernels)
-        #   flash = flash-attn v2 package (requires `pip install flash-attn`, fp16/bf16)
+        #   flash = flash-attn v2 package (requires `pip install flash-attn`, fp16/bf16;
+        #           applies tanh softcapping natively in-kernel, 2.8.3+)
         # NOTE: for Wan 2.x the transformer's custom attention processor honors this
         # setting directly; for other models it is forwarded to diffusers
         # set_attention_backend() on the VAE/text encoder where available.
-        # NOTE: when attention_tanh_softcap_enabled is true, training attention
-        # always uses flex_attention regardless of this setting.
+        # NOTE: when attention_tanh_softcap_enabled is true, the cap is applied by the
+        # selected kernel - flash natively (2.8.3+), or flex via score_mod for
+        # native/sdpa/flex (SDPA itself has no score hook). fp32 layers skip the
+        # cap under flash. See toolkit/models/wan21/wan_attn.py.
         self.attention_backend: str = kwargs.get('attention_backend', 'native')  # native, flash, _flash_3_hub, _flash_3, 
         self.train_unet = kwargs.get('train_unet', True)
         self.train_text_encoder = kwargs.get('train_text_encoder', False)
@@ -1063,11 +1066,50 @@ class TrainConfig:
         self.dynamic_noise_offset = kwargs.get('dynamic_noise_offset', False)
         self.do_cfg = kwargs.get('do_cfg', False)
         self.do_random_cfg = kwargs.get('do_random_cfg', False)
+        # when True, the unconditional (negative) side of training-time CFG uses the
+        # same prompt as the conditional (positive) side instead of the negative prompt
+        self.cfg_same_prompt = kwargs.get('cfg_same_prompt', False)
         self.cfg_scale = kwargs.get('cfg_scale', 1.0)
         self.max_cfg_scale = kwargs.get('max_cfg_scale', self.cfg_scale)
         self.cfg_rescale = kwargs.get('cfg_rescale', None)
         if self.cfg_rescale is None:
             self.cfg_rescale = self.cfg_scale
+
+        # ------------------------------------------------------------------
+        # Conditioning dropout (text + image), positive & negative branches.
+        #
+        # These are GLOBAL rates. A per-dataset value (DatasetConfig) overrides
+        # the global value when it is set (not None). All rates are in [0, 1] and
+        # are applied independently per training item, per step.
+        #
+        #   * text_dropout_rate(_negative)     -> drop the prompt (-> blank) for the
+        #                                          positive / negative text branch.
+        #   * image_dropout_rate(_negative)    -> drop the I2V first-frame image
+        #                                          conditioning for the positive / negative
+        #                                          image branch (makes the item T2V).
+        #
+        # The negative branch only exists when CFG is active (do_cfg / do_random_cfg).
+        # Without CFG only the positive rates apply.
+        # ------------------------------------------------------------------
+        # Positive-branch text drop rate (global). None = use per-dataset then legacy prompt_dropout_prob.
+        self.text_dropout_rate: Optional[float] = kwargs.get('text_dropout_rate', None)
+        # Negative-branch text drop rate (global). Only used when CFG is active.
+        self.text_dropout_rate_negative: Optional[float] = kwargs.get('text_dropout_rate_negative', None)
+        # Positive-branch image (I2V first frame) drop rate (global).
+        self.image_dropout_rate: Optional[float] = kwargs.get('image_dropout_rate', None)
+        # Negative-branch image drop rate (global). Only used when CFG is active.
+        # When cfg_same_prompt is on and this is None, it defaults to 1.0 (always drop,
+        # preserving the original cfg_same_prompt behavior of a fully-unconditional image side).
+        self.image_dropout_rate_negative: Optional[float] = kwargs.get('image_dropout_rate_negative', None)
+
+        # Force the negative branch to share the SAME drop STATE as the positive branch
+        # for the same item/step (positive dropped  =>  negative dropped).
+        self.sync_text_dropout: bool = kwargs.get('sync_text_dropout', False)
+        self.sync_image_dropout: bool = kwargs.get('sync_image_dropout', False)
+        # Invert the synced relationship: positive dropped  =>  negative NOT dropped
+        # (only meaningful when the corresponding sync_* toggle is on).
+        self.invert_text_dropout: bool = kwargs.get('invert_text_dropout', False)
+        self.invert_image_dropout: bool = kwargs.get('invert_image_dropout', False)
 
         # applies the inverse of the prediction mean and std to the target to correct
         # for norm drift
@@ -1644,6 +1686,15 @@ class DatasetConfig:
         self.shuffle_tokens: bool = kwargs.get('shuffle_tokens', False)
         self.caption_dropout_rate: float = float(kwargs.get('caption_dropout_rate', 0.0))
         self.caption_dropout_rate_t2v: float = float(kwargs.get('caption_dropout_rate_t2v', 0.0))
+        # Per-dataset conditioning dropout rates. When set (not None) these OVERRIDE the
+        # corresponding global TrainConfig rate for items in this dataset. When None the
+        # global rate is used (falling back to caption_dropout_rate for text).
+        #   text_dropout_rate(_negative)   -> prompt (-> blank) drop rate
+        #   image_dropout_rate(_negative)  -> I2V first-frame image drop rate (-> T2V)
+        self.text_dropout_rate: Optional[float] = kwargs.get('text_dropout_rate', None)
+        self.text_dropout_rate_negative: Optional[float] = kwargs.get('text_dropout_rate_negative', None)
+        self.image_dropout_rate: Optional[float] = kwargs.get('image_dropout_rate', None)
+        self.image_dropout_rate_negative: Optional[float] = kwargs.get('image_dropout_rate_negative', None)
         self.keep_tokens: int = kwargs.get('keep_tokens', 0)  # #of first tokens to always keep unless caption dropped
         self.flip_x: bool = kwargs.get('flip_x', False)
         self.flip_y: bool = kwargs.get('flip_y', False)

@@ -21,7 +21,8 @@ _attention_config = {
     #   'auto'  = flex_attention when training with softcap, otherwise SDPA (legacy default)
     #   'flex'  = torch flex_attention (the only kernel that can apply tanh softcapping)
     #   'sdpa'  = F.scaled_dot_product_attention (PyTorch picks flash/mem-efficient kernel)
-    #   'flash' = flash-attn v2 package (fp16/bf16, no arbitrary attention masks)
+    #   'flash' = flash-attn v2 package (fp16/bf16, no arbitrary attention masks;
+    #             native tanh softcapping via flash_attn 2.8.3+)
     # 'train_backend' applies during training steps, 'sample_backend' during sampling.
     'train_backend': 'auto',
     'sample_backend': 'auto',
@@ -57,9 +58,15 @@ def set_attention_backend_choice(train_backend: str = 'auto', sample_backend: st
         sample_backend: same options, applied while generating samples
 
     NOTE: when tanh softcapping is enabled for a mode (training and/or
-    sampling, see set_attention_softcapping) it REQUIRES flex_attention (it is
-    implemented as a flex_attention score_mod), so an enabled softcap overrides
-    the backend of that mode to 'flex'.
+    sampling, see set_attention_softcapping) the cap is applied by whichever
+    kernel can do it:
+      - 'flash' applies it natively in-kernel (flash_attn 2.8.3+) and keeps its
+        backend; it only defers to 'flex' if that flash_attn build predates
+        native softcapping.
+      - 'auto'/'sdpa' have no score hook, so an enabled softcap resolves them
+        to 'flex' (the cap is implemented as a flex_attention score_mod).
+    Softcapping is skipped (with a one-time warning) for fp32 layers under
+    'flash', since flash_attn only accepts fp16/bf16.
     """
     _attention_config['train_backend'] = _normalize_backend(train_backend)
     _attention_config['sample_backend'] = _normalize_backend(sample_backend)
@@ -72,7 +79,7 @@ def set_sampling_mode(enabled: bool):
 
 def get_effective_backend(in_sampling: Optional[bool] = None) -> str:
     """
-    Resolve the kernel that will actually be used (after softcap override).
+    Resolve the kernel that will actually be used (after softcap resolution).
     Used for logging the effective configuration at setup time.
     """
     if in_sampling is None:
@@ -81,6 +88,14 @@ def get_effective_backend(in_sampling: Optional[bool] = None) -> str:
     softcap_on = (_attention_config['softcap_sample_enabled'] if in_sampling
                   else _attention_config['softcap_enabled'])
     if softcap_on:
+        if backend == 'flash':
+            # flash applies the cap natively (2.8.3+); it only defers to flex
+            # when this flash_attn build predates native softcapping.
+            if _flash_softcap_supported():
+                return 'flash (softcap active)'
+            return 'flex (softcap active)' if _flex_attention_available() \
+                else 'flash (softcap skipped)'
+        # auto/sdpa/flex all resolve to flex when softcap is on
         return 'flex (softcap active)'
     if backend == 'auto':
         return 'sdpa'
@@ -99,32 +114,93 @@ def _warn_once(key: str, message: str):
     warnings.warn(message, RuntimeWarning, stacklevel=2)
 
 
+def check_flash_softcap_support() -> bool:
+    """
+    True if the installed flash_attn package supports native tanh softcapping
+    (flash_attn_func gained the `softcap` argument in 2.8.3).
+    """
+    try:
+        import inspect
+        from flash_attn import flash_attn_func
+        return 'softcap' in inspect.signature(flash_attn_func).parameters
+    except Exception:
+        return False
+
+
 def _apply_flash_attention(query, key, value, dropout_p: float = 0.0,
-                           is_causal: bool = False, attn_mask: Optional[torch.Tensor] = None):
+                           is_causal: bool = False, attn_mask: Optional[torch.Tensor] = None,
+                           softcap: float = 0.0):
     """
     flash-attn v2 kernel (flash_attn.flash_attn_func).
 
     Expects (B, H, L, D) layout; flash_attn uses (B, L, H, D) internally.
     Falls back to SDPA (with a one-time warning) when the request is not
     expressible with flash_attn (arbitrary masks, unsupported dtype).
+
+    softcap > 0 enables flash_attn's native tanh softcapping:
+        softcap * tanh(QK^T * softmax_scale / softcap)
+    with softmax_scale defaulting to 1/sqrt(head_dim) - the identical
+    Gemma2/Grok-1 semantics used by the flex_attention score_mod path. The
+    cap is applied to the fp32 score accumulator inside the kernel (fwd+bwd).
+    It is only available for fp16/bf16; for other dtypes (e.g. fp32 layers) or
+    when an arbitrary mask is present we fall back to SDPA and softcapping is
+    skipped (with a one-time warning).
     """
     if attn_mask is not None:
-        _warn_once('flash_mask',
-                   "flash attention backend does not support attention masks; "
-                   "using SDPA for masked attention.")
+        if softcap > 0:
+            _warn_once('flash_mask_softcap',
+                       "flash attention softcapping cannot be combined with an "
+                       "attention mask; skipping softcapping and using SDPA.")
+        else:
+            _warn_once('flash_mask',
+                       "flash attention backend does not support attention masks; "
+                       "using SDPA for masked attention.")
         return F.scaled_dot_product_attention(query, key, value,
                                               attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
     if query.dtype not in (torch.float16, torch.bfloat16):
-        _warn_once('flash_dtype',
-                   f"flash attention backend requires fp16/bf16 (got {query.dtype}); using SDPA.")
+        if softcap > 0:
+            _warn_once('flash_softcap_dtype',
+                       f"flash attention softcapping requires fp16/bf16 (got {query.dtype}); "
+                       "skipping softcapping for this layer and using SDPA.")
+        else:
+            _warn_once('flash_dtype',
+                       f"flash attention backend requires fp16/bf16 (got {query.dtype}); using SDPA.")
         return F.scaled_dot_product_attention(query, key, value,
                                               attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
     from flash_attn import flash_attn_func
     q = query.transpose(1, 2)
     k = key.transpose(1, 2)
     v = value.transpose(1, 2)
-    out = flash_attn_func(q, k, v, dropout_p=dropout_p, causal=is_causal)
+    # Native softcap (2.8.3+). 0.0 = deactivated -> identical to pre-softcap behavior.
+    sc = float(softcap) if softcap and softcap > 0 else 0.0
+    out = flash_attn_func(q, k, v, dropout_p=dropout_p, causal=is_causal, softcap=sc)
     return out.transpose(1, 2)
+
+
+# Lazily-cached capability flags (None = unknown). Importing/inspecting the
+# kernels on every attention call would be wasteful, so we probe once and cache.
+_flash_softcap_support = None
+_flex_available = None
+
+
+def _flash_softcap_supported() -> bool:
+    """Cached: can the installed flash_attn apply native softcapping?"""
+    global _flash_softcap_support
+    if _flash_softcap_support is None:
+        _flash_softcap_support = check_flash_softcap_support()
+    return _flash_softcap_support
+
+
+def _flex_attention_available() -> bool:
+    """Cached: is torch.nn.attention.flex_attention importable (PyTorch 2.5+)?"""
+    global _flex_available
+    if _flex_available is None:
+        try:
+            from torch.nn.attention.flex_attention import flex_attention  # noqa: F401
+            _flex_available = True
+        except Exception:
+            _flex_available = False
+    return _flex_available
 
 
 def _compiler_disable(fn):
@@ -844,15 +920,17 @@ def _apply_attention_with_softcap(
     """
     Apply attention with the configured backend and optional tanh softcapping.
 
-    Backend resolution (softcap wins):
+    Backend resolution (softcap-aware):
       - 'auto'  → flex_attention when softcap is enabled for the current mode
-                  (training or sampling), else SDPA
-      - 'flex'  → flex_attention (with score_mod softcapping when enabled)
-      - 'sdpa'  → F.scaled_dot_product_attention
-      - 'flash' → flash-attn v2 package (falls back to SDPA for masks/other dtypes)
-      - softcapping ENABLED for the current mode always overrides the backend
-        to 'flex' (it is implemented as a flex_attention score_mod).
-        Training and sampling have independent softcap toggles.
+                  (training or sampling), else SDPA (legacy default)
+      - 'flex'  → flex_attention (score_mod softcapping when enabled)
+      - 'sdpa'  → F.scaled_dot_product_attention; if softcap is enabled it is
+                  forced to 'flex' (SDPA has no score hook)
+      - 'flash' → flash-attn v2 package. When softcap is enabled it applies the
+                  cap NATIVELY in-kernel (flash_attn 2.8.3+) and is NOT
+                  overridden to 'flex'. Falls back to SDPA (softcap skipped)
+                  for masks / non-fp16-bf16 dtypes such as fp32 layers.
+      Training and sampling have independent softcap toggles.
 
     Uses flex_attention's proper architecture:
     - BlockMask for structural masking (padding, causal) - allows skipping masked blocks
@@ -883,14 +961,32 @@ def _apply_attention_with_softcap(
         backend = 'auto'
 
     # Tanh softcapping is configured independently per mode (training and
-    # sampling) and is only possible with flex_attention (score_mod). When
-    # enabled for the current mode it overrides the selected backend.
+    # sampling). It is applied by whichever kernel can do it:
+    #   - flex_attention via a score_mod (auto/sdpa/flex)
+    #   - flash_attn natively in-kernel (2.8.3+, flash backend)
+    # 'auto'/'sdpa' have no score hook of their own, so when softcap is on they
+    # resolve to 'flex'. 'flash' keeps its backend and applies the cap natively.
     apply_softcap = (_attention_config['softcap_sample_enabled'] if in_sampling
                      else _attention_config['softcap_enabled'])
     if backend == 'auto':
         backend = 'flex' if apply_softcap else 'sdpa'
-    if apply_softcap and backend != 'flex':
+    elif backend == 'sdpa' and apply_softcap:
         backend = 'flex'
+    # NOTE: 'flash' is intentionally NOT overridden to 'flex' here - it applies
+    # softcapping natively (see the backend == 'flash' branch below).
+    # The one exception: if this flash_attn build predates native softcapping
+    # (pre-2.8.3) and flex_attention is available, defer to flex so the cap is
+    # preserved instead of being silently dropped.
+    if backend == 'flash' and apply_softcap and not _flash_softcap_supported():
+        if _flex_attention_available():
+            _warn_once('flash_softcap_unsupported',
+                       "flash_attn does not support native softcapping (needs >= 2.8.3); "
+                       "using flex_attention to apply the cap.")
+            backend = 'flex'
+        else:
+            _warn_once('flash_softcap_unsupported_noflex',
+                       "flash_attn lacks native softcapping and flex_attention is "
+                       "unavailable; softcapping will be skipped (plain flash).")
 
     if backend == 'flex':
         try:
@@ -1013,10 +1109,18 @@ def _apply_attention_with_softcap(
 
     if backend == 'flash':
         try:
-            return _apply_flash_attention(
+            out = _apply_flash_attention(
                 query, key, value,
                 dropout_p=dropout_p, is_causal=is_causal, attn_mask=attn_mask,
+                softcap=soft_cap if apply_softcap else 0.0,
             )
+            # Periodic softcap stats (compiler-disabled; no-op on most steps).
+            # flash_attn does not return LSE here, so lse=None (the sharpness
+            # stat is skipped, but score-range/pct_capped sampling still works).
+            if apply_softcap:
+                _maybe_collect_softcap_stats(query, key, None, soft_cap, attn_type,
+                                             query.shape[2])
+            return out
         except Exception as e:
             _warn_once('flash_failed',
                        f"flash attention backend failed ({type(e).__name__}: {e}); "

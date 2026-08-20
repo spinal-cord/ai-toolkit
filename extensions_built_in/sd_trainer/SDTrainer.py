@@ -635,7 +635,8 @@ class SDTrainer(BaseSDTrainProcess):
             from toolkit.models.wan21.wan_attn import (
                 set_attention_softcapping, set_attention_f32_rope, configure_softcap_logging,
                 enable_gelu_acceleration, is_gelu_acceleration_enabled, update_softcap_step,
-                set_attention_backend_choice, get_effective_backend
+                set_attention_backend_choice, get_effective_backend,
+                check_flash_softcap_support
             )
             from toolkit.util.attention_softcapping import check_flex_attention_support
 
@@ -662,13 +663,40 @@ class SDTrainer(BaseSDTrainProcess):
             sample_softcap_enabled = getattr(
                 getattr(self, 'sample_config', None), 'attention_tanh_softcap_enabled', False)
 
+            # Attention backend selection (separate for training and sampling).
+            # train.attention_backend / sample.attention_backend:
+            #   native (default) | flex | sdpa | flash
+            # Read BEFORE the softcap gate so we can decide, per mode, whether the
+            # selected kernel can actually apply softcapping (flex via score_mod,
+            # or flash natively in 2.8.3+).
+            train_backend = getattr(self.train_config, 'attention_backend', 'native')
+            sample_backend = getattr(getattr(self, 'sample_config', None), 'attention_backend', 'native')
+            train_backend_lc = str(train_backend).lower()
+            sample_backend_lc = str(sample_backend).lower()
+
             if softcap_enabled or sample_softcap_enabled:
-                support = check_flex_attention_support()
-                if support.get('available', False):
+                # Probe kernel capabilities once (cheap; cached at the call sites too).
+                flex_ok = check_flex_attention_support().get('available', False)
+                flash_ok = check_flash_softcap_support()
+
+                def _mode_softcap_ok(enabled, backend_lc):
+                    # A mode can apply softcap if its selected kernel can do it:
+                    #   flash          -> natively (2.8.3+) or defer to flex
+                    #   auto/sdpa/flex -> flex score_mod
+                    if not enabled:
+                        return True
+                    if backend_lc == 'flash':
+                        return flash_ok or flex_ok
+                    return flex_ok
+
+                train_softcap_ok = _mode_softcap_ok(softcap_enabled, train_backend_lc)
+                sample_softcap_ok = _mode_softcap_ok(sample_softcap_enabled, sample_backend_lc)
+
+                if train_softcap_ok or sample_softcap_ok:
                     set_attention_softcapping(
-                        enabled=softcap_enabled,
+                        enabled=train_softcap_ok,
                         soft_cap=soft_cap,
-                        sample_enabled=sample_softcap_enabled,
+                        sample_enabled=sample_softcap_ok,
                         soft_cap_self_attn=soft_cap_self,
                         soft_cap_cross_attn=soft_cap_cross,
                         soft_cap_high_noise=soft_cap_high,
@@ -680,12 +708,18 @@ class SDTrainer(BaseSDTrainProcess):
                     )
                     # Enable logging - sample every 10 training steps (not attention ops)
                     configure_softcap_logging(enabled=True, sample_every_n_steps=10)
-                    print_acc(f"Attention tanh softcapping -> training: {'ON' if softcap_enabled else 'off'}, "
-                              f"sampling: {'ON' if sample_softcap_enabled else 'off'}. "
-                              f"PyTorch {support.get('torch_version')}, flex_attention available.")
-                    print_acc(f"Softcapping requires flex_attention, so it overrides the attention "
-                              f"backend of any mode where it is enabled.")
-                    
+                    print_acc(f"Attention tanh softcapping -> training: {'ON' if train_softcap_ok else 'off'}, "
+                              f"sampling: {'ON' if sample_softcap_ok else 'off'}. "
+                              f"flex_attention available: {flex_ok}, flash native softcap: {flash_ok}.")
+                    print_acc("Softcapping is applied by the selected kernel: flash natively (2.8.3+) "
+                              "or flex via score_mod (auto/sdpa/flex). fp32 layers skip it under flash.")
+                    if softcap_enabled and not train_softcap_ok:
+                        print_acc(f"  NOTE: training softcapping disabled - train backend '{train_backend}' "
+                                  f"cannot apply it (flex unavailable and flash lacks native softcap).")
+                    if sample_softcap_enabled and not sample_softcap_ok:
+                        print_acc(f"  NOTE: sampling softcapping disabled - sample backend '{sample_backend}' "
+                                  f"cannot apply it (flex unavailable and flash lacks native softcap).")
+
                     # Print active softcap configuration summary
                     has_overrides = any(v is not None for v in [
                         soft_cap_self, soft_cap_cross, soft_cap_high, soft_cap_low,
@@ -706,9 +740,9 @@ class SDTrainer(BaseSDTrainProcess):
                     print_acc(f"Softcapping stats logging enabled - will log per-type per-expert statistics every 10 steps. "
                               f"(Works with torch.compile enabled; sampled via a graph break.)")
                 else:
-                    print_acc("Attention tanh softcapping requested but flex_attention not available. "
-                              f"Using standard attention. (Requires PyTorch 2.5+) "
-                              f"Support check: {support}")
+                    print_acc("Attention tanh softcapping requested but no selected attention backend "
+                              "can apply it (flex_attention unavailable and flash_attn lacks native "
+                              "softcapping). Using standard attention.")
                     set_attention_softcapping(enabled=False, sample_enabled=False)
                     configure_softcap_logging(enabled=False)
             else:
@@ -716,11 +750,6 @@ class SDTrainer(BaseSDTrainProcess):
                 configure_softcap_logging(enabled=False)
                 print_acc("Attention tanh softcapping disabled.")
 
-            # Attention backend selection (separate for training and sampling)
-            # train.attention_backend / sample.attention_backend:
-            #   native (default) | flex | sdpa | flash
-            train_backend = getattr(self.train_config, 'attention_backend', 'native')
-            sample_backend = getattr(getattr(self, 'sample_config', None), 'attention_backend', 'native')
             try:
                 set_attention_backend_choice(train_backend=train_backend, sample_backend=sample_backend)
             except ValueError as e:
@@ -2882,6 +2911,15 @@ class SDTrainer(BaseSDTrainProcess):
         guidance_embedding_scale = self.train_config.cfg_scale
         if self.train_config.do_guidance_loss:
             guidance_embedding_scale = self._guidance_loss_target_batch
+        # Pass per-item image-conditioning masks (from the conditioning-dropout config)
+        # to models that support them (e.g. Wan I2V). The masks encode which items keep /
+        # drop the first-frame image on the positive and (when CFG is active) negative
+        # branch. Models without support ignore the extra kwargs.
+        if getattr(self, '_cur_image_cond_mask_pos', None) is not None:
+            kwargs = dict(kwargs)
+            kwargs['image_cond_mask_pos'] = self._cur_image_cond_mask_pos
+            if getattr(self, '_cur_image_cond_mask_neg', None) is not None:
+                kwargs['image_cond_mask_neg'] = self._cur_image_cond_mask_neg
         return self.sd.predict_noise(
             latents=noisy_latents.to(self.device_torch, dtype=dtype),
             conditional_embeddings=conditional_embeds.to(self.device_torch, dtype=dtype),
@@ -2896,34 +2934,29 @@ class SDTrainer(BaseSDTrainProcess):
             **kwargs
         )
 
-    def _apply_caption_dropout(
-        self,
-        embeds: PromptEmbeds,
-        dropout_rate: float,
-        is_i2v_modes: List[bool] = None,
-        dropout_rate_t2v: float = 0.0,
+    def _apply_text_dropout_mask(
+            self,
+            embeds: PromptEmbeds,
+            drop_mask,
     ) -> PromptEmbeds:
-        """Randomly replace some samples' cached embeddings with blank embeddings.
+        """Replace the prompt embeddings of dropped samples with blank embeddings.
 
-        This applies caption dropout at training time when using cached text
-        embeddings, since the text encoder is unloaded and cannot re-encode
-        dropped captions on the fly.
-        
-        For mixed I2V/T2V batches, use is_i2v_modes to determine which dropout rate
-        to apply to each sample. By default, T2V mode uses dropout_rate_t2v (0.0)
-        while I2V mode uses dropout_rate.
+        Args:
+            embeds: the PromptEmbeds to modify in place (and return).
+            drop_mask: per-sample boolean mask (list/tuple of bool, or a torch bool
+                tensor) with length == batch size. True => drop (replace with blank).
         """
+        if embeds is None:
+            return embeds
         batch_size = embeds.text_embeds.shape[0]
-        
-        # Determine effective dropout rate per sample
-        if is_i2v_modes is not None and len(is_i2v_modes) == batch_size:
-            # Per-sample dropout based on I2V/T2V mode
-            rates = [dropout_rate if m else dropout_rate_t2v for m in is_i2v_modes]
-            drop_mask = torch.rand(batch_size, device=self.device_torch) < torch.tensor(rates, device=self.device_torch)
+        if isinstance(drop_mask, (list, tuple)):
+            drop_mask_t = torch.tensor(list(drop_mask), device=self.device_torch)
         else:
-            drop_mask = torch.rand(batch_size, device=self.device_torch) < dropout_rate
-        
-        if not drop_mask.any():
+            drop_mask_t = drop_mask.to(self.device_torch).bool()
+        if drop_mask_t.shape[0] != batch_size:
+            # mask does not line up with the embeds (exotic batching) -> leave as-is
+            return embeds
+        if not drop_mask_t.any():
             return embeds
 
         blank = self.cached_blank_embeds.to(
@@ -2940,7 +2973,7 @@ class SDTrainer(BaseSDTrainProcess):
             blank_text = blank_text[:target_seq_len, :]
 
         # Replace dropped samples with blank embeddings
-        drop_indices = drop_mask.nonzero(as_tuple=True)[0]
+        drop_indices = drop_mask_t.nonzero(as_tuple=True)[0]
         num_dropped = len(drop_indices)
         embeds.text_embeds[drop_indices] = blank_text.unsqueeze(0).expand(num_dropped, -1, -1)
 
@@ -2960,6 +2993,173 @@ class SDTrainer(BaseSDTrainProcess):
                 embeds.attention_mask[drop_indices] = 0
 
         return embeds
+
+    def _apply_caption_dropout(
+            self,
+            embeds: PromptEmbeds,
+            dropout_rate: float,
+            is_i2v_modes: List[bool] = None,
+            dropout_rate_t2v: float = 0.0,
+    ) -> PromptEmbeds:
+        """Randomly replace some samples' cached embeddings with blank embeddings.
+
+        Legacy helper kept for compatibility. New code uses
+        ``_apply_conditioning_dropout`` which unifies text + image, positive +
+        negative, sync/invert, global + per-dataset rates.
+        """
+        batch_size = embeds.text_embeds.shape[0]
+        if is_i2v_modes is not None and len(is_i2v_modes) == batch_size:
+            rates = [dropout_rate if m else dropout_rate_t2v for m in is_i2v_modes]
+            drop_mask = torch.rand(batch_size, device=self.device_torch) < torch.tensor(rates, device=self.device_torch)
+        else:
+            drop_mask = torch.rand(batch_size, device=self.device_torch) < dropout_rate
+        return self._apply_text_dropout_mask(embeds, drop_mask)
+
+    def _resolve_conditioning_dropout_rates(self, dataset_configs: List, is_i2v_modes: List[bool]):
+        """Resolve the effective per-item conditioning dropout rates.
+
+        Precedence per item (using that item's dataset config):
+            per-dataset value (if not None)  >  global value (if not None)  >  fallback
+
+        Returns (pos_text, neg_text, pos_img, neg_img) as lists of floats (len == items).
+        """
+        tc = self.train_config
+        n = len(dataset_configs)
+        pos_text, neg_text, pos_img, neg_img = [], [], [], []
+        for i in range(n):
+            ds = dataset_configs[i] if i < len(dataset_configs) and dataset_configs[i] is not None else None
+
+            # --- positive text ---
+            rate = getattr(ds, 'text_dropout_rate', None) if ds is not None else None
+            if rate is None:
+                rate = tc.text_dropout_rate
+            if rate is None:
+                ds_legacy = getattr(ds, 'caption_dropout_rate', 0.0) if ds is not None else 0.0
+                # honor either legacy source so existing configs keep working
+                rate = max(float(ds_legacy), float(tc.prompt_dropout_prob))
+            pos_text.append(float(rate))
+
+            # --- negative text (only meaningful when CFG is active) ---
+            rate = getattr(ds, 'text_dropout_rate_negative', None) if ds is not None else None
+            if rate is None:
+                rate = tc.text_dropout_rate_negative
+            neg_text.append(0.0 if rate is None else float(rate))
+
+            # --- positive image (I2V first frame) ---
+            rate = getattr(ds, 'image_dropout_rate', None) if ds is not None else None
+            if rate is None:
+                rate = tc.image_dropout_rate
+            pos_img.append(0.0 if rate is None else float(rate))
+
+            # --- negative image (only meaningful when CFG is active) ---
+            rate = getattr(ds, 'image_dropout_rate_negative', None) if ds is not None else None
+            if rate is None:
+                rate = tc.image_dropout_rate_negative
+            if rate is None:
+                # cfg_same_prompt historically drops the image on the uncond side
+                rate = 1.0 if tc.cfg_same_prompt else 0.0
+            neg_img.append(float(rate))
+
+        return pos_text, neg_text, pos_img, neg_img
+
+    def _resolve_branch_drop(self, pos_drop: List[bool], neg_rates: List[float], sync: bool, invert: bool):
+        """Resolve the negative-branch drop state from the positive state.
+
+        sync=True  => negative mirrors the positive state (optionally inverted).
+        sync=False => negative uses its own independent per-item rate.
+        """
+        if sync:
+            state = [bool(p) for p in pos_drop]
+            if invert:
+                state = [not s for s in state]
+            return state
+        return [random.random() < r for r in neg_rates]
+
+    def _apply_conditioning_dropout(
+            self,
+            batch,
+            conditional_embeds: PromptEmbeds,
+            unconditional_embeds: PromptEmbeds,
+            item_index: int = 0,
+    ):
+        """Apply the configured text + image conditioning dropout for one step.
+
+        Computes per-item drop states for the positive and (when CFG is active) the
+        negative branch, applies the text dropout to the prompt embeddings, and
+        returns the image-conditioning masks to hand to the model.
+
+        Returns:
+            (conditional_embeds, unconditional_embeds, pos_image_mask, neg_image_mask)
+            where the image masks are lists of bool (True => apply image conditioning).
+        """
+        tc = self.train_config
+        do_cfg = bool(tc.do_cfg)
+        bs = conditional_embeds.text_embeds.shape[0] if conditional_embeds is not None else 0
+
+        # Per-item dataset configs + i2v flags for the current (possibly chunked) batch.
+        file_items = batch.file_items
+        if tc.single_item_batching and len(file_items) > bs:
+            ds_configs = [file_items[item_index].dataset_config]
+            is_i2v = [file_items[item_index].is_i2v_mode]
+        else:
+            ds_configs = [fi.dataset_config for fi in file_items]
+            is_i2v = [fi.is_i2v_mode for fi in file_items]
+        if len(ds_configs) != bs:
+            # cannot align per-item configs -> fall back to no dropout (keep image on i2v)
+            fallback = [bool(m) for m in is_i2v] if len(is_i2v) == bs else [True] * bs
+            return conditional_embeds, unconditional_embeds, fallback, fallback
+
+        pos_text_rates, neg_text_rates, pos_img_rates, neg_img_rates = \
+            self._resolve_conditioning_dropout_rates(ds_configs, is_i2v)
+
+        # --- positive drop states ---
+        pos_text_drop = [random.random() < r for r in pos_text_rates]
+        pos_img_drop = [random.random() < r for r in pos_img_rates]
+
+        # --- negative drop states (only when CFG is active) ---
+        neg_img_drop = None
+        if do_cfg:
+            neg_img_drop = self._resolve_branch_drop(
+                pos_img_drop, neg_img_rates, tc.sync_image_dropout, tc.invert_image_dropout)
+
+        # The cfg_same_prompt negative branch must share the EXACT same prompt (and
+        # dropout state) as the positive. The encode block's negative clone predates
+        # the positive text dropout, so we rebuild it afterwards (see below). When the
+        # invert toggle is on we need the non-dropped base, so keep a copy of it.
+        base_embeds = None
+        if do_cfg and tc.cfg_same_prompt and tc.invert_text_dropout:
+            base_embeds = conditional_embeds.clone()
+
+        # --- apply positive text dropout ---
+        conditional_embeds = self._apply_text_dropout_mask(conditional_embeds, pos_text_drop)
+
+        # --- apply negative branch text dropout ---
+        if do_cfg:
+            if tc.cfg_same_prompt:
+                if tc.invert_text_dropout:
+                    # inverted: negative uses the OPPOSITE dropout state (positive
+                    # dropped => negative keeps its prompt, and vice versa). Start
+                    # from the non-dropped base and drop the inverted set.
+                    unconditional_embeds = base_embeds.clone()
+                    unconditional_embeds = self._apply_text_dropout_mask(
+                        unconditional_embeds, [not d for d in pos_text_drop])
+                elif unconditional_embeds is None or any(pos_text_drop):
+                    # same state as positive: refresh the negative clone so dropped
+                    # prompts are dropped on BOTH branches (keeps "same prompt" intact)
+                    unconditional_embeds = conditional_embeds.clone()
+                # else: the encode block's clone is already identical to positive
+            elif unconditional_embeds is not None:
+                neg_text_drop = self._resolve_branch_drop(
+                    pos_text_drop, neg_text_rates, tc.sync_text_dropout, tc.invert_text_dropout)
+                unconditional_embeds = self._apply_text_dropout_mask(unconditional_embeds, neg_text_drop)
+
+        # --- image conditioning masks (True => keep the image) ---
+        pos_image_mask = [bool(i2v) and (not d) for i2v, d in zip(is_i2v, pos_img_drop)]
+        neg_image_mask = None
+        if do_cfg:
+            neg_image_mask = [bool(i2v) and (not d) for i2v, d in zip(is_i2v, neg_img_drop)]
+
+        return conditional_embeds, unconditional_embeds, pos_image_mask, neg_image_mask
 
     def train_single_accumulation(self, batch: DataLoaderBatchDTO):
         # Update softcap step counter BEFORE forward pass so logging checks
@@ -2998,7 +3198,7 @@ class SDTrainer(BaseSDTrainProcess):
                     self.sd.text_encoder.to(self.sd.te_torch_dtype)
 
             noisy_latents, noise, timesteps, conditioned_prompts, imgs = self.process_general_training_batch(batch)
-            if self.train_config.do_cfg or self.train_config.do_random_cfg:
+            if (self.train_config.do_cfg or self.train_config.do_random_cfg) and not self.train_config.cfg_same_prompt:
                 # pick random negative prompts
                 if self.negative_prompt_pool is not None:
                     negative_prompts = []
@@ -3208,7 +3408,7 @@ class SDTrainer(BaseSDTrainProcess):
             else:
                 prompt_2_list = [prompts_2]
 
-        for noisy_latents, noise, timesteps, conditioned_prompts, imgs, adapter_images, clip_images, mask_multiplier, prompt_2 in zip(
+        for batch_idx, (noisy_latents, noise, timesteps, conditioned_prompts, imgs, adapter_images, clip_images, mask_multiplier, prompt_2) in enumerate(zip(
                 noisy_latents_list,
                 noise_list,
                 timesteps_list,
@@ -3218,7 +3418,7 @@ class SDTrainer(BaseSDTrainProcess):
                 clip_images_list,
                 mask_multiplier_list,
                 prompt_2_list
-        ):
+        )):
 
             # if self.train_config.negative_prompt is not None:
             #     # add negative prompt
@@ -3273,30 +3473,11 @@ class SDTrainer(BaseSDTrainProcess):
                         with torch.set_grad_enabled(False):
                             if batch.prompt_embeds is not None:
                                 # use the cached embeds (full precision when fp32_front)
+                                # (text conditioning dropout is applied centrally after the
+                                #  encode block via _apply_conditioning_dropout)
                                 conditional_embeds = batch.prompt_embeds.clone().detach().to(
                                     self.device_torch, dtype=embed_dtype
                                 )
-                                # Apply caption dropout to cached embeddings.
-                                # When text embeddings are cached, the text encoder
-                                # is unloaded, so we can't re-encode dropped captions.
-                                # Instead, we randomly replace cached per-image
-                                # embeddings with blank embeddings at training time.
-                                # For mixed I2V/T2V batches, use per-mode dropout rates.
-                                caption_dropout_rate = 0.0
-                                caption_dropout_rate_t2v = 0.0
-                                is_i2v_modes = None
-                                if batch.dataset_config is not None:
-                                    caption_dropout_rate = batch.dataset_config.caption_dropout_rate
-                                    caption_dropout_rate_t2v = batch.dataset_config.caption_dropout_rate_t2v
-                                if hasattr(batch, 'get_is_i2v_mode_list'):
-                                    is_i2v_modes = batch.get_is_i2v_mode_list()
-                                # Apply dropout if either rate is > 0
-                                if (caption_dropout_rate > 0 or caption_dropout_rate_t2v > 0) and self.cached_blank_embeds is not None:
-                                    conditional_embeds = self._apply_caption_dropout(
-                                        conditional_embeds, caption_dropout_rate,
-                                        is_i2v_modes=is_i2v_modes,
-                                        dropout_rate_t2v=caption_dropout_rate_t2v
-                                    )
                             else:
                                 embeds_to_use = self.cached_blank_embeds.clone().detach().to(
                                     self.device_torch, dtype=embed_dtype
@@ -3309,12 +3490,18 @@ class SDTrainer(BaseSDTrainProcess):
                                     [embeds_to_use] * noisy_latents.shape[0]
                                 )
                             if self.train_config.do_cfg:
-                                unconditional_embeds = self.cached_blank_embeds.clone().detach().to(
-                                    self.device_torch, dtype=embed_dtype
-                                )
-                                unconditional_embeds = concat_prompt_embeds(
-                                    [unconditional_embeds] * noisy_latents.shape[0]
-                                )
+                                if self.train_config.cfg_same_prompt:
+                                    # use the same (conditional) prompt embeds for the unconditional side
+                                    unconditional_embeds = conditional_embeds.clone().detach().to(
+                                        self.device_torch, dtype=embed_dtype
+                                    )
+                                else:
+                                    unconditional_embeds = self.cached_blank_embeds.clone().detach().to(
+                                        self.device_torch, dtype=embed_dtype
+                                    )
+                                    unconditional_embeds = concat_prompt_embeds(
+                                        [unconditional_embeds] * noisy_latents.shape[0]
+                                    )
 
                             if isinstance(self.adapter, CustomAdapter):
                                 self.adapter.is_unconditional_run = False
@@ -3325,7 +3512,7 @@ class SDTrainer(BaseSDTrainProcess):
                                 self.adapter.is_unconditional_run = False
                             conditional_embeds = self.sd.encode_prompt(
                                 conditioned_prompts, prompt_2,
-                                dropout_prob=self.train_config.prompt_dropout_prob,
+                                dropout_prob=0.0,
                                 long_prompts=self.do_long_prompts,
                                 **prompt_kwargs
                             ).to(
@@ -3335,16 +3522,24 @@ class SDTrainer(BaseSDTrainProcess):
                             if self.train_config.do_cfg:
                                 if isinstance(self.adapter, CustomAdapter):
                                     self.adapter.is_unconditional_run = True
-                                # todo only do one and repeat it
-                                unconditional_embeds = self.sd.encode_prompt(
-                                    self.batch_negative_prompt,
-                                    self.batch_negative_prompt,
-                                    dropout_prob=self.train_config.prompt_dropout_prob,
-                                    long_prompts=self.do_long_prompts,
-                                    **prompt_kwargs
-                                ).to(
-                                    self.device_torch,
-                                    dtype=dtype)
+                                if self.train_config.cfg_same_prompt:
+                                    # Reuse the conditional embeds so both CFG branches share the exact
+                                    # same text (and the same caption-dropout decision). Re-encoding would
+                                    # re-roll dropout independently per branch and could make the two prompts
+                                    # differ, breaking the "same prompt" invariant.
+                                    unconditional_embeds = conditional_embeds.clone()
+                                else:
+                                    # todo only do one and repeat it
+                                    uncond_prompts = uncond_prompts_2 = self.batch_negative_prompt
+                                    unconditional_embeds = self.sd.encode_prompt(
+                                        uncond_prompts,
+                                        uncond_prompts_2,
+                                        dropout_prob=0.0,
+                                        long_prompts=self.do_long_prompts,
+                                        **prompt_kwargs
+                                    ).to(
+                                        self.device_torch,
+                                        dtype=dtype)
                                 if isinstance(self.adapter, CustomAdapter):
                                     self.adapter.is_unconditional_run = False
                     else:
@@ -3361,7 +3556,7 @@ class SDTrainer(BaseSDTrainProcess):
                                 prompt_kwargs['control_images'] = batch.control_tensor_list
                             conditional_embeds = self.sd.encode_prompt(
                                 conditioned_prompts, prompt_2,
-                                dropout_prob=self.train_config.prompt_dropout_prob,
+                                dropout_prob=0.0,
                                 long_prompts=self.do_long_prompts,
                                 **prompt_kwargs
                             ).to(
@@ -3370,14 +3565,20 @@ class SDTrainer(BaseSDTrainProcess):
                             if self.train_config.do_cfg:
                                 if isinstance(self.adapter, CustomAdapter):
                                     self.adapter.is_unconditional_run = True
-                                unconditional_embeds = self.sd.encode_prompt(
-                                    self.batch_negative_prompt,
-                                    dropout_prob=self.train_config.prompt_dropout_prob,
-                                    long_prompts=self.do_long_prompts,
-                                    **prompt_kwargs
-                                ).to(
-                                    self.device_torch,
-                                    dtype=dtype)
+                                if self.train_config.cfg_same_prompt:
+                                    # Reuse the conditional embeds so both CFG branches share the exact
+                                    # same text (and the same caption-dropout decision).
+                                    unconditional_embeds = conditional_embeds.clone()
+                                else:
+                                    uncond_prompts = self.batch_negative_prompt
+                                    unconditional_embeds = self.sd.encode_prompt(
+                                        uncond_prompts,
+                                        dropout_prob=0.0,
+                                        long_prompts=self.do_long_prompts,
+                                        **prompt_kwargs
+                                    ).to(
+                                        self.device_torch,
+                                        dtype=dtype)
                                 if isinstance(self.adapter, CustomAdapter):
                                     self.adapter.is_unconditional_run = False
                             
@@ -3388,7 +3589,7 @@ class SDTrainer(BaseSDTrainProcess):
                                     dop_prompts_2 = [p.replace(self.trigger_word, self.train_config.diff_output_preservation_class) for p in prompt_2]
                                 self.diff_output_preservation_embeds = self.sd.encode_prompt(
                                     dop_prompts, dop_prompts_2,
-                                    dropout_prob=self.train_config.prompt_dropout_prob,
+                                    dropout_prob=0.0,
                                     long_prompts=self.do_long_prompts,
                                     **prompt_kwargs
                                 ).to(
@@ -3408,6 +3609,16 @@ class SDTrainer(BaseSDTrainProcess):
                                 unconditional_embeds.text_embeds, 
                                 is_unconditional=True
                             )
+
+                # Apply configured conditioning dropout (text + image, positive +
+                # negative, sync/invert, global + per-dataset) and compute the
+                # per-item image-conditioning masks for the model.
+                conditional_embeds, unconditional_embeds, pos_image_mask, neg_image_mask = \
+                    self._apply_conditioning_dropout(
+                        batch, conditional_embeds, unconditional_embeds, item_index=batch_idx
+                    )
+                self._cur_image_cond_mask_pos = pos_image_mask
+                self._cur_image_cond_mask_neg = neg_image_mask
 
                 # flush()
                 pred_kwargs = {}
@@ -3768,19 +3979,24 @@ class SDTrainer(BaseSDTrainProcess):
                         conditional_embeds = self.sd.encode_prompt(
                             fallback_prompts,
                             prompt_2,
-                            dropout_prob=self.train_config.prompt_dropout_prob,
+                            dropout_prob=0.0,
                             long_prompts=self.do_long_prompts,
                             **prompt_kwargs
                         ).to(self.device_torch, dtype=dtype)
                     if self.train_config.do_cfg and unconditional_embeds is None:
                         # When CFG is enabled but no unconditional embedding is generated, fall back to generating an unconditional embedding with an empty hint.
-                        unconditional_embeds = self.sd.encode_prompt(
-                            self.batch_negative_prompt if hasattr(self, 'batch_negative_prompt') else [''],
-                            self.batch_negative_prompt if hasattr(self, 'batch_negative_prompt') else [''],
-                            dropout_prob=self.train_config.prompt_dropout_prob,
-                            long_prompts=self.do_long_prompts,
-                            **prompt_kwargs
-                        ).to(self.device_torch, dtype=dtype)
+                        if self.train_config.cfg_same_prompt and conditional_embeds is not None:
+                            # Reuse the conditional embeds so both branches share the same text.
+                            unconditional_embeds = conditional_embeds.clone()
+                        else:
+                            uncond_prompts = uncond_prompts_2 = self.batch_negative_prompt if hasattr(self, 'batch_negative_prompt') else ['']
+                            unconditional_embeds = self.sd.encode_prompt(
+                                uncond_prompts,
+                                uncond_prompts_2,
+                                dropout_prob=0.0,
+                                long_prompts=self.do_long_prompts,
+                                **prompt_kwargs
+                            ).to(self.device_torch, dtype=dtype)
                     with self.timer('predict_unet'):
                         noise_pred = self.predict_noise(
                             noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),

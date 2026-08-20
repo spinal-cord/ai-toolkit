@@ -3861,6 +3861,147 @@ export default function SimpleJob({
                   onChange={value => setJobConfig(value === true ? true : null, 'config.process[0].train.force_same_timestep_per_batch')}
                 />
               </div>
+              <div>
+                <Checkbox
+                  label="Train with CFG"
+                  docKey={'train.do_cfg'}
+                  className="pt-1"
+                  checked={jobConfig.config.process[0].train.do_cfg || false}
+                  onChange={value => {
+                    if (value) {
+                      setJobConfig(true, 'config.process[0].train.do_cfg');
+                      if (!jobConfig.config.process[0].train.cfg_scale) {
+                        setJobConfig(3.5, 'config.process[0].train.cfg_scale');
+                      }
+                    } else {
+                      setJobConfig(undefined, 'config.process[0].train.do_cfg');
+                    }
+                  }}
+                />
+                {jobConfig.config.process[0].train.do_cfg && (
+                  <>
+                    <NumberInput
+                      label="CFG Scale"
+                      docKey={'train.cfg_scale'}
+                      className="pt-2"
+                      value={(jobConfig.config.process[0].train.cfg_scale as number) || 3.5}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.cfg_scale')}
+                      placeholder="eg. 3.5"
+                      min={1}
+                    />
+                    <Checkbox
+                      label="Random CFG Scale"
+                      docKey={'train.do_random_cfg'}
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].train.do_random_cfg || false}
+                      onChange={value => {
+                        if (value) {
+                          setJobConfig(true, 'config.process[0].train.do_random_cfg');
+                          if (!jobConfig.config.process[0].train.max_cfg_scale) {
+                            setJobConfig(5.0, 'config.process[0].train.max_cfg_scale');
+                          }
+                        } else {
+                          setJobConfig(undefined, 'config.process[0].train.do_random_cfg');
+                        }
+                      }}
+                    />
+                    {jobConfig.config.process[0].train.do_random_cfg && (
+                      <NumberInput
+                        label="Max CFG Scale"
+                        docKey={'train.max_cfg_scale'}
+                        className="pt-2"
+                        value={(jobConfig.config.process[0].train.max_cfg_scale as number) || 5.0}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.max_cfg_scale')}
+                        placeholder="eg. 5.0"
+                        min={1}
+                      />
+                    )}
+                    <Checkbox
+                      label="Same Prompt for Both Branches"
+                      docKey={'train.cfg_same_prompt'}
+                      className="pt-2"
+                      checked={jobConfig.config.process[0].train.cfg_same_prompt || false}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.cfg_same_prompt')}
+                    />
+                  </>
+                )}
+              </div>
+              <div>
+                <FormGroup label="Text Dropout (global)" className="pt-1">
+                  <NumberInput
+                    label="Positive Rate"
+                    docKey={'train.text_dropout_rate'}
+                    className="pt-1"
+                    value={jobConfig.config.process[0].train.text_dropout_rate as number | null}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.text_dropout_rate')}
+                    placeholder="0.0 = off"
+                    min={0}
+                    max={1}
+                  />
+                  <NumberInput
+                    label="Negative Rate"
+                    docKey={'train.text_dropout_rate_negative'}
+                    className="pt-1"
+                    value={jobConfig.config.process[0].train.text_dropout_rate_negative as number | null}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.text_dropout_rate_negative')}
+                    placeholder="0.0 = off"
+                    min={0}
+                    max={1}
+                  />
+                </FormGroup>
+                <Checkbox
+                  label="Sync Negative to Positive"
+                  docKey={'train.sync_text_dropout'}
+                  className="pt-1"
+                  checked={jobConfig.config.process[0].train.sync_text_dropout || false}
+                  onChange={value => setJobConfig(value, 'config.process[0].train.sync_text_dropout')}
+                />
+                <Checkbox
+                  label="Invert Synced Text State"
+                  docKey={'train.invert_text_dropout'}
+                  className="pt-1"
+                  checked={jobConfig.config.process[0].train.invert_text_dropout || false}
+                  onChange={value => setJobConfig(value, 'config.process[0].train.invert_text_dropout')}
+                />
+              </div>
+              <div>
+                <FormGroup label="Image Dropout / I2V (global)" className="pt-1">
+                  <NumberInput
+                    label="Positive Rate"
+                    docKey={'train.image_dropout_rate'}
+                    className="pt-1"
+                    value={jobConfig.config.process[0].train.image_dropout_rate as number | null}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.image_dropout_rate')}
+                    placeholder="0.0 = off"
+                    min={0}
+                    max={1}
+                  />
+                  <NumberInput
+                    label="Negative Rate"
+                    docKey={'train.image_dropout_rate_negative'}
+                    className="pt-1"
+                    value={jobConfig.config.process[0].train.image_dropout_rate_negative as number | null}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.image_dropout_rate_negative')}
+                    placeholder="empty = default"
+                    min={0}
+                    max={1}
+                  />
+                </FormGroup>
+                <Checkbox
+                  label="Sync Negative to Positive"
+                  docKey={'train.sync_image_dropout'}
+                  className="pt-1"
+                  checked={jobConfig.config.process[0].train.sync_image_dropout || false}
+                  onChange={value => setJobConfig(value, 'config.process[0].train.sync_image_dropout')}
+                />
+                <Checkbox
+                  label="Invert Synced Image State"
+                  docKey={'train.invert_image_dropout'}
+                  className="pt-1"
+                  checked={jobConfig.config.process[0].train.invert_image_dropout || false}
+                  onChange={value => setJobConfig(value, 'config.process[0].train.invert_image_dropout')}
+                />
+              </div>
             </div>
           </Card>
         </div>
@@ -4092,6 +4233,48 @@ export default function SimpleJob({
                             />
                           </>
                         )}
+                        <FormGroup label="Conditioning Dropout (override global)" className="pt-2">
+                          <NumberInput
+                            label="Text Rate (positive)"
+                            className="pt-1"
+                            value={dataset.text_dropout_rate ?? null}
+                            onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].text_dropout_rate`)}
+                            placeholder="empty = inherit"
+                            min={0}
+                            max={1}
+                            docKey="dataset.text_dropout_rate"
+                          />
+                          <NumberInput
+                            label="Image Rate (positive)"
+                            className="pt-1"
+                            value={dataset.image_dropout_rate ?? null}
+                            onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].image_dropout_rate`)}
+                            placeholder="empty = inherit"
+                            min={0}
+                            max={1}
+                            docKey="dataset.image_dropout_rate"
+                          />
+                          <NumberInput
+                            label="Text Rate (negative)"
+                            className="pt-1"
+                            value={dataset.text_dropout_rate_negative ?? null}
+                            onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].text_dropout_rate_negative`)}
+                            placeholder="empty = inherit"
+                            min={0}
+                            max={1}
+                            docKey="dataset.text_dropout_rate_negative"
+                          />
+                          <NumberInput
+                            label="Image Rate (negative)"
+                            className="pt-1"
+                            value={dataset.image_dropout_rate_negative ?? null}
+                            onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].image_dropout_rate_negative`)}
+                            placeholder="empty = inherit"
+                            min={0}
+                            max={1}
+                            docKey="dataset.image_dropout_rate_negative"
+                          />
+                        </FormGroup>
                         {modelArch?.additionalSections?.includes('datasets.do_audio') && (
                           <Checkbox
                             label="Do Audio"
