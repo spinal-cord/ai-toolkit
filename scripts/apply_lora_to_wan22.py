@@ -20,6 +20,7 @@ Usage:
 """
 
 import argparse
+import gc
 import os
 import re
 import sys
@@ -27,6 +28,7 @@ import json
 from collections import OrderedDict
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from diffusers import WanTransformer3DModel
 
@@ -39,6 +41,71 @@ from extensions_built_in.diffusion_models.wan22.wan22_14b_model import (
     load_transformer_from_safetensors,
     download_config_for_model,
 )
+
+
+BLOCK_INDEX_RE = re.compile(r"blocks\.(\d+)")
+
+
+def count_blocks_from_safetensors(safetensors_path: str) -> int:
+    """
+    Return the number of transformer blocks in a model safetensors file (max block index + 1).
+
+    Reads only the header (no tensor data) so it is cheap. Returns 0 if no block keys are
+    found (caller should then fall back to the config's num_layers).
+    """
+    block_indices = set()
+    with safe_open(safetensors_path, framework="pt") as f:
+        for key in f.keys():
+            match = BLOCK_INDEX_RE.search(key)
+            if match:
+                block_indices.add(int(match.group(1)))
+    return (max(block_indices) + 1) if block_indices else 0
+
+
+def compute_fp32_prefixes(num_blocks: int, fp32_front_layers: int, fp32_tail_layers: int) -> set:
+    """
+    Build the set of diffusers module-name prefixes that should be kept in fp32.
+
+    This encodes the desired mixed-precision layout:
+      - front: condition_embedder (text/time embeddings + time projection) + patch_embedding
+      - tail:  proj_out + norm_out + head scale_shift_table
+      - the first ``fp32_front_layers`` blocks (entire)
+      - the last ``fp32_tail_layers`` blocks (entire)
+      - every block's attention norms, norm2 and per-block scale_shift_table (modulation)
+    """
+    prefixes = set()
+
+    # Front / condition (text embeddings, time embeddings, time projection, patch embedding)
+    prefixes.add("condition_embedder")
+    prefixes.add("patch_embedding")
+
+    # Tail (output projection, output norm, head modulation)
+    prefixes.add("proj_out")
+    prefixes.add("norm_out")
+    prefixes.add("scale_shift_table")
+
+    num_blocks = max(num_blocks, 0)
+
+    # First N blocks (entire)
+    front = min(max(fp32_front_layers, 0), num_blocks)
+    for i in range(front):
+        prefixes.add(f"blocks.{i}")
+
+    # Last M blocks (entire)
+    tail = min(max(fp32_tail_layers, 0), num_blocks)
+    for i in range(max(0, num_blocks - tail), num_blocks):
+        prefixes.add(f"blocks.{i}")
+
+    # Norms + per-block modulation in EVERY block (so middle blocks' norms also stay fp32)
+    for i in range(num_blocks):
+        prefixes.add(f"blocks.{i}.attn1.norm_q")
+        prefixes.add(f"blocks.{i}.attn1.norm_k")
+        prefixes.add(f"blocks.{i}.attn2.norm_q")
+        prefixes.add(f"blocks.{i}.attn2.norm_k")
+        prefixes.add(f"blocks.{i}.norm2")
+        prefixes.add(f"blocks.{i}.scale_shift_table")
+
+    return prefixes
 
 
 def parse_args():
@@ -104,7 +171,32 @@ def parse_args():
         type=str,
         default="bfloat16",
         choices=["bfloat16", "float16", "float32"],
-        help="Target dtype for merged model (default: bfloat16)",
+        help=(
+            "Base dtype for the merged model. By default, text/time embeddings, projections, "
+            "norms and the front/tail blocks are additionally kept in float32 (see the "
+            "--fp32-* flags). Use --no-fp32 to force the entire model into this dtype. "
+            "(default: bfloat16)"
+        ),
+    )
+    parser.add_argument(
+        "--fp32-front-layers",
+        type=int,
+        default=1,
+        help="Number of leading transformer blocks to keep in float32 (default: 1)",
+    )
+    parser.add_argument(
+        "--fp32-tail-layers",
+        type=int,
+        default=4,
+        help="Number of trailing transformer blocks to keep in float32 (default: 4)",
+    )
+    parser.add_argument(
+        "--no-fp32",
+        action="store_true",
+        help=(
+            "Disable the automatic float32 layout. The entire model is saved in --dtype "
+            "(no fp32 front/tail/embedding/norm layers)."
+        ),
     )
     
     args = parser.parse_args()
@@ -506,71 +598,89 @@ def main():
         print(f"HIGH noise model: {safetensor_files['high']}")
         print(f"LOW noise model: {safetensor_files['low']}")
 
-    # Step 2: Load the base models
-    print("\nLoading HIGH noise transformer...")
+    # Step 2: Load config and compute the mixed-precision fp32 layout.
+    # (No model tensors are loaded yet — this is pure config/path work.)
     config = load_config_from_path(safetensor_files["high"], args.model_path)
-    high_model = load_transformer_from_safetensors(
-        safetensor_files["high"], config, target_dtype, torch.device("cpu")
-    )
 
-    print("Loading LOW noise transformer...")
-    low_model = load_transformer_from_safetensors(
-        safetensor_files["low"], config, target_dtype, torch.device("cpu")
-    )
+    # Compute the mixed-precision fp32 layout (text/time embeddings, projections, norms and
+    # front/tail blocks stay in float32; the rest uses --dtype).
+    fp32_prefixes = None
+    if not args.no_fp32 and target_dtype != torch.float32:
+        num_blocks = count_blocks_from_safetensors(safetensor_files["high"]) or config.get("num_layers", 40)
+        fp32_prefixes = compute_fp32_prefixes(num_blocks, args.fp32_front_layers, args.fp32_tail_layers)
+        fp32_block_indices = sorted({int(p.split(".")[1]) for p in fp32_prefixes if p.startswith("blocks.") and p.count(".") == 1})
+        print(
+            f"Keeping text/time embeddings, projections, norms and front/tail blocks in float32 "
+            f"(front={args.fp32_front_layers}, tail={args.fp32_tail_layers}, total blocks={num_blocks})"
+        )
+        print(f"Entire blocks kept in float32: {fp32_block_indices}")
+    elif args.no_fp32:
+        print("--no-fp32 set: entire model will be saved in the base dtype.")
 
-    # Step 3: Load the LoRAs
-    if args.lora_path_high is not None and args.lora_path_low is not None:
-        lora_high_path = args.lora_path_high
-        lora_low_path = args.lora_path_low
-        
-        print(f"\nLoading HIGH noise LoRA from {lora_high_path}")
-        lora_high_state_dict = load_file(lora_high_path)
-        
-        print(f"Loading LOW noise LoRA from {lora_low_path}")
-        lora_low_state_dict = load_file(lora_low_path)
-    else:
-        lora_high_path = args.lora_path
-        lora_low_path = args.lora_path
-        
-        print(f"\nLoading LoRA from {lora_high_path}")
-        lora_state_dict = load_file(lora_high_path)
-        lora_high_state_dict = lora_state_dict
-        lora_low_state_dict = lora_state_dict
-
-    # Step 4: Merge LoRA into both models
-    print("\nMerging LoRA into HIGH noise transformer...")
-    high_state_dict = high_model.state_dict()
-    merged_high_sd = merge_lora_into_state_dict(high_state_dict, lora_high_state_dict, scale=args.scale)
-
-    print("Merging LoRA into LOW noise transformer...")
-    low_state_dict = low_model.state_dict()
-    merged_low_sd = merge_lora_into_state_dict(low_state_dict, lora_low_state_dict, scale=args.scale)
-
-    # Step 5: Determine output path
+    # Step 3: Resolve output paths (pure path math, no tensors).
     if args.output_path:
         output_path = args.output_path
     else:
         # Default to the directory of the high noise model
         output_path = os.path.dirname(os.path.abspath(safetensor_files["high"]))
-
-    # Step 6: Save the merged models
     os.makedirs(output_path, exist_ok=True)
 
-    # Save HIGH noise model
-    base_high = os.path.basename(safetensor_files["high"])
-    name_high, ext_high = os.path.splitext(base_high)
-    high_output = os.path.join(output_path, f"{name_high}_lora{ext_high}")
+    def _output_path_for(model_file: str) -> str:
+        name, ext = os.path.splitext(os.path.basename(model_file))
+        return os.path.join(output_path, f"{name}_lora{ext}")
 
-    print(f"\nSaving merged HIGH noise model to {high_output}")
-    save_file(merged_high_sd, high_output, metadata={"format": "pt"})
+    high_output = _output_path_for(safetensor_files["high"])
+    low_output = _output_path_for(safetensor_files["low"])
 
-    # Save LOW noise model
-    base_low = os.path.basename(safetensor_files["low"])
-    name_low, ext_low = os.path.splitext(base_low)
-    low_output = os.path.join(output_path, f"{name_low}_lora{ext_low}")
+    # Step 4: Resolve per-expert LoRA paths. If both experts share one LoRA file, load it
+    # once and reuse it (it is small, a few hundred MB).
+    if args.lora_path_high is not None and args.lora_path_low is not None:
+        lora_paths = {"high": args.lora_path_high, "low": args.lora_path_low}
+    else:
+        lora_paths = {"high": args.lora_path, "low": args.lora_path}
 
-    print(f"Saving merged LOW noise model to {low_output}")
-    save_file(merged_low_sd, low_output, metadata={"format": "pt"})
+    shared_lora_sd = None
+    if lora_paths["high"] == lora_paths["low"]:
+        print(f"\nLoading LoRA from {lora_paths['high']}")
+        shared_lora_sd = load_file(lora_paths["high"])
+
+    # Step 5: Process each expert SEQUENTIALLY: load -> merge -> save -> free.
+    # Only one expert's model + merged weights are resident at a time, so peak RAM is a
+    # single expert (~60GB for a 14B model) instead of both experts at once (~125GB+).
+    experts = [
+        ("HIGH", safetensor_files["high"], lora_paths["high"], high_output),
+        ("LOW",  safetensor_files["low"],  lora_paths["low"],  low_output),
+    ]
+    for label, model_file, lora_file, out_file in experts:
+        print(f"\nLoading {label} noise transformer...")
+        model = load_transformer_from_safetensors(
+            model_file, config, target_dtype, torch.device("cpu"),
+            fp32_prefixes=fp32_prefixes,
+        )
+
+        if shared_lora_sd is not None:
+            lora_sd = shared_lora_sd
+        else:
+            print(f"Loading {label} noise LoRA from {lora_file}")
+            lora_sd = load_file(lora_file)
+
+        print(f"Merging LoRA into {label} noise transformer...")
+        base_sd = model.state_dict()
+        merged_sd = merge_lora_into_state_dict(base_sd, lora_sd, scale=args.scale)
+        del base_sd
+
+        print(f"Saving merged {label} noise model to {out_file}")
+        save_file(merged_sd, out_file, metadata={"format": "pt"})
+
+        # Free this expert before loading the next one to keep peak RAM bounded.
+        del model, merged_sd
+        if shared_lora_sd is None:
+            del lora_sd
+        gc.collect()
+
+    if shared_lora_sd is not None:
+        del shared_lora_sd
+        gc.collect()
 
     # Copy config.json if it exists
     config_path = os.path.join(os.path.dirname(safetensor_files["high"]), "config.json")

@@ -483,15 +483,100 @@ class RankGateConfig:
         # Enable/disable rank gating. Default: True (enabled by default for
         # curvature-aware pruning to prevent rank collapse).
         self.enabled: bool = kwargs.get('enabled', True)
-        
-        # Annealing timing (can be absolute steps or ratios of total_steps)
+
+        # ------------------------------------------------------------------
+        # TIMING MODE
+        # ------------------------------------------------------------------
+        # auto_timing=True (default): annealing start / end and the final
+        # hardening window are all detected automatically from the ACTUAL
+        # training dynamics (loss plateau + learning-rate decay) via the
+        # per-expert LearningAwareScheduler. This is the recommended mode and
+        # removes all hardcoded step percentages.
+        #
+        # auto_timing=False: fall back to the legacy manual schedule driven by
+        # the absolute start_step / end_step / hardening_window values below.
+        self.auto_timing: bool = kwargs.get('auto_timing', True)
+
+        # Legacy MANUAL timing (only used when auto_timing is False).
         # start_step: when to begin annealing
-        self.start_step: Optional[int] = kwargs.get('start_step', None)  # auto: 5% of total
+        self.start_step: Optional[int] = kwargs.get('start_step', None)  # manual: required if auto_timing=False
         # end_step: when to complete annealing (before hardening window)
-        self.end_step: Optional[int] = kwargs.get('end_step', None)  # auto: 75% of total
+        self.end_step: Optional[int] = kwargs.get('end_step', None)
+
+        # ------------------------------------------------------------------
+        # LEARNING-AWARE AUTO TIMING (used when auto_timing is True)
+        # ------------------------------------------------------------------
+        # Delay the annealing start until AFTER the LR scheduler warmup so
+        # that the first gate decisions (and the per-tensor rank budgets
+        # computed at that moment) are based on stable, non-ramping gradients
+        # and an already-primed Fisher EMA.
+        self.start_after_warmup: bool = kwargs.get('start_after_warmup', True)
+
+        # --- Plateau detection (annealing START trigger) ---
+        # Annealing starts once the expert's loss has stopped improving
+        # meaningfully. "Meaningful" is defined by comparing a fast loss EMA
+        # to a slow loss EMA: relative improvement
+        #   (slow - fast) / |slow|
+        # below this threshold counts as a "flat" step.
+        self.plateau_relative_threshold: float = kwargs.get('plateau_relative_threshold', 5e-3)
+        # Number of CONSECUTIVE flat steps required to confirm a plateau before
+        # annealing starts (debounce, avoids triggering on a single noisy dip).
+        self.plateau_confirm_steps: int = kwargs.get('plateau_confirm_steps', 50)
+        # Per-expert floor: annealing will never start before this many
+        # per-expert steps (also raised to warmup+1 when start_after_warmup).
+        self.min_anneal_steps: int = kwargs.get('min_anneal_steps', 200)
+
+        # --- Annealing END trigger ---
+        # When the LR scheduler is decaying, annealing progress is driven by
+        # the LR itself: it completes when the LR has decayed below
+        # end_lr_fraction * peak_lr (the model is converging, safe to prune).
+        self.end_lr_fraction: float = kwargs.get('end_lr_fraction', 0.2)
+        # Per-expert max duration (steps) of the annealing window, used as the
+        # fallback clock when the LR is constant (no decay to track) and as a
+        # hard cap on the LR-driven window.
+        self.anneal_max_duration: int = kwargs.get('anneal_max_duration', 1500)
+
+        # --- Final HARDENING trigger (soft gates -> binary) ---
+        # Hardening starts automatically when the LR has decayed below
+        # hardening_lr_fraction * peak_lr (learning is essentially finished).
+        self.hardening_lr_fraction: float = kwargs.get('hardening_lr_fraction', 0.05)
+        # Per-expert minimum length of the hardening window (steps). Also used
+        # as the step-based trigger when the LR is constant.
+        self.hardening_min_steps: int = kwargs.get('hardening_min_steps', 150)
+
+        # --- Loss EMA rates for plateau detection ---
+        self.loss_ema_fast: float = kwargs.get('loss_ema_fast', 0.10)
+        self.loss_ema_slow: float = kwargs.get('loss_ema_slow', 0.02)
+
+        # ------------------------------------------------------------------
+        # TRUNCATED CHECKPOINT ("button")
+        # ------------------------------------------------------------------
+        # When True, every checkpoint save ALSO emits a fully-truncated
+        # variant: the LoRA rank is physically reduced (dead rows of lora_down
+        # and columns of lora_up are removed, alpha rescaled), not merely
+        # zeroed via gates. The .diff tensors are folded as usual.
+        self.save_truncated: bool = kwargs.get('save_truncated', False)
+        # Gate value above which a rank is kept in the truncated checkpoint.
+        self.truncation_threshold: float = kwargs.get('truncation_threshold', 0.5)
+
+        # Manual hardening window size (only used when auto_timing is False).
+        self._legacy_hardening_window: int = kwargs.get('hardening_window', 500)
         
-        # Target rank ratio: final active rank fraction
-        # 0.3 = keep 30% of ranks, kill 70% (aggressive pruning)
+        # Target minimal per-component rank contribution (fraction of the
+        # tensor's total energy). At annealing start, EACH tensor's final
+        # target is computed from its current energy spectrum (per-tensor
+        # annealing, not a global ratio):
+        #   - LoRA pairs:  S^2/sum(S^2) of the SVD of B@A (per rank)
+        #   - .diff tensors (full finetune, e.g. 1D layer norms): x^2/sum(x^2) per element
+        # Components contributing less than this fraction are annealed out.
+        # Default 1e-4 (0.01% of total energy) matches the recommended-rank
+        # threshold of the offline LoRA statistics tool.
+        self.target_min_rank_contribution: float = kwargs.get('target_min_rank_contribution', 1e-4)
+        
+        # Target rank ratio: global FALLBACK final active fraction, used only
+        # for tensors whose per-tensor budget could not be computed
+        # (e.g. weight references unavailable).
+        # 0.3 = keep 30% of components, kill 70% (aggressive pruning)
         self.target_rank_ratio: float = kwargs.get('target_rank_ratio', 0.3)
         
         # Temperature for sigmoid gating
@@ -520,8 +605,9 @@ class RankGateConfig:
         # Include first-order term |g·w| in scoring (recommended for diffusion)
         self.use_first_order: bool = kwargs.get('use_first_order', True)
         
-        # Final hardening window size
-        self.hardening_window: int = kwargs.get('hardening_window', 500)
+        # Legacy manual hardening window size (kept as a public attribute for
+        # backward compatibility; auto_timing uses hardening_min_steps instead).
+        self.hardening_window: int = self._legacy_hardening_window
         
         # Penalty coefficient for mid-preference nudge
         self.eta_pen: float = kwargs.get('eta_pen', 0.01)

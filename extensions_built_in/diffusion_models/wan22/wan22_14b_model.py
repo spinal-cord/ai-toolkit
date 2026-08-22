@@ -635,7 +635,8 @@ def download_safetensors_file(repo_id: str, filename: str,
 def load_transformer_from_safetensors(safetensors_path: str, config: Dict, 
                                         dtype: torch.dtype, device: torch.device,
                                         is_high_noise: bool = True,
-                                        tread_cfg=None) -> WanTransformer3DModel:
+                                        tread_cfg=None,
+                                        fp32_prefixes=None) -> WanTransformer3DModel:
     """
     Load a WanTransformer3DModel from a safetensors file and config.
     Handles FP8 quantized weights by dequantizing them to the target dtype.
@@ -643,6 +644,12 @@ def load_transformer_from_safetensors(safetensors_path: str, config: Dict,
     When ``tread_cfg`` requests fp32 front/tail layers, those modules are loaded in fp32
     (their checkpoint weights are never downcast to the base dtype), while the rest of the
     model stays in ``dtype``.
+
+    Alternatively, an explicit ``fp32_prefixes`` set (diffusers module-name prefixes, e.g.
+    ``{"blocks.0", "condition_embedder"}``) can be supplied to keep exactly those modules in
+    fp32 while the rest uses ``dtype``. Used by the apply-LoRA script to preserve a mixed
+    precision layout (text/time embeddings, projections, norms and front/tail blocks in fp32).
+    ``tread_cfg`` takes precedence when both are provided.
     """
     # Create model from config and start it in the base dtype (small) so the fp32 subset
     # is the *only* fp32 part of the model.
@@ -657,11 +664,20 @@ def load_transformer_from_safetensors(safetensors_path: str, config: Dict,
     # TREAD fp32 front/tail/layers: keep those keys in fp32 and upcast the matching modules
     # before load_state_dict so the copy is lossless (no blanket downcast afterwards).
     num_layers = config.get("num_layers", len(model.blocks))
-    fp32_prefixes = None
     if tread_cfg is not None and tread_cfg.has_fp32:
         from toolkit.models.wan21.wan_tread import tread_fp32_param_prefixes
         fp32_prefixes = tread_fp32_param_prefixes(tread_cfg, num_layers)
         selective_cast_model(model, tread_cfg, dtype)
+    elif fp32_prefixes:
+        # Explicit fp32 prefixes: upcast the matching model params/buffers to fp32 BEFORE
+        # load_state_dict so the copy keeps them at full precision (no blanket downcast).
+        from toolkit.models.wan21.wan_tread import is_tread_fp32_name
+        for name, param in list(model.named_parameters()):
+            if is_tread_fp32_name(name, fp32_prefixes):
+                param.data = param.data.to(torch.float32)
+        for name, buf in list(model.named_buffers()):
+            if is_tread_fp32_name(name, fp32_prefixes):
+                buf.data = buf.data.to(torch.float32)
 
     print("Processing state dict")
     processed_state_dict = _process_state_dict_for_fp8(state_dict, dtype, fp32_prefixes=fp32_prefixes)

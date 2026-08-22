@@ -77,9 +77,29 @@ export interface Wan22TensorTypesConfig {
 
 export interface RankGateConfig {
   enabled?: boolean;
+  // Learning-aware auto timing (default true): annealing start/end and the
+  // final hardening are detected from loss plateau + LR decay, per expert.
+  auto_timing?: boolean;
+  // Raise the annealing floor past the LR warmup (default true).
+  start_after_warmup?: boolean;
+  // Plateau detection (annealing start trigger).
+  plateau_relative_threshold?: number;
+  plateau_confirm_steps?: number;
+  min_anneal_steps?: number;
+  // LR-decay triggers (annealing end + hardening start).
+  end_lr_fraction?: number;
+  anneal_max_duration?: number;
+  hardening_lr_fraction?: number;
+  hardening_min_steps?: number;
+  // Per-tensor automatic rank targets from the energy spectrum.
+  target_min_rank_contribution?: number;
+  // Fallback ratio only (used when a per-tensor budget fails).
   target_rank_ratio?: number;
+  // Manual timeline (only used when auto_timing is false).
   start_step?: number | null;
   end_step?: number | null;
+  hardening_window?: number;
+  // Gate dynamics.
   temperature?: number;
   gamma?: number;
   alpha?: number;
@@ -87,9 +107,11 @@ export interface RankGateConfig {
   update_every?: number;
   fisher_decay?: number;
   use_first_order?: boolean;
-  hardening_window?: number;
   eta_pen?: number;
   final_hardening?: boolean;
+  // Truncated checkpoint ("button"): also emit a rank-reduced LoRA each save.
+  save_truncated?: boolean;
+  truncation_threshold?: number;
 }
 
 export interface LayerOverrideConfig {

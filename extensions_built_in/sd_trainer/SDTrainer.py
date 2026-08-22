@@ -41,7 +41,7 @@ from toolkit.unloader import unload_text_encoder
 from PIL import Image
 from torchvision.transforms import functional as TF
 from toolkit.basic import flush
-from toolkit.rank_gates import FisherTracker, QuenchSchedule, update_rank_gates, apply_hardening_interpolation, finalize_gates, log_gate_stats
+from toolkit.rank_gates import FisherTracker, LearningAwareScheduler, GatedDiff, compute_tensor_budgets, update_rank_gates, apply_hardening_interpolation, finalize_gates, log_gate_stats
 
 
 adapter_transforms = transforms.Compose([
@@ -73,8 +73,13 @@ class SDTrainer(BaseSDTrainProcess):
             torch._functorch.config.donated_buffer = False
         
         # Rank gate annealing (SparseForge-inspired)
-        self.rank_gates_scheduler: Optional[QuenchSchedule] = None
-        self.fisher_tracker: Optional[FisherTracker] = None
+        # Per-expert rank-gate state. Experts are trained completely
+        # independently, so each gets its OWN LearningAwareScheduler (its own
+        # step counter, loss EMAs, LR tracking and phase timeline) and its own
+        # FisherTracker (separate EMA states). Keys: 'transformer_1' /
+        # 'transformer_2' for multistage, or 'single' otherwise.
+        self.rank_gate_controllers: Dict[str, LearningAwareScheduler] = {}
+        self.fisher_trackers: Dict[str, FisherTracker] = {}
         self.rank_gates_is_per_expert_training: bool = False
 
         self.do_grad_scale = True
@@ -364,10 +369,102 @@ class SDTrainer(BaseSDTrainProcess):
             self.taesd.eval()
             self.taesd.requires_grad_(False)
 
+    def _resolve_lr_warmup_steps(self) -> int:
+        """
+        Resolve the LR scheduler warmup length (global steps).
+        
+        Checks the global scheduler and, in dual-expert mode, the per-expert
+        schedulers; returns the longest warmup found (0 if no scheduler with
+        warmup is configured).
+        """
+        tc = self.train_config
+        candidates = []
+        for sched_name, params in (
+            (getattr(tc, 'lr_scheduler', None), getattr(tc, 'lr_scheduler_params', None)),
+            (getattr(tc, 'expert_1_lr_scheduler', None), getattr(tc, 'expert_1_lr_scheduler_params', None)),
+            (getattr(tc, 'expert_2_lr_scheduler', None), getattr(tc, 'expert_2_lr_scheduler_params', None)),
+        ):
+            if isinstance(sched_name, str) and 'warmup' in sched_name.lower():
+                p = params or {}
+                candidates.append(int(p.get('num_warmup_steps', 1000)))
+        return max(candidates) if candidates else 0
+
+    # ------------------------------------------------------------------
+    # Rank-gate helpers (per-expert, learning-aware)
+    # ------------------------------------------------------------------
+    def _gate_expert_key(self) -> str:
+        """Rank-gate expert key for the currently active expert.
+
+        'transformer_1'/'transformer_2' for multistage models, else 'single'.
+        Matches the ``owner_transformer`` stored on each gated module.
+        """
+        if hasattr(self.sd, 'model') and hasattr(self.sd.model, '_active_transformer_name'):
+            return self.sd.model._active_transformer_name
+        return "single"
+
+    @staticmethod
+    def _loss_label_for_gate_key(key: str) -> str:
+        """Map a rank-gate expert key to the loss-tracking label."""
+        return {"transformer_1": "high", "transformer_2": "low"}.get(key, "single")
+
+    def _get_expert_lr(self, key: str) -> Optional[float]:
+        """Current learning rate for a rank-gate expert key (None if unknown)."""
+        try:
+            if getattr(self, 'use_per_expert_schedulers', False):
+                sched = (self.expert_lr_schedulers or {}).get(key)
+                if sched is not None and hasattr(sched, 'get_last_lr'):
+                    return float(sched.get_last_lr()[0])
+            if self.lr_scheduler is not None and hasattr(self.lr_scheduler, 'get_last_lr'):
+                return float(self.lr_scheduler.get_last_lr()[0])
+            if self.optimizer is not None and self.optimizer.param_groups:
+                return float(self.optimizer.param_groups[0]['lr'])
+        except Exception:
+            pass
+        return None
+
+    def _expert_gated_params(self, key: str):
+        """Underlying trainable params owned by a rank-gate expert key.
+
+        Used to feed the per-expert FisherTracker with ONLY that expert's
+        gradients, keeping every expert's EMA state fully independent.
+        """
+        params = []
+        gated = getattr(self.network, 'gated_loras', None) or []
+        for gl in gated:
+            owner = gl.owner_transformer
+            match = (owner is None) if key == "single" else (owner == key)
+            if not match:
+                continue
+            if isinstance(gl, GatedDiff):
+                if gl._param_ref is not None:
+                    params.append(gl._param_ref)
+            else:
+                if len(gl._lora_refs) >= 2:
+                    params.extend(gl._lora_refs)
+        return params
+
+    def _expert_gated_loras(self, key: str):
+        """Gated modules owned by a rank-gate expert key."""
+        gated = getattr(self.network, 'gated_loras', None) or []
+        return [gl for gl in gated
+                if (gl.owner_transformer is None if key == "single"
+                    else gl.owner_transformer == key)]
+
+    def _active_gate_keys(self, active_experts) -> List[str]:
+        """Rank-gate expert key(s) to advance this step.
+
+        In multistage mode ``active_experts`` is the set of active transformer
+        names (only the active expert learns, so only its clock advances).
+        Otherwise a single 'single' key.
+        """
+        if active_experts:
+            return list(active_experts)
+        return [self._gate_expert_key()]
+
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         
-        # Initialize rank gate annealing (SparseForge-inspired)
+        # Initialize rank gate annealing (SparseForge-inspired, learning-aware)
         if (self.network is not None and 
             hasattr(self.network, 'gated_loras') and 
             self.network.gated_loras and
@@ -378,91 +475,109 @@ class SDTrainer(BaseSDTrainProcess):
             rg = self.network_config.rank_gates
             total_steps = self.train_config.steps
             
-            # Determine effective steps per expert for auto-timing.
-            # In per-expert training (Wan 2.2 14B I2V with both experts active),
-            # each expert only sees ~half the batches. Auto-calculated annealing
-            # timing (5% start, 75% end) should be based on per-expert steps,
-            # not total steps, so each expert's gates anneal over their own
-            # effective training duration.
-            #
-            # IMPORTANT: User-provided start_step/end_step are interpreted as GLOBAL
-            # steps (not per-expert). This matches user intuition: "start annealing
-            # at step 1000" means global step 1000, regardless of expert count.
-            
+            # ------------------------------------------------------------------
+            # Per-expert independence: each expert gets its OWN controller and
+            # FisherTracker with fully separate state (step counter, loss EMAs,
+            # LR tracking, phase timeline, Fisher/grad EMAs). Experts are trained
+            # completely independently and anneal on their own clocks.
+            # ------------------------------------------------------------------
             self.rank_gates_is_per_expert_training = False
-            
-            # Check if we're in per-expert training mode with both experts active
+            expert_keys: List[str] = []
             if (hasattr(self.network, 'unet_loras_expert1') and 
                 hasattr(self.network, 'unet_loras_expert2')):
-                expert1_count = len(getattr(self.network, 'unet_loras_expert1', []))
-                expert2_count = len(getattr(self.network, 'unet_loras_expert2', []))
-                if expert1_count > 0 and expert2_count > 0:
-                    # Both experts are being trained - each sees ~half the steps
+                e1 = len(getattr(self.network, 'unet_loras_expert1', []))
+                e2 = len(getattr(self.network, 'unet_loras_expert2', []))
+                if e1 > 0 and e2 > 0:
                     self.rank_gates_is_per_expert_training = True
-                    print(f"\n[SDTrainer] Per-expert training detected ({expert1_count} LoRAs x2). "
-                          f"Each expert sees ~{total_steps // 2} effective steps "
-                          f"(total: {total_steps}). Annealing timing uses global steps.")
+                    expert_keys = [k for k in ("transformer_1", "transformer_2")
+                                   if self._expert_gated_loras(k)]
+                    if not expert_keys:
+                        expert_keys = ["transformer_1", "transformer_2"]
+                    print(f"\n[SDTrainer] Per-expert rank-gate annealing detected. "
+                          f"Each expert anneals independently on its own "
+                          f"loss-plateau / LR-decay clock.")
+            else:
+                expert_keys = ["single"]
             
-            # Scale hardening_window relative to total steps.
-            # Default 500 is reasonable for large runs but would be too large for
-            # small jobs. Cap at 5% of total steps.
-            effective_hardening_window = rg.hardening_window
-            max_hardening_window = max(50, int(total_steps * 0.05))
-            if effective_hardening_window > max_hardening_window:
-                effective_hardening_window = max_hardening_window
-                print(f"  [SDTrainer] Scaled hardening_window: {rg.hardening_window} → {effective_hardening_window} "
-                      f"(5% of {total_steps} total steps)")
+            # Per-expert effective total steps: with N active experts each sees
+            # ~total/N steps, so the per-expert timeline uses that as its horizon.
+            n_experts = len(expert_keys) if self.rank_gates_is_per_expert_training else 1
+            per_expert_total = max(1, total_steps // max(1, n_experts))
+            warmup_steps = self._resolve_lr_warmup_steps()
             
-            # Resolve annealing timing based on TOTAL (global) steps.
-            # User-provided values are global steps; auto values are percentages of total.
-            start_step = rg.start_step
-            end_step = rg.end_step
-            if start_step is None:
-                start_step = max(100, int(total_steps * 0.05))
-            if end_step is None:
-                end_step = min(total_steps - effective_hardening_window, int(total_steps * 0.75))
+            # Manual (legacy) timeline: user-specified global start/end/hardening
+            # converted to per-expert steps. Only used when auto_timing is off.
+            use_manual = not rg.auto_timing
+            manual_start = manual_end = manual_hardening = None
+            if use_manual:
+                start_step = rg.start_step if rg.start_step is not None else max(100, int(per_expert_total * 0.05))
+                end_step = rg.end_step if rg.end_step is not None else int(per_expert_total * 0.75)
+                manual_start = start_step
+                manual_end = end_step
+                max_hw = max(50, int(per_expert_total * 0.05))
+                hw = min(rg.hardening_window, max_hw)
+                manual_hardening = max(end_step, per_expert_total - hw)
             
-            # QuenchSchedule uses GLOBAL steps. In per-expert training, each expert's
-            # gates are driven by the global schedule but only receive ~1/N of the
-            # EMA updates and gate updates. This is intentional: it keeps the code
-            # simple and ensures both experts reach their final state by total_steps.
-            # Temperature decay is tracked by actual update count (per expert) to
-            # avoid decaying too fast when experts alternate.
-            self.rank_gates_scheduler = QuenchSchedule(
-                total_steps=total_steps,
-                start_step=start_step,
-                end_step=end_step,
-                target_rank_ratio=rg.target_rank_ratio,
-                temperature=rg.temperature,
-                gamma=rg.gamma,
-                alpha=rg.alpha,
-                lambda_mid_max=rg.lambda_mid_max,
-                update_every=rg.update_every,
-                hardening_window=effective_hardening_window,
-                eta_pen=rg.eta_pen,
-            )
+            # Build a separate controller + FisherTracker per expert.
+            for key in expert_keys:
+                self.rank_gate_controllers[key] = LearningAwareScheduler(
+                    expert_name=key,
+                    total_steps=per_expert_total,
+                    target_rank_ratio=rg.target_rank_ratio,
+                    temperature=rg.temperature,
+                    gamma=rg.gamma,
+                    alpha=rg.alpha,
+                    lambda_mid_max=rg.lambda_mid_max,
+                    update_every=rg.update_every,
+                    eta_pen=rg.eta_pen,
+                    plateau_relative_threshold=rg.plateau_relative_threshold,
+                    plateau_confirm_steps=rg.plateau_confirm_steps,
+                    min_anneal_steps=rg.min_anneal_steps,
+                    end_lr_fraction=rg.end_lr_fraction,
+                    anneal_max_duration=rg.anneal_max_duration,
+                    hardening_lr_fraction=rg.hardening_lr_fraction,
+                    hardening_min_steps=rg.hardening_min_steps,
+                    loss_ema_fast=rg.loss_ema_fast,
+                    loss_ema_slow=rg.loss_ema_slow,
+                    start_after_warmup=rg.start_after_warmup,
+                    warmup_steps=warmup_steps,
+                    manual_start_step=manual_start,
+                    manual_end_step=manual_end,
+                    manual_hardening_start=manual_hardening,
+                )
+                self.fisher_trackers[key] = FisherTracker(
+                    decay=rg.fisher_decay,
+                    use_first_order=rg.use_first_order,
+                )
             
-            self.fisher_tracker = FisherTracker(
-                decay=rg.fisher_decay,
-                use_first_order=rg.use_first_order,
-            )
-            
-            # Track per-expert update counts for correct temperature decay.
-            # In per-expert training, each expert only gets updated ~half as often,
-            # so temperature should decay based on actual updates received, not
-            # global step count.
-            self.rank_gates_expert_update_counts: Dict[str, int] = {}
-            
-            timing_note = f" (per-expert)" if self.rank_gates_is_per_expert_training else ""
-            print(f"\n[SDTrainer] Rank gate annealing initialized{timing_note}:")
-            print(f"  Start: global step {start_step}, End: global step {end_step}")
-            print(f"  Hardening window: global steps {self.rank_gates_scheduler.hardening_start}-{self.rank_gates_scheduler.hardening_end}")
-            print(f"  Target rank ratio: {rg.target_rank_ratio}")
-            print(f"  Total gated ranks: {sum(gl.r for gl in self.network.gated_loras)}")
+            n_diff = sum(1 for g in self.network.gated_loras if isinstance(g, GatedDiff))
+            mode = "MANUAL timeline" if use_manual else "AUTO (loss-plateau + LR-decay)"
+            print(f"\n[SDTrainer] Rank gate annealing initialized "
+                  f"({len(expert_keys)} expert(s): {', '.join(expert_keys)}), timing={mode}:")
+            if use_manual:
+                print(f"  Manual per-expert timeline: start={manual_start}, "
+                      f"end={manual_end}, hardening={manual_hardening} "
+                      f"(per-expert horizon {per_expert_total})")
+            else:
+                print(f"  Annealing starts automatically on loss plateau "
+                      f"(rel_thresh={rg.plateau_relative_threshold}, "
+                      f"confirm={rg.plateau_confirm_steps} steps, "
+                      f"floor={max(rg.min_anneal_steps, warmup_steps + 1 if rg.start_after_warmup else 0)} per-expert steps)")
+                print(f"  Annealing ends on LR decay below {rg.end_lr_fraction}*peak; "
+                      f"hardening starts on LR decay below {rg.hardening_lr_fraction}*peak")
+            print(f"  Target min rank contribution: {rg.target_min_rank_contribution} "
+                  f"(per-tensor targets from energy spectrum at annealing start; "
+                  f"fallback ratio {rg.target_rank_ratio})")
+            print(f"  Gated tensors: {len(self.network.gated_loras)} "
+                  f"({len(self.network.gated_loras) - n_diff} LoRA, {n_diff} diff), "
+                  f"total gated components: {sum(gl.r for gl in self.network.gated_loras)}")
+            if rg.save_truncated:
+                print(f"  [RankGates] Truncated-checkpoint button ENABLED "
+                      f"(threshold={rg.truncation_threshold})")
         else:
             # Rank gates not enabled or no gated LoRAs
-            self.rank_gates_scheduler = None
-            self.fisher_tracker = None
+            self.rank_gate_controllers = {}
+            self.fisher_trackers = {}
         
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
@@ -2872,30 +2987,84 @@ class SDTrainer(BaseSDTrainProcess):
 
     def save(self, step=None):
         """
-        Override save to finalize rank gates before saving.
-        
-        Gates are finalized (hardened to binary {0,1}) ONLY right before the final save
-        (step=None), and only if final_hardening is enabled in config.
-        This ensures both experts are finalized regardless of which was last active.
+        Override save to (a) finalize rank gates before the final save and
+        (b) optionally emit a fully-truncated checkpoint (the "button").
+
+        Gates are finalized (hardened to binary {0,1}) ONLY right before the
+        final save (step=None), and only if final_hardening is enabled. This is
+        done BEFORE super().save() so the folded weights use binary gates, and
+        it covers every expert (each has its own controller but all gates are
+        finalized together). Trained experts that never entered their own
+        (LR-driven) hardening window are still snapped to binary here.
         """
+        is_main = (not hasattr(self, 'accelerator') or self.accelerator.is_main_process)
+        rg = (self.network_config.rank_gates
+              if (self.network_config is not None
+                  and self.network_config.rank_gates is not None) else None)
+
+        # Finalize gates BEFORE the normal save (final save only) so the folded
+        # weights reflect binary gate decisions for every expert.
+        if (is_main and step is None and rg is not None and rg.final_hardening
+                and self.rank_gate_controllers and self.network is not None):
+            gated_loras = getattr(self.network, 'gated_loras', None)
+            if gated_loras:
+                remaining = [gl for gl in gated_loras if not gl.is_hardened()]
+                if remaining:
+                    finalize_gates(remaining)
+                    print(f"\n[RankGates] Finalized {len(remaining)} gate sets before final save")
+
+        # Normal save (folds the gates into the LoRA / diff weights).
         super().save(step)
-        
-        # Finalize gates ONLY on the final save (step=None) and only if configured.
-        # Run AFTER super().save() so that under DDP, only main_process finalizes.
-        # (In practice gates are identical across ranks, but this is cleaner.)
-        if (not hasattr(self, 'accelerator') or self.accelerator.is_main_process):
-            if (step is None and
-                self.rank_gates_scheduler is not None and
-                self.network is not None and
-                self.network_config is not None and
-                self.network_config.rank_gates is not None and
-                self.network_config.rank_gates.final_hardening):
-                gated_loras = getattr(self.network, 'gated_loras', None)
-                if gated_loras:
-                    remaining = [gl for gl in gated_loras if not gl.is_hardened()]
-                    if remaining:
-                        finalize_gates(remaining)
-                        print(f"\n[RankGates] Finalized {len(remaining)} gate sets before final save")
+
+        # Truncated checkpoint (the "button"): final save only, if enabled. Emits
+        # an additional file with the LoRA rank physically reduced.
+        if (is_main and step is None and rg is not None and rg.save_truncated
+                and self.network is not None):
+            self._save_truncated_checkpoint(step=None)
+
+    def _save_truncated_checkpoint(self, step=None):
+        """
+        Produce a FULLY-TRUNCATED checkpoint: the LoRA rank is physically reduced
+        (dead lora_down rows / lora_up columns removed, alpha rescaled) rather
+        than merely zeroed via the folded gates. Saved alongside the normal
+        checkpoint with a `_truncated` suffix.
+        """
+        import copy as _copy
+        from toolkit.metadata import get_meta_for_safetensors
+
+        # Truncation only makes sense for LoRA (adapter) saves, not merged models.
+        if self.is_fine_tuning or self.train_config.merge_network_on_save:
+            print("[RankGates] Truncated checkpoint is only supported for LoRA "
+                  "(non-merge) saves; skipping.")
+            return
+
+        rg = self.network_config.rank_gates
+        lora_name = self.job.name
+        if self.named_lora:
+            lora_name += '_LoRA'
+        step_num = '' if step is None else f"_{str(step).zfill(9)}"
+        filename = f'{lora_name}{step_num}_truncated.safetensors'
+        file_path = os.path.join(self.save_root, filename)
+        save_meta = get_meta_for_safetensors(_copy.deepcopy(self.meta), self.job.name)
+
+        prev_multiplier = self.network.multiplier
+        self.network.multiplier = 1.0
+        try:
+            embedding_dict = self.embedding.state_dict() if self.embedding else None
+            self.network.save_weights(
+                file_path,
+                dtype=get_torch_dtype(self.save_config.dtype),
+                metadata=save_meta,
+                extra_state_dict=embedding_dict,
+                step=None,  # final-style: fold gates + physically reduce rank
+                truncate=True,
+                truncation_threshold=rg.truncation_threshold,
+            )
+            print(f"\n[RankGates] Saved truncated checkpoint to {file_path}")
+        except Exception as e:
+            print(f"[RankGates WARNING] Failed to save truncated checkpoint: {e}")
+        finally:
+            self.network.multiplier = prev_multiplier
 
     def predict_noise(
         self,
@@ -4148,9 +4317,15 @@ class SDTrainer(BaseSDTrainProcess):
             sync_grad_transfers()
             
             # Update Fisher EMA for rank gate annealing (after sync_grad_transfers
-            # to ensure grads are available even with low_vram offloading)
-            if self.fisher_tracker is not None:
-                self.fisher_tracker.update(self.params)
+            # to ensure grads are available even with low_vram offloading).
+            # PER-EXPERT: only the active expert's FisherTracker is updated, with
+            # ONLY that expert's gated params, so every expert's EMA state stays
+            # fully independent (inactive experts' params have no grads anyway).
+            if self.fisher_trackers:
+                _key = self._gate_expert_key()
+                _tracker = self.fisher_trackers.get(_key)
+                if _tracker is not None:
+                    _tracker.update(self._expert_gated_params(_key))
             
             grad_norm_tensor = self._calculate_grad_norm(self.params)
             if grad_norm_tensor is not None:
@@ -4261,55 +4436,82 @@ class SDTrainer(BaseSDTrainProcess):
                         if self.lr_scheduler is not None:
                             self.lr_scheduler.step()
             
-            # Rank gate annealing updates (after optimizer step)
-            # Uses active_experts from above (same as used for EMA and LoRA freezing).
-            # Schedule operates on GLOBAL steps (user-provided start_step/end_step
-            # are global steps). Per-expert filtering only controls WHICH gates update.
-            if self.rank_gates_scheduler is not None and self.network is not None:
-                gated_loras = self.network.gated_loras
-                if gated_loras:
-                    global_step = self.step_num
-                    
-                    # During hardening window: apply soft→hard interpolation to ALL experts.
-                    # The interpolation is idempotent (snapshot-based, no gradients), so
-                    # applying it to frozen experts is safe and necessary: with
-                    # switch_boundary_every > hardening_window, an expert could otherwise
-                    # be inactive for the entire window and its gates would jump abruptly
-                    # from soft to binary at finalize_gates.
-                    if self.rank_gates_scheduler.is_hardening(global_step):
-                        apply_hardening_interpolation(
-                            gated_loras, self.rank_gates_scheduler, global_step
-                        )
-                    
-                    # During annealing: update gates every N steps.
-                    # Only active expert's gates are updated (frozen expert untouched).
-                    elif self.rank_gates_scheduler.should_update(global_step):
-                        # Increment per-expert update count for correct temperature decay.
-                        if active_experts is not None:
-                            for expert in active_experts:
-                                self.rank_gates_expert_update_counts[expert] = \
-                                    self.rank_gates_expert_update_counts.get(expert, 0) + 1
-                        else:
-                            # Single-expert or shared mode: track under "shared" key
-                            self.rank_gates_expert_update_counts["shared"] = \
-                                self.rank_gates_expert_update_counts.get("shared", 0) + 1
-                        
+            # Rank gate annealing updates (after optimizer step) — PER-EXPERT and
+            # LEARNING-AWARE. Each expert's controller advances on its OWN clock
+            # driven by that expert's OWN loss (plateau) and LR (decay). Experts
+            # are fully independent: separate step counters, separate Fisher/grad
+            # EMAs, separate phase timelines.
+            if self.rank_gate_controllers and self.network is not None and self.network.gated_loras:
+                # ---- 1) Advance the ACTIVE expert's timeline + update gates ----
+                for key in self._active_gate_keys(active_experts):
+                    ctrl = self.rank_gate_controllers.get(key)
+                    if ctrl is None:
+                        continue
+                    expert_gated = self._expert_gated_loras(key)
+                    if not expert_gated:
+                        continue
+                    # Per-expert step counter (multistage: expert_step_counts).
+                    expert_step = self.step_num
+                    _esc = getattr(self, 'expert_step_counts', None)
+                    if key != "single" and _esc is not None:
+                        expert_step = _esc.get(key, self.step_num)
+                    # Per-expert loss (plateau signal) from the just-computed step.
+                    expert_loss = self.prev_expert_loss.get(self._loss_label_for_gate_key(key))
+                    # Per-expert LR (decay signal).
+                    expert_lr = self._get_expert_lr(key)
+                    status = ctrl.record(loss=expert_loss, lr=expert_lr, step=expert_step)
+
+                    if ctrl.should_update():
+                        rg = self.network_config.rank_gates
+                        # Compute per-tensor rank budgets ONCE, at the first
+                        # (post-warmup, plateau-confirmed) gate update, from the
+                        # CURRENT weights' energy spectrum. Each tensor (LoRA pair
+                        # or .diff) gets its own final target: the count of
+                        # components whose energy contribution is at least
+                        # target_min_rank_contribution.
+                        if not ctrl.budgets_computed:
+                            compute_tensor_budgets(
+                                expert_gated,
+                                target_min_contribution=rg.target_min_rank_contribution,
+                                fallback_ratio=rg.target_rank_ratio,
+                            )
+                            ctrl.budgets_computed = True
+                        tracker = self.fisher_trackers.get(key)
+                        if tracker is None:
+                            continue
+                        # Temperature decays with THIS expert's own update count.
+                        ctrl.update_count += 1
                         L_mid = update_rank_gates(
-                            gated_loras, self.fisher_tracker, 
-                            self.rank_gates_scheduler, global_step,
-                            active_experts=active_experts,
-                            expert_update_counts=self.rank_gates_expert_update_counts
-                        )
-                        # Log L_mid for monitoring
-                        self.additional_logs['loss/L_mid'] = L_mid.item()
-                    
-                    # Log stats periodically
-                    if global_step % 500 == 0:
-                        stats = log_gate_stats(gated_loras, global_step)
-                        writer = getattr(self, 'writer', None)
+                            expert_gated, tracker, ctrl, step=expert_step)
+                        # Log L_mid for monitoring (per-expert)
+                        self.additional_logs[f'loss/L_mid_{self._loss_label_for_gate_key(key)}'] = L_mid.item()
+
+                # ---- 2) Hardening interpolation: every expert in its own window ----
+                # Idempotent (snapshot-based, no gradients). A no-op for experts
+                # that have not yet entered their own (LR-driven) hardening window.
+                for key, ctrl in self.rank_gate_controllers.items():
+                    if ctrl.is_hardening():
+                        eg = self._expert_gated_loras(key)
+                        if eg:
+                            apply_hardening_interpolation(eg, ctrl, self.step_num)
+
+                # ---- 3) Periodic per-expert logging ----
+                if self.step_num % 500 == 0:
+                    writer = getattr(self, 'writer', None)
+                    for key, ctrl in self.rank_gate_controllers.items():
+                        eg = self._expert_gated_loras(key)
+                        if not eg:
+                            continue
+                        stats = log_gate_stats(eg, self.step_num)
                         if stats and writer is not None:
-                            for key, value in stats.items():
-                                writer.add_scalar(key, value, global_step)
+                            for k2, v in stats.items():
+                                writer.add_scalar(f"rank_gates/{key}/{k2.split('/')[-1]}", v, self.step_num)
+                        if key in self._active_gate_keys(active_experts):
+                            print(f"[RankGates:{key}] step={ctrl.step} phase={ctrl.phase} "
+                                  f"anneal={ctrl.annealing_progress:.3f} "
+                                  f"harden={ctrl.hardening_progress:.3f} "
+                                  f"loss_fast={ctrl.status()['loss_ema_fast']:.5f} "
+                                  f"lr_ratio={ctrl.status()['lr_ratio']:.4f}")
         else:
             # gradient accumulation. Just a place for breakpoint
             pass

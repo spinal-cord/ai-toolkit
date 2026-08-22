@@ -1599,27 +1599,192 @@ const docs: { [key: string]: ConfigDoc } = {
         <strong>Default:</strong> Enabled (recommended for all LoRA training).
         <br />
         <strong>Effect:</strong> Prevents rank collapse by making soft, curvature-aware pruning decisions instead of
-        hard truncation.
+        hard truncation. In dual-expert models (Wan 2.2 14B) each expert anneals on its own clock with fully
+        separate state (step counters, loss EMAs, Fisher EMAs).
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.auto_timing': {
+    title: 'Automated Timing (Loss + LR Aware)',
+    description: (
+      <>
+        When enabled (default), all annealing timing is detected automatically from the actual training dynamics —
+        per expert, on each expert's own clock:
+        <br />
+        <strong>Annealing starts</strong> when that expert's loss plateaus (fast loss EMA ≈ slow loss EMA for the
+        confirmation window, after warmup + the minimum-steps floor).
+        <br />
+        <strong>Annealing ends</strong> when the expert's learning rate has decayed below the end LR fraction of its
+        peak (with a step-clock fallback for constant LRs).
+        <br />
+        <strong>Hardening starts</strong> when the LR decays below the hardening LR fraction (learning is essentially
+        finished).
+        <br />
+        <br />
+        <strong>Disabled:</strong> falls back to the manual per-expert start step / end step / hardening window.
+        <br />
+        <strong>Default:</strong> true (recommended — no hardcoded step percentages).
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.start_after_warmup': {
+    title: 'Raise Annealing Floor Past LR Warmup',
+    description: (
+      <>
+        The annealing start is never earlier than <code>warmup_steps + 1</code> per-expert steps, so the first gate
+        decisions — and the per-tensor rank budgets computed at that moment — are based on stable (non-ramping)
+        gradients and an already-primed Fisher EMA.
+        <br />
+        <br />
+        <strong>Default:</strong> true.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.plateau_relative_threshold': {
+    title: 'Plateau: Min Relative Improvement',
+    description: (
+      <>
+        A step counts as "flat" when the relative improvement between the fast and slow loss EMAs
+        (<code>(slow - fast) / |slow|</code>) is below this threshold. This is the core loss-plateau signal that
+        triggers annealing start.
+        <br />
+        <br />
+        <strong>Lower (1e-4–1e-3):</strong> stricter plateau → annealing starts later.
+        <br />
+        <strong>Higher (1e-2+):</strong> looser plateau → annealing starts earlier.
+        <br />
+        <strong>Default:</strong> 0.005 (0.5%).
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.plateau_confirm_steps': {
+    title: 'Plateau: Confirm Steps',
+    description: (
+      <>
+        Number of <strong>consecutive</strong> flat steps required to confirm a plateau before annealing starts
+        (debounce, avoids triggering on a single noisy dip).
+        <br />
+        <br />
+        <strong>Default:</strong> 50.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.min_anneal_steps': {
+    title: 'Min Steps Before Annealing (per Expert)',
+    description: (
+      <>
+        Per-expert floor: annealing will never start before this many per-expert steps (also raised to
+        <code>warmup + 1</code> when "raise annealing floor past LR warmup" is on).
+        <br />
+        <br />
+        <strong>Default:</strong> 200.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.end_lr_fraction': {
+    title: 'Anneal Ends At LR Fraction of Peak',
+    description: (
+      <>
+        Annealing progress is driven by the learning rate itself: it completes when the LR has decayed below
+        <code>fraction × peak_lr</code> (the model is converging — safe to finish pruning).
+        <br />
+        <br />
+        <strong>Default:</strong> 0.2 (finish when LR &lt; 20% of peak).
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.anneal_max_duration': {
+    title: 'Anneal Max Duration (constant LR fallback, steps)',
+    description: (
+      <>
+        Per-expert step clock used when the learning rate is constant (no decay to track): annealing completes
+        after this many per-expert steps from the plateau-detected start.
+        <br />
+        <br />
+        <strong>Default:</strong> 1500.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.hardening_lr_fraction': {
+    title: 'Harden At LR Fraction of Peak',
+    description: (
+      <>
+        Final hardening (soft gates → binary {0,1} interpolation) starts automatically when the learning rate has
+        decayed below <code>fraction × peak_lr</code> — learning is essentially finished, so it is safe to commit
+        the pruning decisions. For constant LRs it triggers near the end of training instead.
+        <br />
+        <br />
+        <strong>Default:</strong> 0.05 (start hardening when LR &lt; 5% of peak).
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.hardening_min_steps': {
+    title: 'Min Hardening Window (per-Expert Steps)',
+    description: (
+      <>
+        Minimum length of the final soft→hard interpolation window, in per-expert steps (used as the step-based
+        trigger for constant LRs).
+        <br />
+        <br />
+        <strong>Default:</strong> 150.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.target_min_rank_contribution': {
+    title: 'Min Rank Energy Contribution to Keep',
+    description: (
+      <>
+        The main pruning knob in automatic mode. At annealing start, each tensor's own final target is computed
+        from its <strong>current</strong> energy spectrum (LoRA pairs: SVD of B@A; <code>.diff</code> tensors:
+        per-element energy): components contributing less than this fraction of the tensor's total energy are
+        annealed out.
+        <br />
+        <br />
+        <strong>Lower (5e-5):</strong> keep more ranks (less aggressive).
+        <br />
+        <strong>Higher (1e-3+):</strong> keep fewer ranks (more aggressive).
+        <br />
+        <strong>Default:</strong> 1e-4 (0.01% of tensor energy) — matches the offline LoRA statistics tool's
+        recommended-rank threshold.
       </>
     ),
   },
   'config.process[0].network.rank_gates.target_rank_ratio': {
-    title: 'Target Rank Ratio',
+    title: 'Fallback Target Rank Ratio',
     description: (
       <>
-        Final fraction of ranks to keep after annealing. Gates anneal from 1 → {0,1}, selecting which ranks survive.
+        Global FALLBACK final active fraction, used only for tensors whose per-tensor energy budget could not be
+        computed (e.g. weight references unavailable). With automatic per-tensor targets, most tensors never use
+        this.
         <br />
         <br />
-        <strong>Conservative (0.6–0.9):</strong> Keep more ranks. Use for small datasets, early exploration, or when
-        you want to preserve rank diversity.
+        <strong>Default:</strong> 0.3 (keep 30% of components).
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.save_truncated': {
+    title: 'Also Save Truncated Checkpoint (Reduce LoRA Rank)',
+    description: (
+      <>
+        When enabled, every save also emits a fully-truncated variant
+        (<code>&lt;name&gt;_truncated.safetensors</code>): the LoRA rank is <strong>physically reduced</strong> —
+        dead rows of <code>lora_down</code> and the matching columns of <code>lora_up</code> are removed and
+        <code>alpha</code> is rescaled so the per-rank scaling (alpha / rank) is preserved — instead of merely
+        zeroing them via the folded gates. The result is a genuinely smaller LoRA any standard loader can consume.
         <br />
-        <strong>Aggressive (0.2–0.4):</strong> Keep fewer ranks. Use for large datasets, quick pruning of
-        noise-dominated ranks, or when many ranks are redundant.
         <br />
-        <strong>Default:</strong> 0.3 (keep 30% of ranks, prune 70%).
+        <strong>Default:</strong> false.
+      </>
+    ),
+  },
+  'config.process[0].network.rank_gates.truncation_threshold': {
+    title: 'Truncation Gate Threshold',
+    description: (
+      <>
+        Gate value above which a rank is kept in the truncated checkpoint.
         <br />
         <br />
-        <em>Example:</em> With rank 256 and ratio 0.3, ~77 ranks will survive at the end of training.
+        <strong>Default:</strong> 0.5.
       </>
     ),
   },
@@ -1753,19 +1918,15 @@ const docs: { [key: string]: ConfigDoc } = {
     ),
   },
   'config.process[0].network.rank_gates.hardening_window': {
-    title: 'Hardening Window',
+    title: 'Hardening Window (manual mode only)',
     description: (
       <>
-        Number of steps at the end of training for soft→hard interpolation. Gates gradually binarize during this
-        window.
+        Number of per-expert steps for soft→hard interpolation. Only used when <strong>Automated timing is
+        disabled</strong> — with automated timing the hardening window is detected from the learning-rate decay
+        instead (see "Harden At LR Fraction of Peak").
         <br />
         <br />
-        <strong>Typical range:</strong> 200–1000 steps.
-        <br />
-        <strong>Default:</strong> 500 (auto-capped at 5% of total steps for short runs).
-        <br />
-        <br />
-        <em>Effect:</em> Longer windows give smoother finalization; shorter windows make quicker final cuts.
+        <strong>Default:</strong> 500 (auto-capped at 5% of per-expert steps for short runs).
       </>
     ),
   },
@@ -1787,15 +1948,14 @@ const docs: { [key: string]: ConfigDoc } = {
     ),
   },
   'config.process[0].network.rank_gates.start_step': {
-    title: 'Start Step (Annealing)',
+    title: 'Start Step (manual mode only)',
     description: (
       <>
-        Global step at which annealing begins. Leave empty for auto (5% of total steps).
+        Per-expert step at which annealing begins. Only used when <strong>Automated timing is disabled</strong> —
+        with automated timing the start is detected from the expert's loss plateau instead.
         <br />
         <br />
-        <strong>Auto:</strong> <code>max(100, total_steps × 0.05)</code>.
-        <br />
-        <strong>Manual:</strong> Set after warmup completes (typically 500–2000 steps).
+        <strong>Auto default (manual mode):</strong> <code>max(100, per_expert_steps × 0.05)</code>.
         <br />
         <br />
         <em>Tip:</em> Don't start annealing during warmup; let weights stabilize first.
@@ -1803,18 +1963,14 @@ const docs: { [key: string]: ConfigDoc } = {
     ),
   },
   'config.process[0].network.rank_gates.end_step': {
-    title: 'End Step (Annealing)',
+    title: 'End Step (manual mode only)',
     description: (
       <>
-        Global step at which annealing completes. Leave empty for auto (75% of total steps).
+        Per-expert step at which annealing completes. Only used when <strong>Automated timing is disabled</strong> —
+        with automated timing the end is driven by the expert's learning-rate decay instead.
         <br />
         <br />
-        <strong>Auto:</strong> <code>min(total_steps - hardening_window, total_steps × 0.75)</code>.
-        <br />
-        <strong>Manual:</strong> Set before the hardening window begins.
-        <br />
-        <br />
-        <em>Note:</em> Must be less than <code>total_steps - hardening_window</code>.
+        <strong>Auto default (manual mode):</strong> <code>per_expert_steps × 0.75</code>.
       </>
     ),
   },

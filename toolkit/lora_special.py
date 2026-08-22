@@ -14,7 +14,7 @@ from toolkit.models.lokr import LokrModule
 from .config_modules import NetworkConfig, get_wan22_tensor_type_from_name, WAN22_TENSOR_TYPES, is_wan22_tensor_type_enabled, _is_single_tensor_type
 from .lorm import count_parameters
 from .network_mixins import ToolkitNetworkMixin, ToolkitModuleMixin, ExtractableModuleMixin
-from .rank_gates import GatedLoRA
+from .rank_gates import GatedLoRA, GatedDiff
 
 from toolkit.kohya_lora import LoRANetwork
 from toolkit.models.DoRA import DoRAModule
@@ -268,12 +268,21 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
         # dequantize quantized weights to full precision so the delta can be added (the original
         # quantized tensor is restored in the finally block below)
         base_weight = _dequantize_if_needed(orig_weight)
-        eff_weight = base_weight + (self.diff.to(base_weight.device) * mult).to(base_weight.dtype)
+        diff_t = self.diff.to(base_weight.device)
+        # Apply per-element rank gates (SparseForge-style annealing) to the diff
+        rg = getattr(self, 'rank_gate', None)
+        if rg is not None:
+            diff_t = rg.apply_gates(diff_t)
+        eff_weight = base_weight + (diff_t * mult).to(base_weight.dtype)
 
         has_bias = self.diff_b is not None and om._parameters.get('bias', None) is not None
         if has_bias:
             orig_bias = om._parameters['bias']
-            eff_bias = orig_bias + (self.diff_b.to(orig_bias.device) * mult).to(orig_bias.dtype)
+            diff_b_t = self.diff_b.to(orig_bias.device)
+            rg_b = getattr(self, 'rank_gate_b', None)
+            if rg_b is not None:
+                diff_b_t = rg_b.apply_gates(diff_b_t)
+            eff_bias = orig_bias + (diff_b_t * mult).to(orig_bias.dtype)
 
         # temporarily swap in the effective weights so the original forward (norm/linear/etc) uses them.
         # this keeps autograd flowing into our delta while supporting any layer type.
@@ -298,8 +307,13 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
             return
         org_weight = om.weight
         orig_dtype = org_weight.dtype
+        # apply rank gates so merged weights match the gated forward pass
+        diff_eff = self.diff.float().to(org_weight.device)
+        rg = getattr(self, 'rank_gate', None)
+        if rg is not None:
+            diff_eff = rg.apply_gates(diff_eff)
         # dequantize torchao weights so we can fold the full precision delta in
-        merged_weight = _dequantize_if_needed(org_weight).float() + merge_weight * self.diff.float().to(org_weight.device)
+        merged_weight = _dequantize_if_needed(org_weight).float() + merge_weight * diff_eff
         if self.weight_is_quantized:
             # re-quantize so the model stays quantized across continuous merge/reset cycles
             from toolkit.util.quantize import get_torchao_config, requantize_module_weight
@@ -308,7 +322,11 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
             om.weight.data = merged_weight.to(org_weight.device, orig_dtype)
         # bias is never quantized
         if self.diff_b is not None and getattr(om, 'bias', None) is not None:
-            om.bias.data = (om.bias.data.float() + merge_weight * self.diff_b.float().to(om.bias.device)).to(om.bias.dtype)
+            diff_b_eff = self.diff_b.float().to(org_weight.device)
+            rg_b = getattr(self, 'rank_gate_b', None)
+            if rg_b is not None:
+                diff_b_eff = rg_b.apply_gates(diff_b_eff)
+            om.bias.data = (om.bias.data.float() + merge_weight * diff_b_eff).to(om.bias.dtype)
 
     def reset_weights(self: 'FullModule'):
         with torch.no_grad():
@@ -452,8 +470,9 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             module_class = LokrModule
         self.network_config: NetworkConfig = kwargs.get("network_config", None)
         
-        # List of all GatedLoRA instances for rank gate annealing
-        self.gated_loras: List[GatedLoRA] = []
+        # List of all gated tensors (GatedLoRA for LoRA pairs, GatedDiff for
+        # full-finetune .diff tensors) for rank gate annealing
+        self.gated_loras: List = []
 
         self.peft_format = peft_format
         self.is_transformer = is_transformer
@@ -909,6 +928,45 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                             )
                             loras.append(lora)
                             lora_shape_dict[lora_name] = [list(lora.diff.shape)]
+                            
+                            # Create GatedDiff instances for rank gate annealing of .diff
+                            # tensors (full finetune: 1D layer norms/biases, conv deltas).
+                            # Per-element gates cover ALL elements of the diff tensor(s),
+                            # so every tensor in the LoRA participates in the annealing.
+                            if (self.network_config is not None and 
+                                self.network_config.rank_gates is not None and 
+                                self.network_config.rank_gates.enabled and
+                                not self.full_rank):
+                                
+                                owner = None
+                                if _is_multistage_root:
+                                    if child_name.startswith("transformer_1"):
+                                        owner = "transformer_1"
+                                    elif child_name.startswith("transformer_2"):
+                                        owner = "transformer_2"
+                                
+                                def _add_diff_gate(param, gate_attr):
+                                    if param is None:
+                                        return
+                                    # gate_attr 'rank_gate' -> 'diff', 'rank_gate_b' -> 'diff_b'
+                                    key_suffix = gate_attr.replace("rank_gate", "diff")
+                                    gd = GatedDiff(
+                                        lora_name=lora_name,
+                                        num_elements=param.numel(),
+                                        device=param.device,
+                                        dtype=param.dtype,
+                                        owner_transformer=owner,
+                                        param_ref=param,
+                                        key_suffix=key_suffix,
+                                    )
+                                    # Registered as a submodule so gate values are saved
+                                    # in mid-training checkpoints (resume) and folded into
+                                    # the diff at final save (see get_state_dict).
+                                    setattr(lora, gate_attr, gd)
+                                    self.gated_loras.append(gd)
+                                
+                                _add_diff_gate(lora.diff, "rank_gate")
+                                _add_diff_gate(lora.diff_b, "rank_gate_b")
             return loras, skipped
 
         text_encoders = text_encoder if type(text_encoder) == list else [text_encoder]
@@ -1062,8 +1120,12 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             by_expert = get_gated_loras_by_expert(self.gated_loras)
             total_ranks = sum(gl.r for gl in self.gated_loras)
             rg = self.network_config.rank_gates
-            print(f"\n[RankGates] ENABLED with {len(self.gated_loras)} gated LoRA modules, {total_ranks} total ranks")
-            print(f"  Target rank ratio: {rg.target_rank_ratio} (keep {int(100*rg.target_rank_ratio)}% of ranks)")
+            n_diff = sum(1 for g in self.gated_loras if isinstance(g, GatedDiff))
+            print(f"\n[RankGates] ENABLED with {len(self.gated_loras)} gated tensors "
+                  f"({len(self.gated_loras) - n_diff} LoRA, {n_diff} diff), {total_ranks} total gated components")
+            print(f"  Target min rank contribution: {rg.target_min_rank_contribution} "
+                  f"(per-tensor targets computed from energy spectrum at annealing start; "
+                  f"fallback ratio {rg.target_rank_ratio})")
             print(f"  Start step: {rg.start_step}, End step: {rg.end_step}, Update every: {rg.update_every}")
             print(f"  Temperature: {rg.temperature}, Gamma: {rg.gamma}, Alpha: {rg.alpha}")
             print(f"  Lambda mid max: {rg.lambda_mid_max}")

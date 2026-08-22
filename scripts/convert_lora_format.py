@@ -14,6 +14,10 @@ Precision handling:
   time projection, patch embedding, and head/proj output tensors are kept in
   float32.
 
+  In addition, the first 1 and last 4 transformer blocks (front/tail layers) are
+  always kept in float32 for numerical stability, regardless of their size class.
+  This can be tuned with --fp32_front_layers and --fp32_tail_layers.
+
 Usage:
     python scripts/convert_lora_format.py /path/to/lora.safetensors
     python scripts/convert_lora_format.py /path/to/lora.safetensors --dtype float16
@@ -110,6 +114,8 @@ LARGE_BLOCK_LINEAR_RE = re.compile(
     r"|"
     r"^diffusion_model\.blocks\.\d+\.ffn\.(?:0|2)\.weight$"
 )
+
+BLOCK_INDEX_RE = re.compile(r"blocks\.(\d+)\.")
 
 
 def _remove_transformer_prefix(key: str) -> str:
@@ -242,6 +248,18 @@ def canonical_base_key(key: str) -> str:
     return key
 
 
+def extract_block_index(key: str):
+    """
+    Return the transformer block index for a key, or None if the key does not
+    belong to a transformer block (e.g. condition embedder, proj_out, etc.).
+    """
+    canonical_key = canonical_base_key(key)
+    match = BLOCK_INDEX_RE.search(canonical_key)
+    if match:
+        return int(match.group(1))
+    return None
+
+
 def is_small_tensor(key: str, shape) -> bool:
     """
     Heuristic for tensors that should usually stay in float32:
@@ -285,15 +303,25 @@ def choose_precision(
     tensor: torch.Tensor,
     small_precision: str,
     large_precision: str,
+    fp32_layer_indices: set = None,
 ) -> str:
     """
     Choose target precision for a tensor.
 
     Default intended behavior:
+      - front/tail transformer blocks (fp32_layer_indices) -> float32
       - small tensors -> float32 unless overridden
       - large block attention/FFN weights -> bfloat16 unless --dtype changes it
     """
     shape = tuple(tensor.shape)
+
+    # Front/tail layers are always kept in float32 for numerical stability,
+    # regardless of whether the tensor would otherwise be classified as small
+    # or large.
+    if fp32_layer_indices:
+        block_index = extract_block_index(key)
+        if block_index is not None and block_index in fp32_layer_indices:
+            return "float32"
 
     if is_small_tensor(key, shape):
         return small_precision
@@ -352,6 +380,26 @@ def main():
     )
 
     parser.add_argument(
+        "--fp32_front_layers",
+        type=int,
+        default=1,
+        help=(
+            "Number of leading transformer blocks to keep in float32. "
+            "Default: 1"
+        ),
+    )
+
+    parser.add_argument(
+        "--fp32_tail_layers",
+        type=int,
+        default=4,
+        help=(
+            "Number of trailing transformer blocks to keep in float32. "
+            "Default: 4"
+        ),
+    )
+
+    parser.add_argument(
         "--output-path",
         type=str,
         default=None,
@@ -385,6 +433,27 @@ def main():
     print("Converting keys (removing transformer_N. prefix)...")
     converted_state_dict = convert_lora_keys(lora_state_dict)
 
+    # Determine which transformer blocks to keep in float32 (front + tail layers).
+    block_indices = set()
+    for key in converted_state_dict:
+        idx = extract_block_index(key)
+        if idx is not None:
+            block_indices.add(idx)
+    num_layers = (max(block_indices) + 1) if block_indices else 0
+
+    front_count = min(max(args.fp32_front_layers, 0), num_layers)
+    tail_count = min(max(args.fp32_tail_layers, 0), num_layers)
+    fp32_layer_indices = (
+        set(range(front_count)) | set(range(num_layers - tail_count, num_layers))
+    ) if num_layers > 0 else set()
+
+    if fp32_layer_indices:
+        print(
+            f"Keeping {len(fp32_layer_indices)} front/tail layers in float32 "
+            f"(front={front_count}, tail={tail_count}, total blocks={num_layers}): "
+            f"{sorted(fp32_layer_indices)}"
+        )
+
     # Convert tensors to selected precisions.
     print(
         "Converting tensors "
@@ -400,6 +469,7 @@ def main():
             tensor=value,
             small_precision=small_precision,
             large_precision=large_precision,
+            fp32_layer_indices=fp32_layer_indices,
         )
         target_dtype = DTYPE_MAP[target_precision]
 
@@ -417,11 +487,17 @@ def main():
     # Generate output filename.
     base_name = os.path.splitext(os.path.basename(args.lora_input))[0]
 
-    if small_precision == large_precision:
-        suffix = precision_abbr(large_precision)
-    elif not small_was_specified and small_precision == "float32":
+    used_precisions = set(precision_counter.keys())
+
+    if len(used_precisions) == 1:
+        suffix = precision_abbr(next(iter(used_precisions)))
+    elif (
+        not small_was_specified
+        and small_precision == "float32"
+        and used_precisions <= {"bfloat16", "float32"}
+    ):
         # Preserve the traditional output name for the default mixed behavior:
-        # large tensors BF16, small tensors FP32.
+        # large tensors BF16, small/front-tail tensors FP32.
         suffix = precision_abbr(large_precision)
     else:
         suffix = (
@@ -442,6 +518,11 @@ def main():
     print(f"  Output: {output_path}")
     print(f"  Large/default precision: {large_precision}")
     print(f"  Small precision: {small_precision}")
+    if fp32_layer_indices:
+        print(
+            f"  FP32 front/tail layers ({len(fp32_layer_indices)} blocks): "
+            f"{sorted(fp32_layer_indices)}"
+        )
     print(f"  Keys: {len(final_state_dict)} tensors")
 
     print("\nTensor counts by precision:")

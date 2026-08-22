@@ -188,298 +188,410 @@ function SoftcapOverridesSection({ jobConfig, setJobConfig }: { jobConfig: JobCo
 }
 
 // ============================================================================
-function RankGateConfigSection({ jobConfig, setJobConfig }: { jobConfig: JobConfig; setJobConfig: (value: any, key: string) => void }) {
-  const [collapsed, setCollapsed] = useState(true);
+// ============================================================================
+// Rank Gate Annealing Section (top-level, like TREAD Token Routing)
+// ============================================================================
+function RankGateAnnealingSection({ jobConfig, setJobConfig }: { jobConfig: JobConfig; setJobConfig: (value: any, key: string) => void }) {
   const rg = jobConfig.config.process[0].network?.rank_gates || {};
   const enabled = rg.enabled !== false; // defaults to true
+  const autoTiming = rg.auto_timing !== false; // defaults to true
+  const base = 'config.process[0].network.rank_gates';
 
   const setRg = (key: string, value: any) => {
-    setJobConfig({ ...rg, [key]: value }, 'config.process[0].network.rank_gates');
+    setJobConfig({ ...rg, [key]: value }, base);
+  };
+
+  // Preset buttons: set the per-tensor energy threshold (the actual pruning
+  // knob in auto mode) plus the gate-dynamics strength.
+  const applyPreset = (label: string, values: Record<string, any>) => {
+    console.log(`[RankGates] preset ${label}`, values);
+    // setRg only writes one key at a time (it spreads the captured rg), so
+    // build the merged object in one call.
+    setJobConfig({ ...rg, ...values }, base);
+  };
+
+  const presetStyle: React.CSSProperties = {
+    padding: '4px 8px',
+    fontSize: '10px',
+    cursor: 'pointer',
+    background: 'var(--bg-tertiary)',
+    color: 'var(--text)',
+    border: '1px solid var(--border)',
+    borderRadius: '4px',
   };
 
   return (
-    <div style={{ marginTop: '16px', paddingTop: '16px', borderTop: '1px solid var(--border)' }}>
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          cursor: 'pointer',
-          padding: '4px 0',
-        }}
-        onClick={() => setCollapsed(!collapsed)}
-      >
-        <div>
-          <div style={{ fontWeight: 600, color: 'var(--accent)' }}>Rank Gate Annealing (SparseForge-inspired)</div>
-          <div style={{ fontSize: '11px', color: 'var(--muted)' }}>
-            Soft, curvature-aware rank gating. Enabled by default. Prevents rank collapse during training.
-          </div>
-        </div>
-        <span style={{ fontSize: '16px', color: 'var(--muted)' }}>{collapsed ? '▸' : '▾'}</span>
-      </div>
-
-      {!collapsed && (
-        <div style={{ marginTop: '12px' }}>
-          {/* Enable/Disable */}
+    <Card title="Rank Gate Annealing" collapsible>
+      <div className="space-y-4">
+        <div className="flex flex-col gap-1">
           <Checkbox
-            label="Enable Rank Gates"
-            docKey="config.process[0].network.rank_gates.enabled"
+            label="Enable Rank Gate Annealing"
+            docKey={`${base}.enabled`}
             checked={enabled}
             onChange={value => setRg('enabled', value)}
           />
-
-          {enabled && (
-            <>
-              {/* Target Rank Ratio */}
-              <div style={{ marginTop: '12px' }}>
-                <div style={{ fontSize: '12px', fontWeight: 500, marginBottom: '4px', color: 'var(--accent)' }}>Pruning Targets</div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                  <NumberInput
-                    label="Target Rank Ratio"
-                    docKey="config.process[0].network.rank_gates.target_rank_ratio"
-                    value={rg.target_rank_ratio ?? 0.3}
-                    onChange={value => setRg('target_rank_ratio', value)}
-                    placeholder="0.3 = keep 30% of ranks (aggressive default)"
-                    min={0.1}
-                    max={1.0}
-                    step={0.05}
-                  />
-                  <NumberInput
-                    label="Update Every Steps"
-                    docKey="config.process[0].network.rank_gates.update_every"
-                    value={rg.update_every ?? 15}
-                    onChange={value => setRg('update_every', value)}
-                    placeholder="Update gates every N steps (default: 15)"
-                    min={1}
-                    max={1000}
-                  />
-                </div>
-              </div>
-
-              {/* Annealing Timing */}
-              <div style={{ marginTop: '12px' }}>
-                <div style={{ fontSize: '12px', fontWeight: 500, marginBottom: '4px', color: 'var(--accent)' }}>Annealing Timing (leave empty for auto)</div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                  <NumberInput
-                    label="Start Step"
-                    docKey="config.process[0].network.rank_gates.start_step"
-                    value={rg.start_step ?? ''}
-                    onChange={value => setRg('start_step', value === '' ? null : value)}
-                    placeholder="Auto: 5% of total"
-                    min={0}
-                  />
-                  <NumberInput
-                    label="End Step"
-                    docKey="config.process[0].network.rank_gates.end_step"
-                    value={rg.end_step ?? ''}
-                    onChange={value => setRg('end_step', value === '' ? null : value)}
-                    placeholder="Auto: 75% of total"
-                    min={0}
-                  />
-                </div>
-              </div>
-
-              {/* Temperature & Decay */}
-              <div style={{ marginTop: '12px' }}>
-                <div style={{ fontSize: '12px', fontWeight: 500, marginBottom: '4px', color: 'var(--accent)' }}>Temperature & Decay</div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '8px' }}>
-                  <NumberInput
-                    label="Temperature"
-                    docKey="config.process[0].network.rank_gates.temperature"
-                    value={rg.temperature ?? 1.0}
-                    onChange={value => setRg('temperature', value)}
-                    placeholder="Initial sigmoid temperature"
-                    min={0.1}
-                    max={10}
-                    step={0.1}
-                  />
-                  <NumberInput
-                    label="Gamma (Temp Decay)"
-                    docKey="config.process[0].network.rank_gates.gamma"
-                    value={rg.gamma ?? 0.95}
-                    onChange={value => setRg('gamma', value)}
-                    placeholder="T ← γT per update (default: 0.95)"
-                    min={0.9}
-                    max={0.999}
-                    step={0.001}
-                  />
-                  <NumberInput
-                    label="Alpha (Gate EMA)"
-                    docKey="config.process[0].network.rank_gates.alpha"
-                    value={rg.alpha ?? 0.1}
-                    onChange={value => setRg('alpha', value)}
-                    placeholder="Gate update rate (default: 0.1)"
-                    min={0.001}
-                    max={0.5}
-                    step={0.001}
-                  />
-                </div>
-              </div>
-
-              {/* Binary Preference */}
-              <div style={{ marginTop: '12px' }}>
-                <div style={{ fontSize: '12px', fontWeight: 500, marginBottom: '4px', color: 'var(--accent)' }}>Binary Preference Penalty (L_mid)</div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                  <NumberInput
-                    label="Lambda Mid Max"
-                    docKey="config.process[0].network.rank_gates.lambda_mid_max"
-                    value={rg.lambda_mid_max ?? 0.01}
-                    onChange={value => setRg('lambda_mid_max', value)}
-                    placeholder="Max penalty strength (default: 0.01)"
-                    min={0}
-                    max={0.1}
-                    step={0.001}
-                  />
-                  <NumberInput
-                    label="Eta Penalty"
-                    docKey="config.process[0].network.rank_gates.eta_pen"
-                    value={rg.eta_pen ?? 0.01}
-                    onChange={value => setRg('eta_pen', value)}
-                    placeholder="Mid-preference nudge"
-                    min={0}
-                    max={1}
-                    step={0.001}
-                  />
-                </div>
-              </div>
-
-              {/* Fisher & Scoring */}
-              <div style={{ marginTop: '12px' }}>
-                <div style={{ fontSize: '12px', fontWeight: 500, marginBottom: '4px', color: 'var(--accent)' }}>Fisher & Scoring</div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                  <NumberInput
-                    label="Fisher Decay"
-                    docKey="config.process[0].network.rank_gates.fisher_decay"
-                    value={rg.fisher_decay ?? 0.999}
-                    onChange={value => setRg('fisher_decay', value)}
-                    placeholder="EMA decay for Fisher"
-                    min={0.9}
-                    max={0.9999}
-                    step={0.0001}
-                  />
-                  <Checkbox
-                    label="Use First-Order Term |g·w|"
-                    docKey="config.process[0].network.rank_gates.use_first_order"
-                    checked={rg.use_first_order !== false}
-                    onChange={value => setRg('use_first_order', value)}
-                  />
-                </div>
-              </div>
-
-              {/* Hardening */}
-              <div style={{ marginTop: '12px' }}>
-                <div style={{ fontSize: '12px', fontWeight: 500, marginBottom: '4px', color: 'var(--accent)' }}>Final Hardening</div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                  <NumberInput
-                    label="Hardening Window"
-                    docKey="config.process[0].network.rank_gates.hardening_window"
-                    value={rg.hardening_window ?? 500}
-                    onChange={value => setRg('hardening_window', value)}
-                    placeholder="Steps for soft→hard transition"
-                    min={0}
-                    max={10000}
-                  />
-                  <Checkbox
-                    label="Final Hardening (Binarize)"
-                    docKey="config.process[0].network.rank_gates.final_hardening"
-                    checked={rg.final_hardening !== false}
-                    onChange={value => setRg('final_hardening', value)}
-                  />
-                </div>
-              </div>
-
-              {/* Quick Presets */}
-              <div style={{ marginTop: '12px', display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setRg('target_rank_ratio', 0.8);
-                    setRg('lambda_mid_max', 0.002);
-                    setRg('alpha', 0.02);
-                    setRg('gamma', 0.98);
-                    setRg('update_every', 40);
-                  }}
-                  style={{
-                    padding: '4px 8px',
-                    fontSize: '10px',
-                    cursor: 'pointer',
-                    background: 'var(--bg-tertiary)',
-                    color: 'var(--text)',
-                    border: '1px solid var(--border)',
-                    borderRadius: '4px',
-                  }}
-                >
-                  Conservative (80% keep)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setRg('target_rank_ratio', 0.5);
-                    setRg('lambda_mid_max', 0.005);
-                    setRg('alpha', 0.05);
-                    setRg('gamma', 0.97);
-                    setRg('update_every', 25);
-                  }}
-                  style={{
-                    padding: '4px 8px',
-                    fontSize: '10px',
-                    cursor: 'pointer',
-                    background: 'var(--bg-tertiary)',
-                    color: 'var(--text)',
-                    border: '1px solid var(--border)',
-                    borderRadius: '4px',
-                  }}
-                >
-                  Moderate (50% keep)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setRg('target_rank_ratio', 0.3);
-                    setRg('lambda_mid_max', 0.01);
-                    setRg('alpha', 0.1);
-                    setRg('gamma', 0.95);
-                    setRg('update_every', 15);
-                  }}
-                  style={{
-                    padding: '4px 8px',
-                    fontSize: '10px',
-                    cursor: 'pointer',
-                    background: 'var(--bg-tertiary)',
-                    color: 'var(--text)',
-                    border: '1px solid var(--border)',
-                    borderRadius: '4px',
-                  }}
-                >
-                  Aggressive Default (30% keep)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setRg('target_rank_ratio', 0.2);
-                    setRg('lambda_mid_max', 0.015);
-                    setRg('alpha', 0.15);
-                    setRg('gamma', 0.94);
-                    setRg('update_every', 12);
-                  }}
-                  style={{
-                    padding: '4px 8px',
-                    fontSize: '10px',
-                    cursor: 'pointer',
-                    background: 'var(--bg-tertiary)',
-                    color: 'var(--text)',
-                    border: '1px solid var(--border)',
-                    borderRadius: '4px',
-                  }}
-                >
-                  Very Aggressive (20% keep)
-                </button>
-              </div>
-            </>
-          )}
+          <p className="text-xs text-gray-500">
+            SparseForge-inspired soft, curvature-aware rank gating (enabled by default). Every LoRA rank —
+            and every full-finetune <code>.diff</code> element (layer norms, biases, conv deltas) — gets a
+            soft gate that anneals to {'{0,1}'} so redundant capacity is pruned smoothly instead of by hard
+            truncation. In dual-expert models each expert anneals on its own clock with fully separate
+            state (step counters, loss EMAs, Fisher EMAs).
+          </p>
         </div>
-      )}
-    </div>
+
+        {enabled && (
+          <>
+            {/* ================= Automatic features ================= */}
+            <FormGroup label="Automatic Features">
+              <div className="flex flex-col gap-1">
+                <Checkbox
+                  label="Automated timing (detect from loss plateau + learning-rate decay)"
+                  docKey={`${base}.auto_timing`}
+                  checked={autoTiming}
+                  onChange={value => setRg('auto_timing', value)}
+                />
+                <p className="text-xs text-gray-500">
+                  {autoTiming
+                    ? 'No hardcoded steps: per expert, annealing starts when its loss plateaus, completes when its learning rate decays below the end threshold, and final hardening starts when the learning rate is nearly gone.'
+                    : 'Manual mode: fixed per-expert start / end / hardening steps (below).'}
+                </p>
+              </div>
+
+              {autoTiming ? (
+                <div className="mt-3 space-y-3">
+                  <Checkbox
+                    label="Raise annealing floor past LR warmup"
+                    docKey={`${base}.start_after_warmup`}
+                    checked={rg.start_after_warmup !== false}
+                    onChange={value => setRg('start_after_warmup', value)}
+                  />
+                  <div>
+                    <div className="text-xs font-semibold text-gray-400 uppercase mb-2">
+                      Annealing start — automatic loss-plateau detection
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <NumberInput
+                        label="Plateau: min relative improvement"
+                        docKey={`${base}.plateau_relative_threshold`}
+                        value={rg.plateau_relative_threshold ?? 5e-3}
+                        onChange={value => setRg('plateau_relative_threshold', value)}
+                        placeholder="0.005 = loss counts as flat below 0.5% change"
+                        min={1e-4}
+                        max={0.1}
+                      />
+                      <NumberInput
+                        label="Plateau: confirm steps"
+                        docKey={`${base}.plateau_confirm_steps`}
+                        value={rg.plateau_confirm_steps ?? 50}
+                        onChange={value => setRg('plateau_confirm_steps', value)}
+                        placeholder="50 consecutive flat steps to start"
+                        min={1}
+                        max={10000}
+                      />
+                      <NumberInput
+                        label="Min steps before annealing (per expert)"
+                        docKey={`${base}.min_anneal_steps`}
+                        value={rg.min_anneal_steps ?? 200}
+                        onChange={value => setRg('min_anneal_steps', value)}
+                        placeholder="200"
+                        min={0}
+                        max={100000}
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-xs font-semibold text-gray-400 uppercase mb-2">
+                      Annealing end + hardening — automatic LR-decay detection
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                      <NumberInput
+                        label="Anneal ends at LR fraction of peak"
+                        docKey={`${base}.end_lr_fraction`}
+                        value={rg.end_lr_fraction ?? 0.2}
+                        onChange={value => setRg('end_lr_fraction', value)}
+                        placeholder="0.2 = finish when LR &lt; 20% of peak"
+                        min={0.01}
+                        max={1}
+                      />
+                      <NumberInput
+                        label="Anneal max duration (constant LR fallback, steps)"
+                        docKey={`${base}.anneal_max_duration`}
+                        value={rg.anneal_max_duration ?? 1500}
+                        onChange={value => setRg('anneal_max_duration', value)}
+                        placeholder="1500"
+                        min={10}
+                        max={100000}
+                      />
+                      <NumberInput
+                        label="Harden at LR fraction of peak"
+                        docKey={`${base}.hardening_lr_fraction`}
+                        value={rg.hardening_lr_fraction ?? 0.05}
+                        onChange={value => setRg('hardening_lr_fraction', value)}
+                        placeholder="0.05 = start hardening when LR &lt; 5% of peak"
+                        min={0.001}
+                        max={1}
+                      />
+                      <NumberInput
+                        label="Min hardening window (per-expert steps)"
+                        docKey={`${base}.hardening_min_steps`}
+                        value={rg.hardening_min_steps ?? 150}
+                        onChange={value => setRg('hardening_min_steps', value)}
+                        placeholder="150"
+                        min={10}
+                        max={100000}
+                      />
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-3">
+                  <div className="text-xs font-semibold text-gray-400 uppercase mb-2">
+                    Manual timing (per-expert steps)
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <NumberInput
+                      label="Start Step"
+                      docKey={`${base}.start_step`}
+                      value={rg.start_step ?? null}
+                      onChange={value => setRg('start_step', value)}
+                      placeholder="default: 5% of per-expert steps"
+                      min={0}
+                    />
+                    <NumberInput
+                      label="End Step"
+                      docKey={`${base}.end_step`}
+                      value={rg.end_step ?? null}
+                      onChange={value => setRg('end_step', value)}
+                      placeholder="default: 75% of per-expert steps"
+                      min={0}
+                    />
+                    <NumberInput
+                      label="Hardening Window (steps)"
+                      docKey={`${base}.hardening_window`}
+                      value={rg.hardening_window ?? 500}
+                      onChange={value => setRg('hardening_window', value)}
+                      placeholder="500"
+                      min={0}
+                      max={100000}
+                    />
+                  </div>
+                </div>
+              )}
+            </FormGroup>
+
+            {/* ================= Per-tensor automatic targets ================= */}
+            <FormGroup label="Per-Tensor Rank Targets (automatic from energy spectrum)">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <NumberInput
+                  label="Min rank energy contribution to keep"
+                  docKey={`${base}.target_min_rank_contribution`}
+                  value={rg.target_min_rank_contribution ?? 1e-4}
+                  onChange={value => setRg('target_min_rank_contribution', value)}
+                  placeholder="1e-4 = keep components ≥ 0.01% of tensor energy"
+                  min={1e-6}
+                  max={0.5}
+                />
+                <NumberInput
+                  label="Fallback target rank ratio"
+                  docKey={`${base}.target_rank_ratio`}
+                  value={rg.target_rank_ratio ?? 0.3}
+                  onChange={value => setRg('target_rank_ratio', value)}
+                  placeholder="0.3 = keep 30% (only if a tensor's budget fails)"
+                  min={0.1}
+                  max={1.0}
+                />
+              </div>
+              <p className="text-xs text-gray-500 mt-2">
+                At annealing start, each tensor&apos;s own final target is computed from its CURRENT energy
+                spectrum (LoRA pairs: SVD of B@A; <code>.diff</code> tensors: per-element energy) — no single
+                global ratio. Raise the contribution threshold for more aggressive pruning.
+              </p>
+            </FormGroup>
+
+            {/* ================= Gate dynamics ================= */}
+            <FormGroup label="Gate Dynamics">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <NumberInput
+                  label="Temperature"
+                  docKey={`${base}.temperature`}
+                  value={rg.temperature ?? 1.0}
+                  onChange={value => setRg('temperature', value)}
+                  placeholder="Initial sigmoid temperature"
+                  min={0.1}
+                  max={10}
+                />
+                <NumberInput
+                  label="Gamma (temp decay per update)"
+                  docKey={`${base}.gamma`}
+                  value={rg.gamma ?? 0.95}
+                  onChange={value => setRg('gamma', value)}
+                  placeholder="0.95"
+                  min={0.9}
+                  max={0.999}
+                />
+                <NumberInput
+                  label="Alpha (gate EMA rate)"
+                  docKey={`${base}.alpha`}
+                  value={rg.alpha ?? 0.1}
+                  onChange={value => setRg('alpha', value)}
+                  placeholder="0.1"
+                  min={0.001}
+                  max={0.5}
+                />
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
+                <NumberInput
+                  label="Lambda Mid Max (L_mid)"
+                  docKey={`${base}.lambda_mid_max`}
+                  value={rg.lambda_mid_max ?? 0.01}
+                  onChange={value => setRg('lambda_mid_max', value)}
+                  placeholder="0.01"
+                  min={0}
+                  max={0.1}
+                />
+                <NumberInput
+                  label="Eta Penalty (mid nudge)"
+                  docKey={`${base}.eta_pen`}
+                  value={rg.eta_pen ?? 0.01}
+                  onChange={value => setRg('eta_pen', value)}
+                  placeholder="0.01"
+                  min={0}
+                  max={1}
+                />
+                <NumberInput
+                  label="Update Every (per-expert steps)"
+                  docKey={`${base}.update_every`}
+                  value={rg.update_every ?? 15}
+                  onChange={value => setRg('update_every', value)}
+                  placeholder="15"
+                  min={1}
+                  max={1000}
+                />
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4 items-end">
+                <NumberInput
+                  label="Fisher Decay"
+                  docKey={`${base}.fisher_decay`}
+                  value={rg.fisher_decay ?? 0.999}
+                  onChange={value => setRg('fisher_decay', value)}
+                  placeholder="0.999"
+                  min={0.9}
+                  max={0.9999}
+                />
+                <Checkbox
+                  label="Use First-Order Term |g·w|"
+                  docKey={`${base}.use_first_order`}
+                  checked={rg.use_first_order !== false}
+                  onChange={value => setRg('use_first_order', value)}
+                />
+              </div>
+            </FormGroup>
+
+            {/* ================= Checkpoints ================= */}
+            <FormGroup label="Checkpoints">
+              <div className="flex flex-col gap-1">
+                <Checkbox
+                  label="Final hardening (binarize gates before final save)"
+                  docKey={`${base}.final_hardening`}
+                  checked={rg.final_hardening !== false}
+                  onChange={value => setRg('final_hardening', value)}
+                />
+                <Checkbox
+                  label="Also save truncated checkpoint (physically reduce LoRA rank)"
+                  docKey={`${base}.save_truncated`}
+                  checked={rg.save_truncated === true}
+                  onChange={value => setRg('save_truncated', value)}
+                />
+                {rg.save_truncated === true && (
+                  <div className="mt-2">
+                    <NumberInput
+                      label="Truncation gate threshold"
+                      docKey={`${base}.truncation_threshold`}
+                      value={rg.truncation_threshold ?? 0.5}
+                      onChange={value => setRg('truncation_threshold', value)}
+                      placeholder="0.5 = keep ranks with gate &gt; 0.5"
+                      min={0.01}
+                      max={0.99}
+                    />
+                  </div>
+                )}
+              </div>
+              <p className="text-xs text-gray-500 mt-2">
+                The truncated checkpoint removes dead <code>lora_down</code> rows / <code>lora_up</code>{' '}
+                columns (and rescales alpha) instead of only zeroing them, producing a genuinely smaller
+                LoRA: <code>&lt;name&gt;_truncated.safetensors</code>.
+              </p>
+            </FormGroup>
+
+            {/* ================= Quick presets ================= */}
+            <FormGroup label="Quick Presets">
+              <div className="flex gap-2 flex-wrap">
+                <button
+                  type="button"
+                  style={presetStyle}
+                  onClick={() =>
+                    applyPreset('conservative', {
+                      target_min_rank_contribution: 1e-3,
+                      lambda_mid_max: 0.002,
+                      alpha: 0.02,
+                      gamma: 0.98,
+                      update_every: 40,
+                    })
+                  }
+                >
+                  Conservative (~1% energy)
+                </button>
+                <button
+                  type="button"
+                  style={presetStyle}
+                  onClick={() =>
+                    applyPreset('moderate', {
+                      target_min_rank_contribution: 5e-4,
+                      lambda_mid_max: 0.005,
+                      alpha: 0.05,
+                      gamma: 0.97,
+                      update_every: 25,
+                    })
+                  }
+                >
+                  Moderate (~0.05% energy)
+                </button>
+                <button
+                  type="button"
+                  style={presetStyle}
+                  onClick={() =>
+                    applyPreset('aggressive', {
+                      target_min_rank_contribution: 1e-4,
+                      lambda_mid_max: 0.01,
+                      alpha: 0.1,
+                      gamma: 0.95,
+                      update_every: 15,
+                    })
+                  }
+                >
+                  Aggressive Default (0.01% energy)
+                </button>
+                <button
+                  type="button"
+                  style={presetStyle}
+                  onClick={() =>
+                    applyPreset('very aggressive', {
+                      target_min_rank_contribution: 5e-5,
+                      lambda_mid_max: 0.015,
+                      alpha: 0.15,
+                      gamma: 0.94,
+                      update_every: 12,
+                    })
+                  }
+                >
+                  Very Aggressive (0.005% energy)
+                </button>
+              </div>
+            </FormGroup>
+          </>
+        )}
+      </div>
+    </Card>
   );
 }
 
@@ -2071,13 +2183,6 @@ export default function SimpleJob({
                 </div>
               </>
             )}
-            {/* Rank Gate Annealing (SparseForge-inspired) */}
-            {jobConfig.config.process[0].network?.type == 'lora' && (
-              <RankGateConfigSection
-                jobConfig={jobConfig}
-                setJobConfig={setJobConfig}
-              />
-            )}
           </Card>
           {!disableSections.includes('slider') && (
             <Card title="Slider">
@@ -2140,6 +2245,12 @@ export default function SimpleJob({
             />
           </Card>
         </div>
+        {/* Rank Gate Annealing (SparseForge-inspired) — top-level section, LoRA only */}
+        {jobConfig.config.process[0].network?.type == 'lora' && (
+          <div>
+            <RankGateAnnealingSection jobConfig={jobConfig} setJobConfig={setJobConfig} />
+          </div>
+        )}
         {modelArch?.additionalSections?.includes('model.tread') && (
           <div>
             <TreadSection jobConfig={jobConfig} setJobConfig={setJobConfig} />

@@ -571,7 +571,8 @@ class ToolkitNetworkMixin:
 
         return keymap
     
-    def get_state_dict(self: Network, extra_state_dict=None, dtype=torch.float16, step=None):
+    def get_state_dict(self: Network, extra_state_dict=None, dtype=torch.float16, step=None,
+                       truncate=False, truncation_threshold=0.5):
         """
         Get the state dict for saving.
         
@@ -582,6 +583,10 @@ class ToolkitNetworkMixin:
                   gates are folded into LoRA weights for inference compatibility.
                   If not None, this is a mid-training checkpoint: gates are kept
                   as-is so training can resume with correct gate values.
+            truncate: If True (final save only), physically reduce the LoRA rank
+                  (remove dead lora_down rows / lora_up columns, rescale alpha)
+                  instead of only zeroing them via the folded gates.
+            truncation_threshold: Gate value above which a rank is kept.
         """
         from toolkit.print import print_acc
         import time
@@ -620,25 +625,57 @@ class ToolkitNetworkMixin:
         # Handle rank gates differently for mid-training checkpoints vs final save.
         # Final save (step=None): fold gates into LoRA weights for inference
         # Mid-training checkpoint (step is not None): keep gates so resume works
-        if step is None:
-            # FINAL SAVE: fold gates into A matrices and strip gate keys.
-            # W_eff = B @ diag(m) @ A = B @ (diag(m) @ A)
+        if step is None and truncate:
+            # TRUNCATED FINAL SAVE: fold gates AND physically reduce the LoRA
+            # rank (dead rows/cols removed, alpha rescaled). Produces a genuinely
+            # smaller LoRA rather than one with zeroed rank components.
+            print_acc("[SAVE LOG] Truncating rank gates (rank-reduced final save)...")
+            from toolkit.rank_gates import truncate_state_dict
+            gated = getattr(self, 'gated_loras', None) or []
+            state_dict, trunc_summary = truncate_state_dict(
+                state_dict, gated, threshold=truncation_threshold)
+            n_trunc = len(trunc_summary)
+            if n_trunc:
+                old_total = sum(o for _, o, _ in trunc_summary)
+                new_total = sum(n for _, _, n in trunc_summary)
+                print_acc(f"[SAVE LOG] Truncated {n_trunc} LoRA modules: "
+                          f"{old_total} -> {new_total} total ranks "
+                          f"({100.0 * new_total / max(1, old_total):.1f}%)")
+        elif step is None:
+            # FINAL SAVE: fold gates into the underlying weights and strip gate keys.
+            # - LoRA pairs:  W_eff = B @ diag(m) @ A = B @ (diag(m) @ A)
+            # - .diff tensors (full finetune): diff_eff = diag(m) * diff
             # This ensures external loaders (ComfyUI, A1111, etc.) get the correct
             # gated weights without needing to understand our gate keys.
-            print_acc("[SAVE LOG] Folding rank gates into LoRA A matrices (final save)...")
+            print_acc("[SAVE LOG] Folding rank gates into weights (final save)...")
+            from toolkit.rank_gates import GatedDiff
             for lora in self.get_all_modules():
+                # LoRA pairs: fold gates into A matrices
                 rg = getattr(lora, 'rank_gate', None)
-                if rg is None:
-                    continue
-                m = rg.gates.detach().float().view(-1, 1)  # (r, 1)
-                key_A = f"{lora.lora_name}.lora_down.weight"
-                if key_A in state_dict:
-                    A = state_dict[key_A].float()
-                    state_dict[key_A] = (A * m).to(A.dtype)
+                if rg is not None and not isinstance(rg, GatedDiff) and hasattr(lora, 'lora_down'):
+                    m = rg.gates.detach().float()
+                    key_A = f"{lora.lora_name}.lora_down.weight"
+                    if key_A in state_dict:
+                        A = state_dict[key_A].float()
+                        # (r, in) linear or (r, in, k, k) conv: scale along rank dim
+                        m_b = m.view(-1, 1, 1, 1) if A.dim() == 4 else m.view(-1, 1)
+                        state_dict[key_A] = (A * m_b).to(A.dtype)
+                
+                # .diff tensors (full finetune): fold gates into the diff parameters
+                for attr, suffix in (("rank_gate", "diff"), ("rank_gate_b", "diff_b")):
+                    rgd = getattr(lora, attr, None)
+                    if rgd is None or not isinstance(rgd, GatedDiff):
+                        continue
+                    key = f"{lora.lora_name}.{suffix}"
+                    if key in state_dict:
+                        v = state_dict[key].float()
+                        m = rgd.gates.detach().float().view(v.shape)
+                        state_dict[key] = (v * m).to(state_dict[key].dtype)
             
             # Strip all gate-related keys from state_dict to avoid bloat.
-            # Gates are already folded into A matrices above.
-            gate_keys_to_remove = [k for k in state_dict.keys() if '.rank_gate.' in k]
+            # Gates are already folded into the weights above.
+            gate_keys_to_remove = [k for k in state_dict.keys()
+                                   if '.rank_gate.' in k or '.rank_gate_b.' in k]
             if gate_keys_to_remove:
                 print_acc(f"[SAVE LOG] Removing {len(gate_keys_to_remove)} gate-related keys from state_dict")
                 for k in gate_keys_to_remove:
@@ -720,7 +757,9 @@ class ToolkitNetworkMixin:
             file, dtype=torch.float16,
             metadata=None,
             extra_state_dict: Optional[OrderedDict] = None,
-            step=None
+            step=None,
+            truncate=False,
+            truncation_threshold=0.5,
     ):
         """
         Save network weights to file.
@@ -732,6 +771,10 @@ class ToolkitNetworkMixin:
             extra_state_dict: Additional state dict entries to include.
             step: Training step number. If None, this is the final save and rank
                   gates are folded into LoRA weights for inference compatibility.
+            truncate: If True (final save), physically reduce the LoRA rank
+                  (remove dead rows/cols, rescale alpha) instead of only zeroing
+                  them via the folded gates.
+            truncation_threshold: Gate value above which a rank is kept.
         """
         from toolkit.print import print_acc
         import time
@@ -757,7 +800,8 @@ class ToolkitNetworkMixin:
         watchdog_thread = threading.Thread(target=watchdog, daemon=True)
         watchdog_thread.start()
         
-        save_dict = self.get_state_dict(extra_state_dict=extra_state_dict, dtype=dtype, step=step)
+        save_dict = self.get_state_dict(extra_state_dict=extra_state_dict, dtype=dtype, step=step,
+                                        truncate=truncate, truncation_threshold=truncation_threshold)
         
         if metadata is not None and len(metadata) == 0:
             metadata = None
