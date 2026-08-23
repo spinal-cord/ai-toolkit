@@ -1411,6 +1411,14 @@ export default function SimpleJob({
                 />
               </FormGroup>
             )}
+            {modelArch?.additionalSections?.includes('model.vae_tiling') && (
+              <Checkbox
+                label="VAE Tiling"
+                docKey="model.vae_tiling"
+                checked={jobConfig.config.process[0].model.vae_tiling || false}
+                onChange={value => setJobConfig(value, 'config.process[0].model.vae_tiling')}
+              />
+            )}
             {modelArch?.additionalSections?.includes('model.model_kwargs.kv_cache') && (
               <Checkbox
                 label="KV Cache"

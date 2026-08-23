@@ -251,6 +251,22 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'model.vae_tiling': {
+    title: 'VAE Tiling',
+    description: (
+      <>
+        When enabled, the VAE splits large frames into overlapping tiles and
+        encodes/decodes them separately to reduce peak VRAM. This applies to both
+        latent caching (encoding) and sampling (decoding).
+        <br />
+        <br />
+        Disabled by default. Tiling introduces a small quality loss in the tile
+        blend bands and can leave faint seams at tile boundaries, so for frames
+        that fit in memory it is best to leave this off for the highest latent
+        quality. Enable it only if you run out of VRAM on large resolutions.
+      </>
+    ),
+  },
   'model.layer_offloading': {
     title: (
       <>

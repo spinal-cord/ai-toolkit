@@ -58,6 +58,17 @@ export const handleModelArchChange = (
     }
   }
 
+  // handle vae tiling setting (disabled by default)
+  if (!newArch?.additionalSections?.includes('model.vae_tiling')) {
+    if ('vae_tiling' in jobConfig.config.process[0].model) {
+      const newModel = objectCopy(jobConfig.config.process[0].model);
+      delete newModel.vae_tiling;
+      setJobConfig(newModel, 'config.process[0].model');
+    }
+  } else if (!('vae_tiling' in jobConfig.config.process[0].model)) {
+    setJobConfig(false, 'config.process[0].model.vae_tiling');
+  }
+
   const numDatasets = jobConfig.config.process[0].datasets.length;
 
   let currentDefaults = expandDatasetDefaults(currentArch.defaults || {}, numDatasets);

@@ -1497,6 +1497,12 @@ class ModelConfig:
         self.qtype = kwargs.get("qtype", "qfloat8")
         self.qtype_te = kwargs.get("qtype_te", "qfloat8")
         self.low_vram = kwargs.get("low_vram", False)
+        # VAE spatial tiling toggle. When False (default) the VAE encodes and
+        # decodes whole frames in a single pass (no spatial tiling). Set True to
+        # enable spatial tiling, which reduces peak VRAM for large resolutions at
+        # the cost of a small quality loss in the tile blend bands. This applies to
+        # both latent caching (encode) and sampling (decode).
+        self.vae_tiling = kwargs.get("vae_tiling", False)
         self.attn_masking = kwargs.get("attn_masking", False)
         if self.attn_masking and not self.is_flux:
             raise ValueError("attn_masking is only supported with flux models currently")

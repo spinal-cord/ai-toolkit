@@ -729,7 +729,12 @@ class Wan21(BaseModel):
         self.pipeline = pipe
         self.model = transformer
         self.vae = vae
-        self.vae.enable_tiling()
+        # Only enable spatial tiling when explicitly requested (config
+        # `model.vae_tiling`). Disabled by default so latent caching encodes
+        # whole frames in a single pass (no tile blend artifacts). Note: the
+        # sampling (decode) path separately honors `low_vram` via `use_vae_tiling`.
+        if self.model_config.vae_tiling:
+            self.vae.enable_tiling()
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
 
@@ -772,7 +777,7 @@ class Wan21(BaseModel):
     @property
     def use_vae_tiling(self):
         # tile the vae decode when sampling if in low vram or explicitly enabled
-        return self.model_config.low_vram or self.model_config.model_kwargs.get(
+        return self.model_config.low_vram or self.model_config.vae_tiling or self.model_config.model_kwargs.get(
             "vae_tiling", False
         )
 
