@@ -351,6 +351,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 nag_scale=sample_item.nag_scale if sample_item.nag_scale is not None else sample_config.nag_scale,
                 nag_alpha=sample_item.nag_alpha if sample_item.nag_alpha is not None else sample_config.nag_alpha,
                 nag_tau=sample_item.nag_tau if sample_item.nag_tau is not None else sample_config.nag_tau,
+                # Flow-matching shift: per-sample override falls back to the
+                # global sample.sampling_flow_shift. None = scheduler default.
+                sampling_flow_shift=sample_item.sampling_flow_shift if sample_item.sampling_flow_shift is not None else sample_config.sampling_flow_shift,
                 # Tanh softcap: per-sample override falls back to the sample-level
                 # toggle. A None value means "inherit" (sample-level value, then
                 # the training value) - resolved at attention time.

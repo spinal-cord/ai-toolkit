@@ -1142,6 +1142,13 @@ export default function SimpleJob({
   const isVideoModel = !!(modelArch?.group === 'video');
   const isAudioModel = !!(modelArch?.group === 'audio');
 
+  // True when the selected sample sampler is a flow-matching one. The flow
+  // shift field (global + per-sample) is only meaningful for these.
+  const isFlowSampler = !!(
+    jobConfig.config.process[0].sample.sampler &&
+    jobConfig.config.process[0].sample.sampler.toLowerCase().includes('flow')
+  );
+
   const taggedSampleArr: Record<string, any>[] | null = useMemo(() => {
     if (!modelArch) return null;
     if (!modelArch.sampleTags) return null;
@@ -4641,6 +4648,33 @@ export default function SimpleJob({
                   min={1}
                   required
                 />
+                {isFlowSampler && (
+                  <NumberInput
+                    label="Flow Shift"
+                    value={
+                      jobConfig.config.process[0].sample.sampling_flow_shift ?? ''
+                    }
+                    onChange={value => {
+                      if (value === '') {
+                        // clear -> use the scheduler's default shift
+                        const newSample = objectCopy(jobConfig.config.process[0].sample);
+                        delete newSample.sampling_flow_shift;
+                        setJobConfig(newSample, 'config.process[0].sample');
+                      } else {
+                        const numValue = parseFloat(value);
+                        if (!isNaN(numValue)) {
+                          setJobConfig(numValue, 'config.process[0].sample.sampling_flow_shift');
+                        } else {
+                          console.warn('Invalid flow shift value:', value);
+                        }
+                      }
+                    }}
+                    placeholder="eg. 5.0 (default)"
+                    className="pt-2"
+                    min={0}
+                    step={0.1}
+                  />
+                )}
               </div>
 
               {/* NAG (Negative Attention Guidance) Parameters */}
@@ -5038,6 +5072,58 @@ export default function SimpleJob({
                             onChange={value => setJobConfig(value, `config.process[0].sample.samples[${i}].neg`)}
                             placeholder={`${jobConfig.config.process[0].sample.neg ?? '(global)'}`}
                           />
+                          <NumberInput
+                            label={`CFG Scale`}
+                            value={sample.guidance_scale ?? ''}
+                            onChange={value => {
+                              if (value === '') {
+                                // clear -> inherit the global guidance scale
+                                let newConfig = objectCopy(jobConfig);
+                                if (newConfig.config.process[0].sample.samples[i]) {
+                                  delete newConfig.config.process[0].sample.samples[i].guidance_scale;
+                                  setJobConfig(
+                                    newConfig.config.process[0].sample.samples,
+                                    'config.process[0].sample.samples',
+                                  );
+                                }
+                              } else {
+                                const numValue = parseFloat(value);
+                                if (!isNaN(numValue)) {
+                                  setJobConfig(numValue, `config.process[0].sample.samples[${i}].guidance_scale`);
+                                }
+                              }
+                            }}
+                            placeholder={`${jobConfig.config.process[0].sample.guidance_scale} (default)`}
+                            min={0}
+                            step={0.1}
+                          />
+                          {isFlowSampler && (
+                            <NumberInput
+                              label={`Flow Shift`}
+                              value={sample.sampling_flow_shift ?? ''}
+                              onChange={value => {
+                                if (value === '') {
+                                  // clear -> inherit the global flow shift
+                                  let newConfig = objectCopy(jobConfig);
+                                  if (newConfig.config.process[0].sample.samples[i]) {
+                                    delete newConfig.config.process[0].sample.samples[i].sampling_flow_shift;
+                                    setJobConfig(
+                                      newConfig.config.process[0].sample.samples,
+                                      'config.process[0].sample.samples',
+                                    );
+                                  }
+                                } else {
+                                  const numValue = parseFloat(value);
+                                  if (!isNaN(numValue)) {
+                                    setJobConfig(numValue, `config.process[0].sample.samples[${i}].sampling_flow_shift`);
+                                  }
+                                }
+                              }}
+                              placeholder={`${jobConfig.config.process[0].sample.sampling_flow_shift ?? '(global)'} (default)`}
+                              min={0}
+                              step={0.1}
+                            />
+                          )}
                         </div>
 
                         {/* Per-Sample NAG Parameters */}

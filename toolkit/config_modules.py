@@ -358,6 +358,11 @@ class SampleItem:
         self.nag_alpha: Optional[float] = kwargs.get('nag_alpha', None)
         self.nag_tau: Optional[float] = kwargs.get('nag_tau', None)
 
+        # Flow-matching shift - per-sample override (Wan 2.x / flow models only).
+        # None = inherit the global sample.sampling_flow_shift (then the
+        # scheduler's default shift).
+        self.sampling_flow_shift: Optional[float] = kwargs.get('sampling_flow_shift', None)
+
         # Attention tanh softcap - per-sample override (Wan 2.x only).
         # None = follow the global "Apply Tanh Softcapping During Sampling"
         # toggle / inherit the sample-level (then training) soft cap value.
@@ -2000,12 +2005,16 @@ class GenerateImageConfig:
             nag_tau: float = 3.5,
             attention_tanh_softcap_enabled: bool = False,
             attention_tanh_softcap_value: Optional[float] = None,
+            sampling_flow_shift: Optional[float] = None,
     ):
         self.width: int = width
         self.height: int = height
         self.num_inference_steps: int = num_inference_steps
         self.guidance_scale: float = guidance_scale
         self.guidance_rescale: float = guidance_rescale
+        # Flow-matching shift for this generation. None = use the scheduler's
+        # configured (global) shift. Only meaningful for flow-matching models.
+        self.sampling_flow_shift: Optional[float] = sampling_flow_shift
         self.prompt: str = prompt
         self.prompt_2: str = prompt_2
         self.negative_prompt: str = negative_prompt

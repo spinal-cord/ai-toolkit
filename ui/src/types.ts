@@ -454,6 +454,9 @@ export interface SampleItem {
   ctrl_img_1?: string | null;
   ctrl_img_2?: string | null;
   ctrl_img_3?: string | null;
+  // Per-sample flow-matching shift override (Wan 2.x / flow models). Absent =
+  // inherit the global sample.sampling_flow_shift (then the scheduler default).
+  sampling_flow_shift?: number;
   // NAG (Negative Attention Guidance) per-sample override
   nag_scale?: number;
   nag_alpha?: number;
@@ -491,6 +494,10 @@ export interface SampleConfig {
   sample_steps: number;
   num_frames: number;
   fps: number;
+  // Global flow-matching shift used for sample generation (Wan 2.x / flow
+  // models). Optional - when absent the scheduler's default shift is used.
+  // Individual samples can override this with their own sampling_flow_shift.
+  sampling_flow_shift?: number;
   // NAG (Negative Attention Guidance) parameters - global defaults for all samples
   // nag_scale: 1.0 disables, >1 enables (typical range 1.0–20.0)
   // nag_alpha: blend factor between NAG-guided and original prediction (0.0–2.0)

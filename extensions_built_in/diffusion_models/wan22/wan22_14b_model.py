@@ -1571,6 +1571,8 @@ class Wan2214bModel(Wan21):
             nag_scale=gen_config.nag_scale,
             nag_alpha=gen_config.nag_alpha,
             nag_tau=gen_config.nag_tau,
+            # Per-sample flow-matching shift override (None = global default)
+            flow_shift=gen_config.sampling_flow_shift,
             **extra
         )[0]
 

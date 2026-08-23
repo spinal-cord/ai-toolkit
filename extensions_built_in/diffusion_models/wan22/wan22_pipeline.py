@@ -39,6 +39,25 @@ class Wan22Pipeline(WanPipeline):
         )
         self._aggressive_offload = aggressive_offload
         self._exec_device = device
+        # Capture the scheduler's configured (global) shift so that per-sample
+        # flow-shift overrides can be applied and then cleanly reset on the next
+        # call. ``scheduler.shift`` is the property backing the sigma schedule.
+        try:
+            self._base_flow_shift = float(scheduler.shift)
+        except Exception:
+            self._base_flow_shift = None
+
+    def _set_flow_shift(self, flow_shift: Optional[float]) -> None:
+        """Apply an effective flow shift to the scheduler before set_timesteps.
+
+        Falls back to the global (base) shift when ``flow_shift`` is None. This
+        guarantees no per-sample shift leaks into subsequent samples even when
+        consecutive samples have different (or missing) overrides.
+        """
+        effective = flow_shift if flow_shift is not None else self._base_flow_shift
+        if effective is not None and hasattr(self.scheduler, "set_shift"):
+            self.scheduler.set_shift(effective)
+
     @property
     def _execution_device(self):
         return self._exec_device
@@ -73,6 +92,9 @@ class Wan22Pipeline(WanPipeline):
         nag_scale: float = 1.0,
         nag_alpha: float = 0.5,
         nag_tau: float = 3.5,
+        # Per-call flow-matching shift override. None = use the global shift
+        # the scheduler was constructed with.
+        flow_shift: Optional[float] = None,
     ):
 
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
@@ -166,6 +188,9 @@ class Wan22Pipeline(WanPipeline):
                 device, model_dtype)
 
         # 4. Prepare timesteps
+        # Apply the effective flow shift (per-sample override or global default)
+        # before building the sigma schedule so it uses the correct shift.
+        self._set_flow_shift(flow_shift)
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
