@@ -370,6 +370,34 @@ class BaseModel:
     def add_status_update_hook(self, func):
         self._status_update_hooks.append(func)
 
+    def _set_sample_softcap_override(self, gen_config: GenerateImageConfig):
+        """
+        Apply the per-sample attention tanh softcap override before generating
+        a sample (Wan 2.x toolkit path only; no-op for other models since only
+        wan_attn reads these globals).
+
+        gen_config.attention_tanh_softcap_enabled is the per-sample EFFECTIVE
+        toggle (per-sample override -> sample-level toggle, resolved by the
+        caller). A None value means inherit (sample-level value, then the
+        training value).
+        """
+        try:
+            from toolkit.models.wan21 import wan_attn
+            wan_attn.set_sample_softcap_override(
+                enabled=gen_config.attention_tanh_softcap_enabled,
+                value=gen_config.attention_tanh_softcap_value,
+            )
+        except Exception:
+            pass
+
+    def _clear_sample_softcap_override(self):
+        """Clear the per-sample softcap override after a sampling batch."""
+        try:
+            from toolkit.models.wan21 import wan_attn
+            wan_attn.set_sample_softcap_override(None, None)
+        except Exception:
+            pass
+
     @torch.no_grad()
     def generate_images(
             self,
@@ -440,6 +468,10 @@ class BaseModel:
 
                 for i in tqdm(range(len(image_configs)), desc=f"Generating Samples", leave=False):
                     gen_config = image_configs[i]
+
+                    # Per-sample attention tanh softcap override (Wan 2.x only;
+                    # no-op for other models)
+                    self._set_sample_softcap_override(gen_config)
 
                     extra = {}
                     validation_image = None
@@ -680,6 +712,9 @@ class BaseModel:
 
                 if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
                     self.adapter.clear_memory()
+
+        # clear the per-sample softcap override (no-op for non-Wan models)
+        self._clear_sample_softcap_override()
 
         # clear pipeline and cache to reduce vram usage
         del pipeline

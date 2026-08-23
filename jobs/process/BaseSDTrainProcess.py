@@ -351,6 +351,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 nag_scale=sample_item.nag_scale if sample_item.nag_scale is not None else sample_config.nag_scale,
                 nag_alpha=sample_item.nag_alpha if sample_item.nag_alpha is not None else sample_config.nag_alpha,
                 nag_tau=sample_item.nag_tau if sample_item.nag_tau is not None else sample_config.nag_tau,
+                # Tanh softcap: per-sample override falls back to the sample-level
+                # toggle. A None value means "inherit" (sample-level value, then
+                # the training value) - resolved at attention time.
+                attention_tanh_softcap_enabled=(
+                    sample_item.attention_tanh_softcap_enabled
+                    if sample_item.attention_tanh_softcap_enabled is not None
+                    else sample_config.attention_tanh_softcap_enabled
+                ),
+                attention_tanh_softcap_value=(
+                    sample_item.attention_tanh_softcap_value
+                    if sample_item.attention_tanh_softcap_value is not None
+                    else sample_config.attention_tanh_softcap_value
+                ),
                 **extra_args
             ))
 
@@ -365,8 +378,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
 
-        # Use the sampling attention backend (Wan 2.x toolkit path only;
-        # no-op for other models). Sampling never applies tanh softcapping.
+        # Switch the toolkit attention layer into sampling mode (Wan 2.x toolkit path
+        # only; no-op for other models). This selects the sampling attention backend
+        # and - when the user requested it (globally and/or per-sample) - applies
+        # sampling-level tanh softcapping during generate_images.
         wan_attn_module = None
         try:
             from toolkit.models.wan21 import wan_attn as wan_attn_module
@@ -1817,10 +1832,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         
         if self.train_config.attention_backend != 'native':
             # Forward the backend to diffusers models that support it (VAE/text encoder).
-            # NOTE: for Wan 2.x the transformer uses the toolkit's custom attention
-            # processor, which honors train.attention_backend / sample.attention_backend
-            # directly (see toolkit/models/wan21/wan_attn.py) - diffusers'
-            # set_attention_backend() has no effect on that custom processor.
+            # NOTE: for Wan 2.x with attention softcapping requested, the trainer
+            # installs the toolkit's custom attention processor (see
+            # toolkit/models/wan21/wan_attn.py), which honors train.attention_backend /
+            # sample.attention_backend directly - diffusers' set_attention_backend() has
+            # no effect on that custom processor. Without softcapping the stock
+            # diffusers processor is used and set_attention_backend() applies.
             # Wrapped in try/except: e.g. 'flash' raises if flash-attn isn't
             # installed, which should degrade to a warning, not crash the job.
             try:

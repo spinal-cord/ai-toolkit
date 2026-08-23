@@ -774,9 +774,20 @@ class SDTrainer(BaseSDTrainProcess):
             soft_cap_cross_low = getattr(self.train_config, 'attention_tanh_softcap_value_cross_attn_low_noise', None)
 
             # Sampling softcapping is an independent toggle (off by default to
-            # match standard inference). Uses the same soft_cap/overrides.
-            sample_softcap_enabled = getattr(
-                getattr(self, 'sample_config', None), 'attention_tanh_softcap_enabled', False)
+            # match standard inference). It can be requested globally
+            # (sample.attention_tanh_softcap_enabled) and/or per-sample
+            # (sample.samples[i].attention_tanh_softcap_enabled). Sampling uses
+            # its own soft cap value when set
+            # (sample.attention_tanh_softcap_value), otherwise inherits the
+            # training value. Per-sample values take precedence over both.
+            sample_config = getattr(self, 'sample_config', None)
+            sample_softcap_enabled = getattr(sample_config, 'attention_tanh_softcap_enabled', False)
+            sample_soft_cap_value = getattr(sample_config, 'attention_tanh_softcap_value', None)
+            per_sample_softcap = any(
+                getattr(s, 'attention_tanh_softcap_enabled', None) is True
+                for s in (getattr(sample_config, 'samples', None) or [])
+            )
+            sample_softcap_requested = sample_softcap_enabled or per_sample_softcap
 
             # Attention backend selection (separate for training and sampling).
             # train.attention_backend / sample.attention_backend:
@@ -789,7 +800,7 @@ class SDTrainer(BaseSDTrainProcess):
             train_backend_lc = str(train_backend).lower()
             sample_backend_lc = str(sample_backend).lower()
 
-            if softcap_enabled or sample_softcap_enabled:
+            if softcap_enabled or sample_softcap_requested:
                 # Probe kernel capabilities once (cheap; cached at the call sites too).
                 flex_ok = check_flex_attention_support().get('available', False)
                 flash_ok = check_flash_softcap_support()
@@ -805,13 +816,22 @@ class SDTrainer(BaseSDTrainProcess):
                     return flex_ok
 
                 train_softcap_ok = _mode_softcap_ok(softcap_enabled, train_backend_lc)
-                sample_softcap_ok = _mode_softcap_ok(sample_softcap_enabled, sample_backend_lc)
+                # Gate on ANY sampling request (global toggle or per-sample
+                # override) so unsupported requests are surfaced at setup time.
+                sample_softcap_ok = _mode_softcap_ok(sample_softcap_requested, sample_backend_lc)
 
-                if train_softcap_ok or sample_softcap_ok:
+                if (softcap_enabled and train_softcap_ok) or sample_softcap_requested:
                     set_attention_softcapping(
-                        enabled=train_softcap_ok,
+                        # Only enable a mode when the user enabled it AND the
+                        # kernel can apply it (_mode_softcap_ok returns True for
+                        # disabled modes, so it must not be used as the flag).
+                        enabled=softcap_enabled and train_softcap_ok,
                         soft_cap=soft_cap,
-                        sample_enabled=sample_softcap_ok,
+                        # Only enable the global sampling toggle when the user
+                        # enabled it AND the kernel can apply it (per-sample
+                        # overrides are applied at runtime by the trainer).
+                        sample_enabled=sample_softcap_enabled and sample_softcap_ok,
+                        sample_soft_cap=sample_soft_cap_value,
                         soft_cap_self_attn=soft_cap_self,
                         soft_cap_cross_attn=soft_cap_cross,
                         soft_cap_high_noise=soft_cap_high,
@@ -823,17 +843,42 @@ class SDTrainer(BaseSDTrainProcess):
                     )
                     # Enable logging - sample every 10 training steps (not attention ops)
                     configure_softcap_logging(enabled=True, sample_every_n_steps=10)
-                    print_acc(f"Attention tanh softcapping -> training: {'ON' if train_softcap_ok else 'off'}, "
-                              f"sampling: {'ON' if sample_softcap_ok else 'off'}. "
+
+                    # Install the toolkit's attention processor on the transformer.
+                    # CRITICAL: the stock diffusers WanAttnProcessor (used by default
+                    # on the standard Wan 2.x path) has no softcap hook - without this
+                    # install the entire softcap machinery above is a no-op (the config
+                    # globals are set but nothing reads them). Covers both experts of
+                    # dual-expert (Wan 2.2 14B) models. Only done when at least one
+                    # mode will actually apply the cap; when no kernel can apply it the
+                    # stock processors are left in place (behavior unchanged).
+                    train_applies = softcap_enabled and train_softcap_ok
+                    sample_applies = sample_softcap_requested and sample_softcap_ok
+                    if train_applies or sample_applies:
+                        try:
+                            from toolkit.models.wan21.wan_attn import install_softcap_processors
+                            n_installed = install_softcap_processors(getattr(self.sd, 'model', None))
+                            if n_installed:
+                                print_acc(f"Installed WanAttnProcessor2_0 on {n_installed} attention blocks "
+                                          f"(softcapping + per-mode attention backends now active on the standard path).")
+                        except Exception as e:
+                            print_acc(f"Warning: failed to install softcap attention processor: {e}")
+
+                    sample_value_str = (f"{sample_soft_cap_value}" if sample_soft_cap_value is not None
+                                        else f"inherit training value ({soft_cap})")
+                    print_acc(f"Attention tanh softcapping -> training: {'ON' if softcap_enabled and train_softcap_ok else 'off'} "
+                              f"(soft_cap={soft_cap}), sampling: {'ON' if sample_softcap_enabled and sample_softcap_ok else 'off'} "
+                              f"(soft_cap={sample_value_str}, per-sample overrides: {per_sample_softcap}). "
                               f"flex_attention available: {flex_ok}, flash native softcap: {flash_ok}.")
                     print_acc("Softcapping is applied by the selected kernel: flash natively (2.8.3+) "
                               "or flex via score_mod (auto/sdpa/flex). fp32 layers skip it under flash.")
                     if softcap_enabled and not train_softcap_ok:
                         print_acc(f"  NOTE: training softcapping disabled - train backend '{train_backend}' "
                                   f"cannot apply it (flex unavailable and flash lacks native softcap).")
-                    if sample_softcap_enabled and not sample_softcap_ok:
+                    if sample_softcap_requested and not sample_softcap_ok:
                         print_acc(f"  NOTE: sampling softcapping disabled - sample backend '{sample_backend}' "
-                                  f"cannot apply it (flex unavailable and flash lacks native softcap).")
+                                  f"cannot apply it (flex unavailable and flash lacks native softcap). "
+                                  f"Per-sample softcap overrides will be ignored.")
 
                     # Print active softcap configuration summary
                     has_overrides = any(v is not None for v in [

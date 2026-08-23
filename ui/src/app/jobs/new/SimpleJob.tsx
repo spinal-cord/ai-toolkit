@@ -4587,9 +4587,40 @@ export default function SimpleJob({
                     </div>
                     <span className="text-xs text-gray-500">off = standard inference</span>
                   </div>
+                  {jobConfig.config.process[0].sample.attention_tanh_softcap_enabled && (
+                    <TextInput
+                      label="Sample Soft Cap Value"
+                      className="pt-2"
+                      docKey="sample.attention_tanh_softcap_value"
+                      value={
+                        jobConfig.config.process[0].sample.attention_tanh_softcap_value
+                          ? `${jobConfig.config.process[0].sample.attention_tanh_softcap_value}`
+                          : ''
+                      }
+                      onChange={value => {
+                        // remove any non-numeric characters
+                        value = value.replace(/[^0-9.]/g, '');
+                        if (value === '') {
+                          // clear the override -> inherit the training value
+                          const newSample = objectCopy(jobConfig.config.process[0].sample);
+                          delete newSample.attention_tanh_softcap_value;
+                          setJobConfig(newSample, 'config.process[0].sample');
+                        } else {
+                          const numValue = parseFloat(value);
+                          if (!isNaN(numValue)) {
+                            setJobConfig(numValue, 'config.process[0].sample.attention_tanh_softcap_value');
+                          } else {
+                            console.warn('Invalid sample soft cap value:', value);
+                          }
+                        }
+                      }}
+                      placeholder={`${jobConfig.config.process[0].train.attention_tanh_softcap_value ?? 30.0} (training value)`}
+                    />
+                  )}
                   <p className="text-xs text-gray-500 mt-1">
-                    Independent of the training toggle above; uses the same global soft cap value.
-                    Forces the sampling attention backend to FlexAttention.
+                    Independent of the training toggle above. Empty value = inherit the training global soft cap
+                    value, so sampling can use a different cap than training. Each sample below can also override
+                    both the toggle and the value. Forces the sampling attention backend to FlexAttention.
                   </p>
                 </div>
                 <NumberInput
@@ -5086,6 +5117,108 @@ export default function SimpleJob({
                           />
                         </div>
 
+                        {/* Per-Sample Tanh Softcap Override */}
+                        <div className="border border-green-900 rounded-lg p-3 mt-2">
+                          {(() => {
+                            const globalSampleSoftcap =
+                              jobConfig.config.process[0].sample.attention_tanh_softcap_enabled ?? false;
+                            const isOverridden = sample.attention_tanh_softcap_enabled !== undefined;
+                            const effectiveSoftcap = sample.attention_tanh_softcap_enabled ?? globalSampleSoftcap;
+                            return (
+                              <>
+                                <div className="flex items-center justify-between">
+                                  <div className="flex items-center space-x-2">
+                                    <input
+                                      type="checkbox"
+                                      id={`sample_softcap_enabled_${i}`}
+                                      checked={effectiveSoftcap}
+                                      onChange={e => {
+                                        if (e.target.checked) {
+                                          // explicitly enable for this sample
+                                          setJobConfig(
+                                            true,
+                                            `config.process[0].sample.samples[${i}].attention_tanh_softcap_enabled`,
+                                          );
+                                        } else if (isOverridden || globalSampleSoftcap) {
+                                          // explicit off override (either clearing a previous override or
+                                          // disabling a sample that was on via the global toggle)
+                                          setJobConfig(
+                                            false,
+                                            `config.process[0].sample.samples[${i}].attention_tanh_softcap_enabled`,
+                                          );
+                                        } else {
+                                          // inherited and already off: just clean up any stale keys
+                                          let newConfig = objectCopy(jobConfig);
+                                          if (newConfig.config.process[0].sample.samples[i]) {
+                                            delete newConfig.config.process[0].sample.samples[i].attention_tanh_softcap_enabled;
+                                            delete newConfig.config.process[0].sample.samples[i].attention_tanh_softcap_value;
+                                            setJobConfig(
+                                              newConfig.config.process[0].sample.samples,
+                                              'config.process[0].sample.samples',
+                                            );
+                                          }
+                                        }
+                                      }}
+                                      className="rounded border-gray-600"
+                                    />
+                                    <label
+                                      htmlFor={`sample_softcap_enabled_${i}`}
+                                      className="text-sm text-green-300 font-medium"
+                                    >
+                                      Apply Tanh Softcapping {isOverridden ? '(override)' : ''}
+                                    </label>
+                                  </div>
+                                  <span className="text-xs text-gray-500">
+                                    unchecked &amp; unoverridden = follow global ({globalSampleSoftcap ? 'on' : 'off'})
+                                  </span>
+                                </div>
+                                {effectiveSoftcap && (
+                                  <TextInput
+                                    label="Soft Cap Value"
+                                    className="pt-2"
+                                    docKey="sample.attention_tanh_softcap_value"
+                                    value={sample.attention_tanh_softcap_value ? `${sample.attention_tanh_softcap_value}` : ''}
+                                    onChange={value => {
+                                      // remove any non-numeric characters
+                                      value = value.replace(/[^0-9.]/g, '');
+                                      if (value === '') {
+                                        // clear the override -> inherit the global sample/training value
+                                        let newConfig = objectCopy(jobConfig);
+                                        if (newConfig.config.process[0].sample.samples[i]) {
+                                          delete newConfig.config.process[0].sample.samples[i].attention_tanh_softcap_value;
+                                          setJobConfig(
+                                            newConfig.config.process[0].sample.samples,
+                                            'config.process[0].sample.samples',
+                                          );
+                                        }
+                                      } else {
+                                        const numValue = parseFloat(value);
+                                        if (!isNaN(numValue)) {
+                                          setJobConfig(
+                                            numValue,
+                                            `config.process[0].sample.samples[${i}].attention_tanh_softcap_value`,
+                                          );
+                                        } else {
+                                          console.warn('Invalid soft cap value:', value);
+                                        }
+                                      }
+                                    }}
+                                    placeholder={`${
+                                      jobConfig.config.process[0].sample.attention_tanh_softcap_value ??
+                                      jobConfig.config.process[0].train.attention_tanh_softcap_value ??
+                                      30.0
+                                    } (default)`}
+                                  />
+                                )}
+                                <p className="text-xs text-gray-500 mt-1">
+                                  Follows the global &quot;Apply Tanh Softcapping During Sampling&quot; toggle unless
+                                  overridden here. Empty value = inherit the global sample value (or the training
+                                  value when that is empty too).
+                                </p>
+                              </>
+                            );
+                          })()}
+                        </div>
                         {/* Per-Sample Video Params (fps, num_frames) */}
                         {isVideoModel && (
                           <div className="grid w-full lg:grid-flow-col lg:auto-cols-fr gap-4 mt-2">

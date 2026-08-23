@@ -1103,6 +1103,41 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'sample.attention_tanh_softcap_value': {
+    title: 'Sample Soft Cap Value',
+    description: (
+      <>
+        <strong>Overview</strong>
+        <br />
+        The tanh soft cap value used while generating samples. Decoupled from the training soft cap value so you can,
+        for example, train with a gentle cap (e.g. 30) but sample with a stricter one (e.g. 20) to preview how the
+        model behaves under a different capping regime.
+        <br />
+        <br />
+        <strong>Value Hierarchy</strong>
+        <br />
+        <ol className="list-decimal list-inside ml-4 space-y-1">
+          <li>Per-sample value (on the sample card) — highest priority</li>
+          <li>Global sample value (this field, in the Sample card)</li>
+          <li>Training global soft cap value (<code>train.attention_tanh_softcap_value</code>) — final fallback</li>
+        </ol>
+        <br />
+        <strong>Empty = inherit</strong>
+        <br />
+        Leaving this field empty means sample generation inherits the training soft cap value. Set a number to use a
+        sampling-specific value. The same inheritance applies to the per-sample override: an empty per-sample value
+        falls back to the global sample value, then to the training value.
+        <br />
+        <br />
+        <strong>Per-sample toggle</strong>
+        <br />
+        Each sample has its own &quot;Apply Tanh Softcapping&quot; checkbox. It follows the global
+        &quot;Apply Tanh Softcapping During Sampling&quot; toggle unless explicitly overridden (checked = force on for
+        that sample, unchecked while the global toggle is on = force off). Enabling softcapping on any sample forces
+        the sampling attention backend to FlexAttention.
+      </>
+    ),
+  },
   'train.attention_f32_rope_enabled': {
     title: 'Attention F32 RoPE Acceleration',
     description: (

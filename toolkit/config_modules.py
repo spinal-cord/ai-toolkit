@@ -358,6 +358,12 @@ class SampleItem:
         self.nag_alpha: Optional[float] = kwargs.get('nag_alpha', None)
         self.nag_tau: Optional[float] = kwargs.get('nag_tau', None)
 
+        # Attention tanh softcap - per-sample override (Wan 2.x only).
+        # None = follow the global "Apply Tanh Softcapping During Sampling"
+        # toggle / inherit the sample-level (then training) soft cap value.
+        self.attention_tanh_softcap_enabled: Optional[bool] = kwargs.get('attention_tanh_softcap_enabled', None)
+        self.attention_tanh_softcap_value: Optional[float] = kwargs.get('attention_tanh_softcap_value', None)
+
 class SampleConfig:
     def __init__(self, **kwargs):
         self.sampler: str = kwargs.get('sampler', 'ddpm')
@@ -370,6 +376,11 @@ class SampleConfig:
         # same soft_cap value/overrides. Off by default to match standard
         # inference; enabling it forces the sampling backend to flex_attention.
         self.attention_tanh_softcap_enabled: bool = kwargs.get('attention_tanh_softcap_enabled', False)
+        # Sampling-specific soft cap value (Wan 2.x). Decoupled from the
+        # training value so samples can be generated with a different cap.
+        # None = inherit train.attention_tanh_softcap_value. Individual
+        # samples (samples[i].attention_tanh_softcap_value) take precedence.
+        self.attention_tanh_softcap_value: Optional[float] = kwargs.get('attention_tanh_softcap_value', None)
         self.sample_every: int = kwargs.get('sample_every', 100)
         self.width: int = kwargs.get('width', 512)
         self.height: int = kwargs.get('height', 512)
@@ -1987,6 +1998,8 @@ class GenerateImageConfig:
             nag_scale: float = 1.0,
             nag_alpha: float = 0.5,
             nag_tau: float = 3.5,
+            attention_tanh_softcap_enabled: bool = False,
+            attention_tanh_softcap_value: Optional[float] = None,
     ):
         self.width: int = width
         self.height: int = height
@@ -2063,6 +2076,13 @@ class GenerateImageConfig:
         self.nag_scale: float = nag_scale
         self.nag_alpha: float = nag_alpha
         self.nag_tau: float = nag_tau
+
+        # Attention tanh softcap (Wan 2.x). The enabled flag is the per-sample
+        # EFFECTIVE toggle (per-sample override -> sample-level toggle, already
+        # resolved by the caller). None value = inherit (sample-level value,
+        # then the training value).
+        self.attention_tanh_softcap_enabled: bool = attention_tanh_softcap_enabled
+        self.attention_tanh_softcap_value: Optional[float] = attention_tanh_softcap_value
 
     def set_gen_time(self, gen_time: int = None):
         if gen_time is not None:

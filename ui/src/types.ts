@@ -458,6 +458,13 @@ export interface SampleItem {
   nag_scale?: number;
   nag_alpha?: number;
   nag_tau?: number;
+  // Per-sample tanh softcap override. `attention_tanh_softcap_enabled`
+  // explicitly enables/disables softcapping for this sample (absent = follow
+  // the global "Apply Tanh Softcapping During Sampling" toggle).
+  // `attention_tanh_softcap_value` overrides the soft cap value for this
+  // sample (absent = inherit the global sample value, then the training value).
+  attention_tanh_softcap_enabled?: boolean;
+  attention_tanh_softcap_value?: number;
 }
 
 export interface SampleConfig {
@@ -468,6 +475,10 @@ export interface SampleConfig {
   // toggle; uses the same soft cap value). Off by default to match standard
   // inference. Enabling it forces the sampling backend to flex attention.
   attention_tanh_softcap_enabled?: boolean;
+  // Sampling-specific soft cap value. When set, overrides the training global
+  // soft cap value for sample generation. Empty = inherit the training value.
+  // Individual samples can override both the toggle and the value.
+  attention_tanh_softcap_value?: number;
   sample_every: number;
   width: number;
   height: number;

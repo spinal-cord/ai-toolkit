@@ -10,12 +10,28 @@ from functools import partial, lru_cache
 # Hierarchy: per-type-per-expert → per-type → global
 # The WanAttnProcessor2_0 resolves which value to use and passes it directly to _apply_attention_with_softcap
 _attention_config = {
-    'softcap_enabled': True,
+    # Default False (opt-in): the trainer (SDTrainer._setup_attention_softcapping)
+    # always sets this explicitly from the job config. Keeping the module default
+    # off means processes that never call set_attention_softcapping (e.g. pure
+    # generation jobs) keep standard (un-capped) attention.
+    'softcap_enabled': False,
     # Whether tanh softcapping is also applied during SAMPLING (independent of
     # the training toggle). Off by default to match standard inference; users
     # can opt in via sample.attention_tanh_softcap_enabled in the job config.
     'softcap_sample_enabled': False,
     'softcap_value': 30.0,  # Global default
+    # Sampling-specific global softcap value (sample.attention_tanh_softcap_value).
+    # Decoupled from the training value so samples can use a different cap.
+    # None = inherit the training global softcap value.
+    'softcap_sample_value': None,
+    # Per-sample softcap override - set by the trainer around EACH sample in a
+    # batch (sample.samples[i].attention_tanh_softcap_*). None = inherit the
+    # global sampling settings. Reading these inside compiled code makes
+    # Dynamo specialize on them - the resulting graph variants are cached, so
+    # switching only costs a recompile the first time each state is entered
+    # (same pattern as 'in_sampling' above).
+    'sample_softcap_override_enabled': None,
+    'sample_softcap_override_value': None,
     'f32_rope_enabled': True,
     # Attention backend selection (set by the trainer from the job config)
     #   'auto'  = flex_attention when training with softcap, otherwise SDPA (legacy default)
@@ -498,6 +514,7 @@ def set_attention_softcapping(
     enabled: bool = True,
     soft_cap: float = 30.0,
     sample_enabled: Optional[bool] = None,  # None = leave sampling setting unchanged
+    sample_soft_cap: Optional[float] = None,  # Sampling-specific value; None = inherit training value
     # Per-attention-type overrides
     soft_cap_self_attn: float = None,
     soft_cap_cross_attn: float = None,
@@ -523,8 +540,11 @@ def set_attention_softcapping(
         enabled: Whether softcapping is enabled during training
         sample_enabled: Whether softcapping is also applied during sampling
             (None = do not change the current sampling setting). When enabled,
-            sampling uses the same soft_cap/overrides as training.
-        soft_cap: Global default softcap value
+            sampling uses the sample_soft_cap/overrides (falling back to the
+            training values when sample_soft_cap is None).
+        soft_cap: Global default softcap value (training)
+        sample_soft_cap: Global default softcap value for sampling only.
+            None = sampling inherits the training value.
         soft_cap_self_attn: Override for all self-attention
         soft_cap_cross_attn: Override for all cross-attention
         soft_cap_high_noise: Override for all attention in high-noise expert
@@ -538,7 +558,8 @@ def set_attention_softcapping(
     if sample_enabled is not None:
         _attention_config['softcap_sample_enabled'] = bool(sample_enabled)
     _attention_config['softcap_value'] = soft_cap
-    
+    _attention_config['softcap_sample_value'] = float(sample_soft_cap) if sample_soft_cap is not None else None
+
     # Store overrides in the dedicated dict
     _softcap_overrides['self_attn'] = soft_cap_self_attn
     _softcap_overrides['cross_attn'] = soft_cap_cross_attn
@@ -553,6 +574,33 @@ def set_attention_softcapping(
 def set_attention_f32_rope(enabled: bool = True):
     """Set global attention F32 RoPE acceleration configuration."""
     _attention_config['f32_rope_enabled'] = enabled
+
+
+def set_sample_softcap_override(enabled: Optional[bool] = None, value: Optional[float] = None):
+    """
+    Set the per-sample tanh softcap override for the next generated sample.
+
+    The trainer calls this before EACH sample in a batch so individual samples
+    can enable/disable softcapping and/or use a different soft cap value than
+    the global sampling settings (sample.samples[i].attention_tanh_softcap_*).
+
+    Args:
+        enabled: True/False = force softcapping on/off for this sample;
+            None = follow the global "Apply Tanh Softcapping During Sampling"
+            toggle. If True but no attention kernel can apply softcapping, it
+            is clamped to False (with a one-time warning) so that training
+            softcapping is never affected by an unsupported sample request.
+        value: Soft cap value to use for this sample; None = inherit the
+            sample-level value (then the training value).
+    """
+    if enabled is True and not (_flex_attention_available() or _flash_softcap_supported()):
+        _warn_once('sample_softcap_unsupported',
+                   "Per-sample attention softcapping requested but no attention kernel "
+                   "can apply it (flex_attention unavailable and flash_attn lacks native "
+                   "softcapping); the sample will use standard (un-capped) attention.")
+        enabled = False
+    _attention_config['sample_softcap_override_enabled'] = enabled
+    _attention_config['sample_softcap_override_value'] = float(value) if value is not None else None
 
 
 @_compiler_disable
@@ -616,7 +664,8 @@ def resolve_softcap_value(attn_type: str, expert: str) -> float:
     Resolve the effective softcap value for given attention type and expert.
     
     Hierarchy (most specific to least):
-        per-type-per-expert → per-type → per-expert → global
+        per-sample (sampling only) → per-type-per-expert → per-type → per-expert →
+        sampling global (sampling only) → training global
     
     This is called by WanAttnProcessor2_0 BEFORE passing to _apply_attention_with_softcap.
     
@@ -627,7 +676,13 @@ def resolve_softcap_value(attn_type: str, expert: str) -> float:
     Returns:
         The float softcap value to use
     """
-    # Most specific: per-type-per-expert
+    in_sampling = _attention_config['in_sampling']
+
+    # Most specific: per-sample override (set by the trainer around each sample)
+    if in_sampling and _attention_config['sample_softcap_override_value'] is not None:
+        return float(_attention_config['sample_softcap_override_value'])
+
+    # Per-type-per-expert
     combined_key = f"{attn_type}_{expert}" if expert != 'single' else None
     if combined_key and _softcap_overrides.get(combined_key) is not None:
         return float(_softcap_overrides[combined_key])
@@ -640,7 +695,9 @@ def resolve_softcap_value(attn_type: str, expert: str) -> float:
     if expert != 'single' and _softcap_overrides.get(expert) is not None:
         return float(_softcap_overrides[expert])
     
-    # Global default
+    # Global default: sampling has its own value when set (sample.attention_tanh_softcap_value)
+    if in_sampling and _attention_config['softcap_sample_value'] is not None:
+        return float(_attention_config['softcap_sample_value'])
     return float(_attention_config['softcap_value'])
 
 
@@ -968,6 +1025,11 @@ def _apply_attention_with_softcap(
     # resolve to 'flex'. 'flash' keeps its backend and applies the cap natively.
     apply_softcap = (_attention_config['softcap_sample_enabled'] if in_sampling
                      else _attention_config['softcap_enabled'])
+    # Per-sample override (set by the trainer around each sample; sampling only).
+    # Takes precedence over the global sampling toggle so individual samples can
+    # enable/disable softcapping independently.
+    if in_sampling and _attention_config['sample_softcap_override_enabled'] is not None:
+        apply_softcap = bool(_attention_config['sample_softcap_override_enabled'])
     if backend == 'auto':
         backend = 'flex' if apply_softcap else 'sdpa'
     elif backend == 'sdpa' and apply_softcap:
@@ -1135,6 +1197,65 @@ def _apply_attention_with_softcap(
     )
 
 
+def install_softcap_processors(model, num_img_tokens: int = 257) -> int:
+    """
+    Install WanAttnProcessor2_0 on every attention block of a (possibly dual-expert)
+    Wan transformer so the toolkit's softcapping / per-mode backend machinery is
+    actually used at runtime.
+
+    The stock diffusers ``WanAttnProcessor`` (used by default on the standard
+    Wan 2.x path) dispatches through diffusers' attention registry and has NO
+    softcap hook - with it installed, all of the softcap config in this module
+    (training AND sampling, including per-sample overrides) is silently ignored.
+    This function is the install point that closes that gap. It is called by the
+    trainer (``SDTrainer._setup_attention_softcapping``) when softcapping is
+    requested for at least one mode.
+
+    Handles:
+      * ``DualWanTransformer3DModel`` (Wan 2.2 14B: wraps ``transformer_1`` /
+        ``transformer_2`` - both experts get the processor)
+      * any module exposing ``.blocks`` (``WanTransformer3DModel``)
+
+    Existing ``WanAttnProcessor2_0`` instances are left untouched (e.g. the ones
+    the I2V custom adapter installed with its own ``num_img_tokens``), so this is
+    idempotent and safe to call at any point after model load.
+
+    Args:
+        model: The transformer (or dual-expert wrapper) to patch.
+        num_img_tokens: Image-token count for the I2V ``add_k_proj`` branch
+            (irrelevant on the stock path where ``add_k_proj is None``).
+
+    Returns:
+        Number of attention modules that were (re)installed.
+    """
+    if model is None:
+        return 0
+    targets = []
+    if hasattr(model, "transformer_1") or hasattr(model, "transformer_2"):
+        for name in ("transformer_1", "transformer_2"):
+            sub = getattr(model, name, None)
+            if sub is not None:
+                targets.append(sub)
+    elif hasattr(model, "blocks"):
+        targets.append(model)
+
+    installed = 0
+    for transformer in targets:
+        blocks = getattr(transformer, "blocks", None)
+        if blocks is None:
+            continue
+        for block in blocks:
+            for attn_name in ("attn1", "attn2"):
+                attn = getattr(block, attn_name, None)
+                if attn is None or not hasattr(attn, "set_processor"):
+                    continue
+                if isinstance(attn.processor, WanAttnProcessor2_0):
+                    continue
+                attn.set_processor(WanAttnProcessor2_0(num_img_tokens))
+                installed += 1
+    return installed
+
+
 # modified to set the image embedder size
 class WanAttnProcessor2_0:
     def __init__(self, num_img_tokens: int = 257):
@@ -1149,7 +1270,10 @@ class WanAttnProcessor2_0:
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        rotary_emb: Optional[torch.Tensor] = None,
+        # Current diffusers passes a (freqs_cos, freqs_sin) tuple of REAL
+        # tensors (1, S, 1, D); legacy diffusers passed a single complex
+        # tensor (1, S, 1, D/2). Both are handled (see apply_rotary_emb_*).
+        rotary_emb=None,
     ) -> torch.Tensor:
         # Determine attention type BEFORE encoder_hidden_states gets modified
         # Self-attention: encoder_hidden_states is None (will be set to hidden_states)
@@ -1174,10 +1298,19 @@ class WanAttnProcessor2_0:
         
         encoder_hidden_states_img = None
         if attn.add_k_proj is not None:
+            # Split [image tokens | text tokens]. The I2V adapter installs this
+            # processor with its exact vision-token count; on the stock path the
+            # default (257, clip-vit-h) matches diffusers, which pads the T5 text
+            # to 512 (the stock processor splits as shape[1] - 512). Fall back to
+            # that stock-style split if the hardcoded count cannot fit, so a
+            # differently-padded text stream cannot produce an empty text side.
+            num_img_tokens = self.num_img_tokens
+            if num_img_tokens is None or encoder_hidden_states.shape[1] <= num_img_tokens:
+                num_img_tokens = max(encoder_hidden_states.shape[1] - 512, 0)
             encoder_hidden_states_img = encoder_hidden_states[:,
-                                                              :self.num_img_tokens]
+                                                              :num_img_tokens]
             encoder_hidden_states = encoder_hidden_states[:,
-                                                          self.num_img_tokens:]
+                                                          num_img_tokens:]
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
 
@@ -1198,7 +1331,9 @@ class WanAttnProcessor2_0:
             # Use F32 acceleration if enabled (faster than F64, more stable than BF16/FP16)
             rope_dtype = torch.float32 if _attention_config['f32_rope_enabled'] else torch.float64
 
-            def apply_rotary_emb(hidden_states: torch.Tensor, freqs: torch.Tensor):
+            def apply_rotary_emb_complex(hidden_states: torch.Tensor, freqs: torch.Tensor):
+                # Legacy diffusers RoPE format: a single COMPLEX tensor (1, S, 1, D/2)
+                # produced by the old Rope.forward().
                 # Save original dtype BEFORE any casting
                 orig_dtype = hidden_states.dtype
                 # Use rope_dtype for numerically stable RoPE computation
@@ -1212,12 +1347,54 @@ class WanAttnProcessor2_0:
                 # to avoid implicit upcast or discarding imaginary part.
                 rope_complex_dtype = torch.complex64 if rope_dtype == torch.float32 else torch.complex128
                 freqs_casted = freqs.to(rope_complex_dtype) if freqs.dtype != rope_complex_dtype else freqs
+                # Our q/k layout here is (B, H, S, D), so freqs must be (1, 1, S, D/2).
+                # Some diffusers versions pass (1, S, 1, D/2) (the stock processor
+                # keeps the (B, S, H, D) layout, where that shape broadcasts directly).
+                if freqs_casted.dim() == 4 and freqs_casted.shape[2] == 1 and freqs_casted.shape[1] != 1:
+                    freqs_casted = freqs_casted.permute(0, 2, 1, 3)
                 x_out = torch.view_as_real(x_rotated * freqs_casted).flatten(3, 4)
                 # CRITICAL: cast back to original model dtype (e.g., bf16), not rope_dtype
                 return x_out.to(orig_dtype)
 
-            query = apply_rotary_emb(query, rotary_emb)
-            key = apply_rotary_emb(key, rotary_emb)
+            def apply_rotary_emb_real(hidden_states: torch.Tensor, freqs_cos: torch.Tensor,
+                                      freqs_sin: torch.Tensor):
+                # diffusers >= 0.35 RoPE format (current): a (freqs_cos, freqs_sin) tuple
+                # of REAL tensors with shape (1, S, 1, D), where the real part is repeated
+                # at even/odd positions (repeat_interleave_real=True). Same math as the
+                # stock WanAttnProcessor, but computed in rope_dtype for stability.
+                orig_dtype = hidden_states.dtype
+                rope_states = hidden_states.to(rope_dtype)
+                if not rope_states.is_contiguous():
+                    rope_states = rope_states.contiguous()
+                x1, x2 = rope_states.unflatten(-1, (-1, 2)).unbind(-1)
+                # Even positions pair with cos, odd with sin (matches the stock
+                # processor's freqs_cos[..., 0::2] / freqs_sin[..., 1::2] slicing).
+                cos = freqs_cos[..., 0::2].to(rope_dtype)
+                sin = freqs_sin[..., 1::2].to(rope_dtype)
+                # Our q/k layout here is (B, H, S, D), but the installed diffusers
+                # passes freqs shaped (1, S, 1, D) (the stock processor keeps the
+                # (B, S, H, D) layout, where that shape broadcasts directly). Move
+                # the sequence dim to position 2 so it aligns.
+                if cos.dim() == 4 and cos.shape[2] == 1:
+                    cos = cos.permute(0, 2, 1, 3)
+                    sin = sin.permute(0, 2, 1, 3)
+                elif cos.dim() == 3:
+                    cos = cos.view(1, 1, cos.shape[0], -1)
+                    sin = sin.view(1, 1, sin.shape[0], -1)
+                out = torch.empty_like(rope_states)
+                out[..., 0::2] = x1 * cos - x2 * sin
+                out[..., 1::2] = x1 * sin + x2 * cos
+                return out.to(orig_dtype)
+
+            if isinstance(rotary_emb, (tuple, list)):
+                # Real (cos, sin) tuple - the format the installed diffusers passes.
+                freqs_cos, freqs_sin = rotary_emb[0], rotary_emb[1]
+                query = apply_rotary_emb_real(query, freqs_cos, freqs_sin)
+                key = apply_rotary_emb_real(key, freqs_cos, freqs_sin)
+            else:
+                # Legacy single complex tensor.
+                query = apply_rotary_emb_complex(query, rotary_emb)
+                key = apply_rotary_emb_complex(key, rotary_emb)
 
         # I2V task
         hidden_states_img = None
