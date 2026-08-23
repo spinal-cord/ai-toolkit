@@ -367,7 +367,7 @@ class TrainSliderProcess(BaseSDTrainProcess):
                 denoised_latents = noisy_latents
                 current_timestep = timesteps
             else:
-                if self.train_config.noise_scheduler == 'flowmatch':
+                if self.train_config.noise_scheduler in ['flowmatch', 'custom_flowmatch']:
                     linear_timesteps = any([
                         self.train_config.linear_timesteps,
                         self.train_config.linear_timesteps2,

@@ -1312,7 +1312,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     self.sd.noise_scheduler.set_timesteps(
                         num_train_timesteps, device=self.device_torch, original_inference_steps=num_train_timesteps
                     )
-                elif self.train_config.noise_scheduler == 'flowmatch':
+                elif self.train_config.noise_scheduler in ['flowmatch', 'custom_flowmatch']:
                     linear_timesteps = any([
                         self.train_config.linear_timesteps,
                         self.train_config.linear_timesteps2,
@@ -1435,7 +1435,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         # todo, some schedulers use indices, otheres use timesteps. Not sure what to do here
                         min_idx = min_noise_steps + 1
                         max_idx = max_noise_steps - 1
-                        if self.train_config.noise_scheduler == 'flowmatch':
+                        if self.train_config.noise_scheduler in ['flowmatch', 'custom_flowmatch']:
                             # flowmatch uses indices, so we need to use indices
                             min_idx = min_noise_steps
                             max_idx = max_noise_steps
