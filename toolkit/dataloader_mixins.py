@@ -682,11 +682,9 @@ class CaptionProcessingDTOMixin:
         if self.raw_caption_short is not None:
             self.caption_short = self.get_caption(short_caption=True)
         
-        # Clean up orphaned JSON caches if the JSON file has changed.
-        # This removes old .safetensors files that were cached for previous
-        # versions of the JSON file (different hash) to save disk space.
-        if self.json_caption_path is not None:
-            self.cleanup_orphaned_json_caches()
+        # Clean up legacy per-file text embedding caches (no longer referenced
+        # by the content-addressed cache) to save disk space.
+        self.cleanup_legacy_text_embedding_caches()
     
     def _filter_prompts_by_mode(self, prompts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -695,50 +693,47 @@ class CaptionProcessingDTOMixin:
         """
         return _filter_prompts_by_mode(prompts, is_i2v_mode=getattr(self, 'is_i2v_mode', True))
     
-    def cleanup_orphaned_json_caches(self: 'FileItemDTO'):
+    def cleanup_legacy_text_embedding_caches(self: 'FileItemDTO'):
         """
-        Clean up old text embedding caches for JSON captions when the JSON file has changed.
-        Old caches (with different JSON hash) are deleted to save disk space.
+        Clean up legacy per-file text embedding caches when a caption is loaded.
+
+        Legacy caches were stored directly in ``_t_e_cache`` as
+        ``{filename}_{hash}.safetensors`` (one file per dataset item per prompt).
+        The current cache is content-addressed - files are named by the sha256
+        of the prompt text and live in a versioned subdirectory of
+        ``_t_e_cache`` - so legacy per-file files are never referenced anymore
+        and can be deleted.
+
+        Content-addressed cache files are intentionally NOT deleted here: they
+        are shared across dataset items, and a prompt removed from one item's
+        caption may still be referenced by another item.
         """
-        if self.json_caption_path is None:
-            return
-        
         img_dir = os.path.dirname(self.path)
         te_dir = os.path.join(img_dir, '_t_e_cache')
-        
+
         if not os.path.exists(te_dir):
             return
-        
+
         filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
-        current_hash = self.json_file_hash
-        
-        # Compute the base hash strings for current prompts
-        current_hashes = set()
-        for prompt_idx in range(len(self.raw_prompts)):
-            hash_dict = self.get_text_embedding_info_dict(prompt_index=prompt_idx)
-            hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
-            hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
-            hash_str = hash_str.replace('=', '')
-            current_hashes.add(hash_str)
-        
-        # Find and delete orphaned cache files
+
+        # Find and delete legacy per-file cache files only
         deleted_count = 0
         for cache_file in os.listdir(te_dir):
+            # Legacy format: {filename_no_ext}_{hash}.safetensors
+            # (content-addressed files are named purely by the prompt's sha256)
             if cache_file.startswith(f'{filename_no_ext}_') and cache_file.endswith('.safetensors'):
-                # Extract the hash from filename
-                # Format: {filename_no_ext}_{hash}.safetensors
-                hash_part = cache_file[len(filename_no_ext) + 1:-len('.safetensors')]
-                if hash_part not in current_hashes:
+                cache_path = os.path.join(te_dir, cache_file)
+                if os.path.isfile(cache_path):
                     try:
-                        os.remove(os.path.join(te_dir, cache_file))
+                        os.remove(cache_path)
                         deleted_count += 1
                     except OSError:
                         pass  # Ignore errors deleting old files
-        
+
         if deleted_count > 0:
             import logging
             logger = logging.getLogger(__name__)
-            logger.debug(f"Cleaned up {deleted_count} orphaned text embedding caches for {filename_no_ext}")
+            logger.debug(f"Cleaned up {deleted_count} legacy text embedding caches for {filename_no_ext}")
 
     def get_caption(
             self: 'FileItemDTO',
@@ -2226,28 +2221,60 @@ class TextEmbeddingFileItemDTOMixin:
             item["control_path"] = self.control_path
         return item
     
+    def get_prompt_cache_hash(self: 'FileItemDTO', prompt_text: str) -> str:
+        """
+        Compute the content-addressed cache key (sha256) for a prompt.
+
+        The key is the sha256 of the exact text passed to the text encoder, so
+        identical prompts - across dataset items or across JSON caption files -
+        map to a single shared cache file.
+
+        When control images are encoded into the text embedding, the control
+        image path(s) are folded into the hash as well, since they contribute
+        to the cached tensors and the same prompt with a different control
+        image produces a different embedding.
+        """
+        hash_input = prompt_text
+        if self.encode_control_in_text_embeddings and self.control_path is not None:
+            control_path_list = self.control_path
+            if not isinstance(control_path_list, list):
+                control_path_list = [control_path_list]
+            hash_input = hash_input + '\x00' + '\x00'.join(sorted(control_path_list))
+        return hashlib.sha256(hash_input.encode('utf-8')).hexdigest()
+
+    def get_text_embedding_cache_dir(self: 'FileItemDTO') -> str:
+        """
+        Get the content-addressed text embedding cache directory.
+
+        Embeddings are stored in ``_t_e_cache`` next to the media file, in a
+        subdirectory keyed by the text encoder space/version so that caches
+        from different text encoders never collide.
+        """
+        img_dir = os.path.dirname(self.path)
+        te_dir = os.path.join(img_dir, '_t_e_cache')
+        version_dir = f'{self.text_embedding_space_version}_v{self.text_embedding_version}'
+        return os.path.join(te_dir, version_dir)
+
+    def get_text_embedding_path_for_prompt(self: 'FileItemDTO', prompt_text: str) -> str:
+        """
+        Get the text embedding cache path for a prompt, named by the sha256
+        of the prompt text.
+        """
+        cache_hash = self.get_prompt_cache_hash(prompt_text)
+        return os.path.join(self.get_text_embedding_cache_dir(), f'{cache_hash}.safetensors')
+
     def get_json_prompt_cache_paths(self: 'FileItemDTO') -> List[str]:
         """
         Get cache paths for all prompts in a JSON caption file.
-        Returns a list of paths, one per prompt.
+        Returns a list of paths, one per prompt (named by the prompt's sha256).
         """
         if self.json_caption_path is None or not self.raw_prompts:
             return []
-        
-        paths = []
-        img_dir = os.path.dirname(self.path)
-        te_dir = os.path.join(img_dir, '_t_e_cache')
-        filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
-        
-        for idx, prompt in enumerate(self.raw_prompts):
-            hash_dict = self.get_text_embedding_info_dict(prompt_index=idx)
-            hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
-            hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
-            hash_str = hash_str.replace('=', '')
-            paths.append(os.path.join(te_dir, f'{filename_no_ext}_{hash_str}.safetensors'))
-        
-        return paths
-    
+        return [
+            self.get_text_embedding_path_for_prompt(clean_caption(p['prompt']))
+            for p in self.raw_prompts
+        ]
+
     def get_captions_for_caching(self: 'FileItemDTO') -> List[str]:
         """
         Get all captions that need to be cached.
@@ -2261,26 +2288,33 @@ class TextEmbeddingFileItemDTOMixin:
 
     def get_text_embedding_path(self: 'FileItemDTO', recalculate=False, prompt_index: int = None):
         """
-        Get the text embedding cache path.
-        
+        Get the text embedding cache path (content-addressed by prompt sha256).
+
         For JSON captions:
-            - prompt_index identifies which prompt's cache to load
-            - If prompt_index is None, returns None (must be specified for JSON)
-        
+            - prompt_index identifies which prompt from the JSON file to use
+            - the cache file is named by the sha256 of that prompt's text, so
+              identical prompts across dataset items share one cache file
+
         For .txt captions:
-            - prompt_index is ignored
+            - prompt_index is ignored and the item's caption is used
         """
         if recalculate or self._text_embedding_path is None:
-            # we store text embeddings in a folder in same path as image called _text_embedding_cache
-            img_dir = os.path.dirname(self.path)
-            te_dir = os.path.join(img_dir, '_t_e_cache')
-            hash_dict = self.get_text_embedding_info_dict(prompt_index=prompt_index)
-            filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
-            # get base64 hash of md5 checksum of hash_dict
-            hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
-            hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
-            hash_str = hash_str.replace('=', '')
-            self._text_embedding_path = os.path.join(te_dir, f'{filename_no_ext}_{hash_str}.safetensors')
+            if self.json_caption_path is not None and prompt_index is not None:
+                # make sure the JSON prompts are loaded
+                if not self.raw_prompts:
+                    self.load_caption()
+                if prompt_index < 0 or prompt_index >= len(self.raw_prompts):
+                    raise Exception(
+                        f"prompt_index {prompt_index} out of range for JSON captions "
+                        f"{self.json_caption_path} ({len(self.raw_prompts)} prompts)"
+                    )
+                prompt_text = clean_caption(self.raw_prompts[prompt_index]['prompt'])
+            else:
+                # make sure the caption is loaded here
+                if self.caption is None:
+                    self.load_caption()
+                prompt_text = self.caption
+            self._text_embedding_path = self.get_text_embedding_path_for_prompt(prompt_text)
 
         return self._text_embedding_path
 
@@ -2301,29 +2335,33 @@ class TextEmbeddingFileItemDTOMixin:
                 filtered_prompts = _filter_prompts_by_mode(self.raw_prompts, is_i2v_mode=is_i2v, log_warning=False)
                 
                 if filtered_prompts:
-                    # Select a prompt using weighted random selection
+                    # Select a prompt using weighted random selection, then look
+                    # up its cache by the sha256 of the selected prompt's text.
                     selected = select_prompt_weighted(filtered_prompts)
-                    # Find the index of the selected prompt in the original list
-                    selected_index = None
-                    for idx, p in enumerate(self.raw_prompts):
-                        if p is selected:
-                            selected_index = idx
-                            break
-                    
-                    if selected_index is not None:
-                        # Load the cached embedding for this specific prompt
-                        cache_path = self.get_text_embedding_path(recalculate=True, prompt_index=selected_index)
-                        if os.path.exists(cache_path):
-                            self.prompt_embeds = PromptEmbeds.load(cache_path)
-                            # Update caption to match loaded embedding
-                            self.selected_prompt = selected
-                            self.raw_caption = selected['prompt']
-                            self.raw_caption_short = self.raw_caption
-                            # Recompute caption with trigger word etc.
-                            self.caption = self.get_caption()
-                            if self.raw_caption_short is not None:
-                                self.caption_short = self.get_caption(short_caption=True)
-                            return
+                    prompt_text = clean_caption(selected['prompt'])
+                    cache_path = self.get_text_embedding_path_for_prompt(prompt_text)
+                    if os.path.exists(cache_path):
+                        self.prompt_embeds = PromptEmbeds.load(cache_path)
+                        # Update caption to match loaded embedding
+                        self.selected_prompt = selected
+                        self.raw_caption = selected['prompt']
+                        self.raw_caption_short = self.raw_caption
+                        # Recompute caption with trigger word etc.
+                        self.caption = self.get_caption()
+                        if self.raw_caption_short is not None:
+                            self.caption_short = self.get_caption(short_caption=True)
+                        return
+                    # A prompt matched the current mode but its cache file is
+                    # missing. The text encoder is unloaded while training with
+                    # cached embeddings, so this cannot be re-encoded on the fly -
+                    # fail loudly instead of silently training on an empty caption.
+                    raise Exception(
+                        f"Text embedding cache miss for prompt {prompt_text!r} "
+                        f"(JSON captions: {self.json_caption_path}). Expected cache file "
+                        f"{cache_path} does not exist. Re-run the job with text embedding "
+                        f"caching enabled (or delete the dataset's _t_e_cache directory) "
+                        f"so the cache is rebuilt."
+                    )
                 
                 # No prompts matched the current training mode - use empty prompt.
                 # Intentionally do NOT fallback to prompt_index=0, as that could
@@ -2345,7 +2383,16 @@ class TextEmbeddingFileItemDTOMixin:
             # This can happen when a JSON file is modified to have no valid prompts
             # after caches were created for the previous valid prompts.
             if self.json_caption_path is None:
-                self.prompt_embeds = PromptEmbeds.load(self.get_text_embedding_path())
+                text_embedding_path = self.get_text_embedding_path()
+                if not os.path.exists(text_embedding_path):
+                    raise Exception(
+                        f"Text embedding cache miss for caption {self.caption!r} "
+                        f"(media file: {self.path}). Expected cache file "
+                        f"{text_embedding_path} does not exist. Re-run the job with text "
+                        f"embedding caching enabled (or delete the dataset's "
+                        f"_t_e_cache directory) so the cache is rebuilt."
+                    )
+                self.prompt_embeds = PromptEmbeds.load(text_embedding_path)
             # else: JSON with no valid prompts - leave prompt_embeds as None (uses empty caption)
 
 class TextEmbeddingCachingMixin:
